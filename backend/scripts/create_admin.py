@@ -42,7 +42,8 @@ if str(BACKEND_DIR) not in sys.path:
 
 from dotenv import load_dotenv  # noqa: E402
 
-ENV_PATH = Path(r"D:\myproject\wave-money\backend\.env")
+# 基于脚本自身位置推导：<repo>/backend/.env（Linux / Render / Windows 通用）
+ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 load_dotenv(ENV_PATH if ENV_PATH.exists() else BACKEND_DIR / ".env")
 
 import asyncpg  # noqa: E402
