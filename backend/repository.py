@@ -6,11 +6,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from abc import ABC, abstractmethod
 from datetime import date, datetime, timezone
 from typing import Any
 
-from db import init_pool
+from db import database_url, init_pool
 from services.auth import (
     GLOBAL_SETTINGS_USER_ID,
     ROLE_ADMIN,
@@ -35,6 +36,8 @@ from services.pnl import (
     money,
     normalize_stake_mode,
 )
+
+logger = logging.getLogger(__name__)
 
 # 开奖纠正动作（落库英文枚举）
 DRAW_ACTION_CORRECT = "CORRECT"
@@ -1623,13 +1626,28 @@ _store: Store | None = None
 
 
 async def get_store() -> Store:
-    """返回当前存储实现；配置了 DATABASE_URL 则使用 Postgres。"""
+    """返回当前存储实现；配置了 DATABASE_URL 则使用 Postgres。
+
+    数据库不可用（网络抖动 / 密码错误 / 熔断退避中）时**不抛异常**：
+    退化为内存存储让应用仍能启动，否则连健康检查都拿不到，问题更难定位。
+    """
     global _store
     if _store is not None:
         return _store
 
-    pool = await init_pool()
+    pool = None
+    try:
+        pool = await init_pool()
+    except Exception:
+        # main.py 的 lifespan 也会先试一次并记录原因，这里的兜底保证启动不被中断
+        logger.exception("数据库连接池不可用 — 本次退化为内存存储（数据不会持久化）")
+
     if pool is None:
+        if database_url():
+            logger.warning(
+                "已配置 DATABASE_URL 但连接不可用：当前使用内存存储，"
+                "接口会返回空数据。请检查数据库地址与密码。"
+            )
         _store = MemoryStore()
         return _store
 
@@ -1638,6 +1656,7 @@ async def get_store() -> Store:
         await postgres.ensure_schema()
         _store = postgres
     except Exception:
+        logger.exception("数据库 schema 校验失败 — 退化为内存存储")
         _store = MemoryStore()
     return _store
 
