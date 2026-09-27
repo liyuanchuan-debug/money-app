@@ -3,12 +3,26 @@ services:
     name: wave-money-api
     runtime: python
     rootDir: backend
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
     envVars:
+      # asyncpg==0.30.0 没有 3.14 的预编译 wheel，必须固定到 3.13（与本地 venv 一致）
       - key: PYTHON_VERSION
-        value: "3.11.9"
+        value: "3.13.2"
       - key: CORS_ORIGINS
         sync: false
       - key: DATABASE_URL
         sync: false
+      # 会话签名密钥（HMAC-SHA256）：由 Render 生成并持久保存。
+      # APP_ENV/RENDER=production 时缺失该值后端会**直接启动失败**。
+      # ⚠️ 换值会让所有已登录会话立刻失效。
+      - key: SESSION_SECRET
+        generateValue: true
+      # 权限校验总开关：默认 true。显式 "false" 才是开发旁路（全部放行）。
+      - key: AUTH_ENFORCED
+        value: "true"
+      # 会话有效期（天）。默认 365：登录后不清站点数据 / 不退出则一直有效。
+      - key: JWT_EXPIRE_DAYS
+        value: "365"

@@ -18,3 +18,38 @@ dist/
 *.swp
 .DS_Store
 Thumbs.db
+
+# ---------------------------------------------------------------------------
+# 本地临时产物 / 验证残留（部署前仓库整理新增）
+# ---------------------------------------------------------------------------
+# 临时工作目录：截图、探针、一次性验证（.tmp-nav/ .tmp-tools/ .tmp-verify/
+# .tmp-omission-shots/ .tmp-shots-indexfe/ .tmpbuild-*/ 等）
+.tmp*
+tmp*/
+frontend/.tmp*/
+frontend/tmp*/
+
+# 临时日志与截图（.tmp-*.log / .tmp-*.txt / .tmp-*.png）
+*.log
+
+# 前端一次性验证产物
+frontend/.favicon-verify/
+frontend-favicon-verify/
+# 误落到端口号目录的 Nuxt 开发缓存（只含 .nuxt/ 与 node_modules/）
+frontend/3820/
+# 生成四叶草 logo 折线的一次性脚本（文件头已标注 TEMP，用完即删）
+frontend/.clover-gen.mjs
+
+# 后端手工 curl 调试时落盘的请求/响应样本
+backend/body.json
+backend/resp.json
+
+# 后端本地数据目录（导出/缓存）；仅显式保留 tests 依赖的固定样本
+backend/data/*
+!backend/data/draws_70_269.txt
+
+# pytest 缓存
+.pytest_cache/
+
+# 文档目录下的截图/示意图（本地 mock，未纳入仓库）
+docs/pnl-dashboard-mock.png

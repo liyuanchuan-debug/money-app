@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-24 -21 48 48" width="48" height="48" role="img" aria-label="四叶沙盘">
+  <title>四叶沙盘</title>
+  <!--
+    Brand mark for tab favicon (independent of BrandMark.vue).
+    Four heart-shaped leaves rotated 90deg; tip offset 2.6 from center.
+    Colors: aqua-300 #63e6fb -> aqua-400 #22d3ee -> emerald-400 #34d399;
+    stem: aqua-500 #0bb6d6 -> emerald-500 #10b981 (userSpaceOnUse so vertical stroke paints).
+    Dark disc behind mark so cyan stays visible on light and dark tab bars.
+  -->
+  <defs>
+    <linearGradient id="clover-leaf" x1="16%" y1="4%" x2="84%" y2="96%">
+      <stop offset="0%" stop-color="#63e6fb" />
+      <stop offset="46%" stop-color="#22d3ee" />
+      <stop offset="100%" stop-color="#34d399" />
+    </linearGradient>
+    <linearGradient id="clover-stem" gradientUnits="userSpaceOnUse" x1="0" y1="5" x2="0" y2="24">
+      <stop offset="0%" stop-color="#0bb6d6" />
+      <stop offset="100%" stop-color="#10b981" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded dark plate: keeps the mark readable at 16px on light chrome tabs -->
+  <rect x="-23" y="-20" width="46" height="46" rx="10" fill="#05060f" />
+
+  <path d="M0 5V24" stroke="url(#clover-stem)" stroke-width="4.6" stroke-linecap="round" fill="none" />
+
+  <path
+    fill="url(#clover-leaf)"
+    d="M0 -2.6C5.7 -7.7 10.5 -9.5 10.5 -14.8C10.5 -18.2 7.6 -19.8 3.9 -19.8C1.7 -19.8 0.5 -18.8 0 -17.7C-0.5 -18.8 -1.7 -19.8 -3.9 -19.8C-7.6 -19.8 -10.5 -18.2 -10.5 -14.8C-10.5 -9.5 -5.7 -7.7 0 -2.6ZM2.6 0C7.7 5.7 9.5 10.5 14.8 10.5C18.2 10.5 19.8 7.6 19.8 3.9C19.8 1.7 18.8 0.5 17.7 0C18.8 -0.5 19.8 -1.7 19.8 -3.9C19.8 -7.6 18.2 -10.5 14.8 -10.5C9.5 -10.5 7.7 -5.7 2.6 0ZM0 2.6C-5.7 7.7 -10.5 9.5 -10.5 14.8C-10.5 18.2 -7.6 19.8 -3.9 19.8C-1.7 19.8 -0.5 18.8 0 17.7C0.5 18.8 1.7 19.8 3.9 19.8C7.6 19.8 10.5 18.2 10.5 14.8C10.5 9.5 5.7 7.7 0 2.6ZM-2.6 0C-7.7 -5.7 -9.5 -10.5 -14.8 -10.5C-18.2 -10.5 -19.8 -7.6 -19.8 -3.9C-19.8 -1.7 -18.8 -0.5 -17.7 0C-18.8 0.5 -19.8 1.7 -19.8 3.9C-19.8 7.6 -18.2 10.5 -14.8 10.5C-9.5 10.5 -7.7 5.7 -2.6 0Z"
+  />
+</svg>

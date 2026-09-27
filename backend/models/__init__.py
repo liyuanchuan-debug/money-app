@@ -1,17 +1,37 @@
+from .auth import (
+    AuthConfigOut,
+    LoginIn,
+    LoginOut,
+    MeOut,
+    RegisterIn,
+    RegisterOut,
+    RoleIn,
+    UserOut,
+    UserStatusIn,
+    public_user,
+)
 from .item import Item
 from .lottery import (
+    HistoryRecordOut,
     RecommendRequest,
-    RecordIn,
-    RecordOut,
     SettingsOut,
     SettingsPatch,
 )
 
 __all__ = [
+    "AuthConfigOut",
+    "HistoryRecordOut",
     "Item",
-    "RecordIn",
-    "RecordOut",
+    "LoginIn",
+    "LoginOut",
+    "MeOut",
+    "RecommendRequest",
+    "RegisterIn",
+    "RegisterOut",
+    "RoleIn",
     "SettingsOut",
     "SettingsPatch",
-    "RecommendRequest",
+    "UserOut",
+    "UserStatusIn",
+    "public_user",
 ]
