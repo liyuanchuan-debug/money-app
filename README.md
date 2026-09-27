@@ -133,6 +133,8 @@ wave-money/
 - 支持导入 / 导出 JSON（只含 `draws`，version 2）
 - 支持清空历史
 
+> ⚠️ **`items` 表的漂移（已知，勿踩）**：`schema.sql`（新库一次性初始化）里还留着脚手架时代的 `items` 建表 + 3 行示例数据，但 `backend/repository.py` 的 `SCHEMA_STATEMENTS`（`ensure_schema` / 迁移脚本走的那份）**早已不含 `items`**。也就是说：跑迁移脚本升级的库里没有 `items` 表，`GET /api/items` 会走异常兜底返回内置示例数据——不影响任何业务。以 `SCHEMA_STATEMENTS` 为准即可；`items` 属脚手架遗留，后续可整体下线。
+
 > 未配置 `DATABASE_URL` 时后端退化为**内存存储**（进程重启即丢失），仅用于本地预览。生产环境必须配置 Supabase 连接串，否则历史无法持久化。
 
 ---
@@ -143,7 +145,7 @@ wave-money/
 
 1. 在 [supabase.com](https://supabase.com) 创建项目
 2. 打开 **SQL Editor**，执行 [`schema.sql`](./schema.sql)
-3. 从 **Project Settings → Database** 复制连接串
+3. 从 **Project Settings → Database → Connection string** 复制 **Connection pooling**（pooler）连接串 —— 直连主机 `db.<ref>.supabase.co` 只有 IPv6，云平台（Render 等）连不上，本地直连可用但生产必须用 pooler
 
 ### 2. 后端
 
@@ -216,7 +218,7 @@ npm run dev
 | POST | `/api/recommend` | 生成推荐；body `{"mode":"random","number":21,"amount_seed":3}` 均可选 |
 | GET | `/api/export` | 导出 JSON |
 | POST | `/api/import?replace=true` | 导入 JSON（仅 `ADMIN`） |
-| GET | `/api/items` | 示例数据（脚手架保留） |
+| GET | `/api/items` | 脚手架示例数据（表缺失时返回内置样例，见「数据存储」的漂移说明） |
 
 认证与用户管理接口（详见下方「认证与权限（RBAC）」）：
 
@@ -258,12 +260,12 @@ npm run dev
 
 | 接口 | 所需角色 |
 |------|----------|
-| `/api/health`、`/api/draws*` 读取、`/api/draws/next-period`、`/api/zodiac/*` | `USER`+（已审批） |
-| `/api/stats/trend`、`/api/history`、`GET/PUT /api/settings` | `USER`+ |
-| `/api/stats/frequency`、`/api/stats/zodiac-trend`、`POST /api/stats/backtest` | `VIP` / `ADMIN` |
-| `/api/recommend`（财富密码）、`/api/export` | `VIP` / `ADMIN` |
-| `POST /api/draws/quick`、`POST /api/draws/import`、`DELETE /api/draws*`、`POST /api/import` | `ADMIN` |
-| `/api/admin/users*` | `ADMIN` |
+| `GET /api/health` | 公开 |
+| **只读浏览（匿名可读）**：`GET /api/draws`、`GET /api/draws/latest`、`GET /api/history`、`GET /api/zodiac/*`、`GET /api/stats/trend`、`GET /api/stats/frequency`、`GET /api/stats/zodiac-trend` | 匿名（**无需登录**；带会话时按本人设置算阈值） |
+| `GET /api/draws/next-period`、`GET/PUT /api/settings` | `USER`+（任意**已审批**用户，非 VIP 专属） |
+| `POST /api/recommend`（财富密码）、`GET /api/export`、`GET /api/stats/pnl`、`POST /api/stats/backtest` | `VIP` / `ADMIN` |
+| `POST /api/draws/quick` / `{id}/correct` / `import`、`DELETE /api/draws*`、`POST /api/import` | `ADMIN` |
+| `/api/admin/*`（用户列表 / 审批 / 改状态 / 改角色） | `ADMIN` |
 
 账号状态：`PENDING`（待审批，注册后的默认值）→ `APPROVED`（已通过）/ `REJECTED`（已拒绝）/ `DISABLED`（已停用）。
 只有 `APPROVED` 能登录。登录接口**先校验密码再看状态**，所以「待审批」这类差异文案只有密码正确的人能看到，不构成手机号枚举面。
@@ -281,12 +283,15 @@ npm run dev
 本开关只控制后端 API；生产务必保持 `true`。角色检查内部没有任何静默 fail-open 分支。
 后端启动时会打印一行醒目的开关状态日志，便于确认。
 
-### 会话 Cookie 与跨站
+### 会话 Cookie 与登录方案（**同源反代，推荐**）
 
 - 密钥来自 `SESSION_SECRET`（HMAC-SHA256）。**生产环境缺失会直接启动失败**；本地开发缺失会打印告警并使用不安全的兜底密钥。换值会让所有已登录会话立刻失效。
 - **持久登录**：会话写在浏览器持久 Cookie `wm_session`（`HttpOnly` + `Max-Age`，等同于 localStorage 级别的持久层，关浏览器再开仍有效）。默认 **365 天**；可用 `JWT_EXPIRE_DAYS`（天）或 `SESSION_TTL_SECONDS`（秒，优先）覆盖。只有用户清站点数据 / 点退出登录 / 密钥轮换 / 账号被停用，会话才会失效。
-- `SESSION_COOKIE_SAMESITE` 默认 `lax`。前后端**跨站**部署（前端 `*.vercel.app` + 后端 `*.onrender.com`）时必须改成 `none`，否则 Cookie 不会随跨站请求发送，表现为「登录成功但下一个请求仍未登录」。`none` 会自动强制 `Secure`，只能在 HTTPS 下用。
-- 开了登录之后 `CORS_ORIGINS` 不能再写 `*`（`allow_credentials` 会被关掉，浏览器不携带 Cookie，登录必失败）。
+- **推荐部署形态 = 同源反代**：前端（Vercel）把 `/api/**` 反代到后端（Render），浏览器**只看到前端域名**，请求是同站的。此时：
+  - `SESSION_COOKIE_SAMESITE` 保持默认 `lax` 即可，**不要**改成 `none`；
+  - `CORS_ORIGINS` 基本用不上（请求由 Nitro 服务端发起，没有浏览器 Origin）。
+- `SESSION_COOKIE_SECURE`：代码会按 `request.url.scheme`（或 `X-Forwarded-Proto`）自动判 Secure，但 uvicorn 默认**不信任代理头**，代理后可能判不出来。所以生产**显式设 `SESSION_COOKIE_SECURE=true`**（`render.yaml` 已钉死）。
+- 仅当**真正跨站**部署（浏览器直连 `*.onrender.com`，不走反代）时才需要 `SESSION_COOKIE_SAMESITE=none`（`none` 会自动强制 `Secure`，只能在 HTTPS 下用），且 `CORS_ORIGINS` 不能写 `*`（`allow_credentials` 会被关掉，浏览器不携带 Cookie，登录必失败）。
 
 ### 按用户隔离的 `settings`
 
@@ -310,18 +315,23 @@ cd D:\myproject\wave-money
 
 前端（Vercel）与后端（Render）通过环境变量互相寻址；域名和密钥一律不进仓库，全部在 Dashboard 配置。
 
+**登录方案 = 同源反代（推荐）**：Vercel 上的 Nuxt 把 `/api/**` 反代到 Render 后端，浏览器只访问前端域名，前后端**同站**。因此 Cookie 用默认 `SameSite=lax`、不需要 `none`，也不需要靠 CORS 传凭证。
+
 ### 部署顺序
 
-前端要后端地址，后端要前端域名（写进 `CORS_ORIGINS`），两边互相依赖，所以顺序是「先后端 → 再前端 → 最后回填 CORS」：
+| 步骤 | 在哪做 | 产出 / 动作 | 给谁用 |
+|------|--------|-------------|--------|
+| 1 | Supabase Dashboard | `DATABASE_URL`（**必须用 pooler 主机**，见下） | Render 后端 |
+| 2 | Render | 建后端 → 得到 `https://<app>.onrender.com` | Vercel 前端 |
+| 3 | 本地终端 | 跑 `create_admin.py` 建第一个超管 | 进后台的唯一入口 |
+| 4 | Vercel | Root Directory = `frontend`，设 `NUXT_API_PROXY_TARGET` = 后端地址 | 浏览器同源调 API |
+| 5 | Render（可选） | 把前端域名回填 `CORS_ORIGINS`（自动重新部署） | 仅直连后端 / 调试时需要 |
 
-| 步骤 | 在哪做 | 产出 | 给谁用 |
-|------|--------|------|--------|
-| 1 | Supabase Dashboard | `DATABASE_URL` 连接串 | Render 后端 |
-| 2 | Render | 后端地址 `https://<app>.onrender.com` | Vercel 前端 |
-| 3 | Vercel | 前端地址 `https://<app>.vercel.app` | Render 后端 |
-| 4 | Render | 把前端地址写进 `CORS_ORIGINS`（自动重新部署） | 前端才能跨域调用 |
+> 同源反代下第 5 步**不是必需**（浏览器请求由 Nitro 服务端转发，没有 Origin 头）。仍然建议填上，方便直连 `/docs`、Postman 调试，也让日后改回跨站部署时不用返工。
 
-> 第 4 步不能省。第 2 步先建后端只是为了拿到地址，此时前端还没放行；回填 `CORS_ORIGINS` 后 Render 会自动重新部署，跨域才通。
+> ⚠️ **两个最常见的阻塞点**，按顺序排除：
+> 1. **数据库连不上** → `DATABASE_URL` 用了直连主机 `db.<ref>.supabase.co`。该主机**只有 IPv6**，Render 出站只有 IPv4，必然超时。必须换成 Supabase **Connection Pooling（pooler）** 主机：`aws-0-<region>.pooler.supabase.com`。
+> 2. **登录了但刷新就掉登录** → 前端没走同源反代（`NUXT_PUBLIC_API_URL` 或 `NUXT_API_PROXY_TARGET` 没配好）。见「前端 → Vercel」。
 
 ### 后端 → Render
 
@@ -329,7 +339,7 @@ cd D:\myproject\wave-money
 
 1. Render Dashboard → **New +** → **Blueprint**
 2. 选择仓库 `liyuanchuan-debug/money-app`（`render.yaml` 在仓库根目录，无需填 Root Directory）
-3. Render 按 `render.yaml` 创建 Web Service `wave-money-api`
+3. Render 按 `render.yaml` 创建 Web Service `wave-money-api`，**region 已经是 `singapore`**（对齐 Supabase 首尔，见下方说明）
 4. 首次创建时会逐个询问 `sync: false` 的变量，此时粘贴 `DATABASE_URL` 和 `CORS_ORIGINS`
 
 > `sync: false` 就是 Render 保存密钥的方式：值不写进仓库，只在 Dashboard 填。也因为如此，后续再改 `render.yaml` 时这批变量会被忽略，要改直接去 Dashboard 改。
@@ -351,19 +361,21 @@ cd D:\myproject\wave-money
 | Key | 值 | 说明 |
 |-----|-----|------|
 | `PYTHON_VERSION` | `3.13.2` | 已写入 `render.yaml`。Render 新服务默认 3.14.x，而 `asyncpg==0.30.0` 没有 3.14 的预编译 wheel，必须钉在 3.13 |
-| `DATABASE_URL` | Supabase 连接串 | 密钥，只在 Dashboard 填 |
-| `CORS_ORIGINS` | 前端域名，逗号分隔 | 见下方「CORS 写法」 |
+| `DATABASE_URL` | Supabase **pooler** 连接串 | 密钥，只在 Dashboard 填。必须是 pooler 主机（直连只有 IPv6，Render 连不上），见下 |
+| `CORS_ORIGINS` | 前端域名，逗号分隔 | 同源反代下可选（调试用）；见下方「CORS 写法」 |
 | `SESSION_SECRET` | `render.yaml` 里 `generateValue: true` 自动生成 | 会话签名密钥。**缺失时后端直接启动失败**（Render 会注入 `RENDER=true`，等价生产环境）。换值会让所有已登录会话失效 |
 | `AUTH_ENFORCED` | `true` | API 鉴权总开关；显式 `false` 才是开发旁路 |
-| `SESSION_COOKIE_SAMESITE` | `none` | 前后端跨站时必须设；`none` 自动强制 `Secure` |
+| `SESSION_COOKIE_SECURE` | `true` | 已写入 `render.yaml`。uvicorn 默认不信任代理的 `X-Forwarded-Proto`，靠 `request.url.scheme` 自动判可能失效，显式钉死 |
+| `SESSION_COOKIE_SAMESITE` | `lax`（默认） | 同源反代方案下保持 `lax`，**不要**写 `none`（那是跨站部署才需要） |
+| `region` | `singapore` | 已写入 `render.yaml`。**创建服务后不可修改**，所以必须在第一次创建前就定好；Supabase 在 `ap-northeast-2`（首尔），singapore 是 Render 最近的可选区域，默认 `oregon` 会跨太平洋绕远 |
 
-> `render.yaml` 没有写 `region`，默认 `oregon`。该字段创建后不可修改，如果 Supabase 项目不在默认区域，请在第一次创建前把 region 改成离 Supabase 最近的（`oregon` / `ohio` / `virginia` / `frankfurt` / `singapore`）。
+**Supabase 连接串在哪**：Supabase Dashboard → **Project Settings → Database → Connection string**。选 **Connection pooling**（不是 Direct connection）。
 
-**Supabase 连接串在哪**：Supabase Dashboard → **Project Settings → Database → Connection string → URI**，复制后把 `[YOUR-PASSWORD]` 换成真实密码。
-
+- **必须用 pooler 主机**：`aws-0-<region>.pooler.supabase.com`。直连主机 `db.<ref>.supabase.co` 只解析到 **IPv6**，Render 只有 IPv4 出口，表现是启动时 `Database pool init failed` 超时。
+- pooler 用户名是 `postgres.<project-ref>`（注意带项目引用后缀），**不是** 单纯的 `postgres`。
+- 端口：`5432` = Session 模式（长连接池，本项目用这个即可）；`6543` = Transaction 模式。
 - asyncpg 的 DSN 解析显式接受 `postgresql://` 与 `postgres://` 两种 scheme，Supabase 给的 `postgresql://` 原样粘贴即可，不用改写。
 - 密码里若有 `@` `#` `/` 等字符必须先 URL 编码，否则连接串会被解析错。
-- 直连（5432）和 Connection Pooling（6543）都能用；免费项目建议用 Connection Pooling。
 
 **CORS 写法**（对应 `backend/main.py` 的 `_cors_config()`）
 
@@ -374,17 +386,38 @@ cd D:\myproject\wave-money
 | `*` | 放行所有来源，同时自动关闭 `allow_credentials` |
 
 > 为什么 `*` 要单独处理：Starlette 在 `allow_origins=["*"]` + `allow_credentials=True` 时，只有请求带 Cookie 才会回显真实 Origin；普通响应返回的是 `Access-Control-Allow-Origin: *` 加 `Access-Control-Allow-Credentials: true`，而浏览器对这种组合下的携带凭证请求会直接拒绝。所以 `*` 分支显式关掉凭证。生产环境建议写真实域名，Preview 用 `https://*.vercel.app`。
+>
+> 同源反代下浏览器不直连后端，这段 CORS 只影响直连调试，写真实前端域名或 `https://*.vercel.app` 都行；只有**跨站**方案才必须严格配对 Cookie 的 `SameSite`。
+
+### 建第一个管理员（必做，否则没人能进后台）
+
+新注册用户一律 `PENDING`，**必须由管理员审批才能登录**，而第一个管理员只能从命令行直接建。部署完后端、`DATABASE_URL` 已通之后：
+
+```powershell
+cd D:\myproject\wave-money
+$env:ADMIN_PHONE='13800138000'
+$env:ADMIN_PASSWORD='换成你的强密码'
+.\backend\.venv\Scripts\python.exe .\backend\scripts\create_admin.py
+```
+
+- 脚本**直连数据库**（读 `backend/.env` 的 `DATABASE_URL`），不受 `AUTH_ENFORCED` / 后端服务影响，随时可救回后台。
+- **幂等**：手机号已存在则提升为 `ADMIN` + `APPROVED`；不加 `--password` 不会改动已有密码。
+- 云上执行不便时，也可在渲染机 / 本地用生产 `DATABASE_URL` 跑同一条命令。
 
 ### 前端 → Vercel
 
 1. Vercel → **Add New → Project** → Import Git Repository 选 `liyuanchuan-debug/money-app`
-2. **Root Directory** 设为 `frontend`（必须；不设的话 Vercel 在仓库根目录找不到 `package.json`）
+2. **Root Directory** 设为 `frontend`（**必须**；不设的话 Vercel 在仓库根目录找不到 `package.json`）
 3. **Framework Preset** 选 `Nuxt.js`（一般会自动识别）。Build Command 保持默认 `nuxt build`，Output Directory 不要手填
-4. **Environment Variables** 加一条：
+4. **Environment Variables** 加一条（同源反代方案只需这一条）：
 
 | Key | 值 |
 |-----|-----|
-| `NUXT_PUBLIC_API_URL` | Render 后端地址，如 `https://wave-money-api.onrender.com`（**结尾不要带 `/`**） |
+| `NUXT_API_PROXY_TARGET` | Render 后端地址，如 `https://wave-money-api.onrender.com`（**结尾不要带 `/`**） |
+
+`NUXT_PUBLIC_API_URL` **留空**（或干脆不设）：空串 = 浏览器打同源 `/api/*`，再由 Nuxt 反代到 `NUXT_API_PROXY_TARGET`，Cookie 落在前端域名上，登录最稳。
+
+> ⚠️ `NUXT_API_PROXY_TARGET` 是**构建期**变量：它的值在 `nuxt build` 时被烤进 Nitro 的 `routeRules` 代理规则（见 `frontend/nuxt.config.ts`），不是运行时读取。**改完必须 Redeploy**（关掉构建缓存重建），只改环境变量不重新部署不会生效。
 
 5. Deploy
 
@@ -399,8 +432,12 @@ cd D:\myproject\wave-money
 | 健康检查 | `https://<render-app>.onrender.com/api/health` | `{"status":"ok"}` |
 | 接口文档 | `https://<render-app>.onrender.com/docs` | Swagger UI 正常打开 |
 | 存储后端 | `https://<render-app>.onrender.com/api/export` | 返回体含 `"storage": "postgres"`（不是 `memory`） |
+| 数据库连通 | Render → Logs | `Active storage backend: postgres`（看到 `memory` 说明 DSN 有问题，常见是没用 pooler 主机） |
 | 前端页面 | `https://<vercel-app>.vercel.app` | 能录入开奖号并看到推荐结果 |
-| 跨域 | DevTools → Network → 任一 `/api/...` 请求 | 响应头 `Access-Control-Allow-Origin: https://<vercel-app>.vercel.app` |
+| 同源反代 | DevTools → Network → 任一 `/api/...` 请求 | Request URL 是**前端自己的域名**（`https://<vercel-app>.vercel.app/api/...`），不是 `onrender.com`；状态 200 |
+| 会话 Cookie | DevTools → Application → Cookies | 存在 `wm_session`，`Secure` + `SameSite=Lax`，Domain 是前端域名 |
+| 匿名只读 | 无痕窗口打开前端首页 | `/api/draws`、`/api/history` 等只读接口正常返回（不要求登录） |
+| 登录态保持 | 登录后刷新 / 重开浏览器 | 仍是登录状态（掉登录 = 反代没生效，跨站了） |
 
 后端启动日志（Render → Logs）里确认连的是 Supabase 还是内存回退：
 

@@ -1,11 +1,16 @@
 // https://nuxt.com/docs/api/configuration/nuxt-config
 
 /**
- * 本地默认走同源 `/api`（由 Nitro 反代到后端），避免：
+ * 登录方案 = **同源反代**：浏览器只打同源 `/api`，由 Nitro（dev 用 devProxy、
+ * 生产用下面的 routeRules）反代到后端。这样前后端同站，Cookie 用默认
+ * `SameSite=lax` 即可，也不用靠 CORS 传凭证，避免：
  *   - 浏览器开 `127.0.0.1:3000` 而 API 写 `localhost:8000` → CORS / Cookie 主机不一致；
  *   - 跨端口直连时会话 Cookie 看起来「登录成功、刷新就失效」。
- * 生产跨域部署时在环境变量里设 `NUXT_PUBLIC_API_URL=https://api.example.com`，
- * 并同步后端 `CORS_ORIGINS` + `SESSION_COOKIE_SAMESITE=none`。
+ *
+ * 生产只需在 Vercel 设 `NUXT_API_PROXY_TARGET=https://<render-app>.onrender.com`；
+ * 该值是**构建期**变量（被烤进下面的 routeRules），改完必须 Redeploy。
+ * `NUXT_PUBLIC_API_URL` 留空 = 走同源。只有真正跨站直连才需要填它并同步后端
+ * `CORS_ORIGINS` + `SESSION_COOKIE_SAMESITE=none`（不推荐）。
  */
 const backendOrigin = (
   process.env.NUXT_API_PROXY_TARGET

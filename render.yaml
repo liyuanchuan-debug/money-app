@@ -4,6 +4,9 @@ services:
     runtime: python
     rootDir: backend
     plan: free
+    # ⚠️ region **创建服务后不可修改**：Supabase 在 ap-northeast-2（首尔），
+    # 必须用 singapore（Render 离首尔最近），否则默认 oregon 会跨太平洋多绕 ~150ms/请求。
+    region: singapore
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health
@@ -23,6 +26,14 @@ services:
       # 权限校验总开关：默认 true。显式 "false" 才是开发旁路（全部放行）。
       - key: AUTH_ENFORCED
         value: "true"
+      # 会话 Cookie 的 Secure 标志。Render 在代理后转发，uvicorn 默认不信任
+      # X-Forwarded-Proto，靠 request.url.scheme 自动判定可能失效 —— 显式钉成 true。
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+      # 登录方案 = 同源反代（Vercel 前端把 /api 反代到本服务）：同站请求，
+      # 保持默认 lax 即可；**不要**写 none（那是跨站部署才需要）。
+      - key: SESSION_COOKIE_SAMESITE
+        value: "lax"
       # 会话有效期（天）。默认 365：登录后不清站点数据 / 不退出则一直有效。
       - key: JWT_EXPIRE_DAYS
         value: "365"
