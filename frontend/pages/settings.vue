@@ -479,6 +479,15 @@ const readonlyInputClass
                     {{ option.label }}
                   </GlassButton>
                 </div>
+                <!-- 不加权时窗口档位对选号无影响：醒目提示，避免「选了档位就以为开启了加权」 -->
+                <p
+                  v-if="form.trend_bias === 'neutral'"
+                  class="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-200"
+                >
+                  当前是「不加权」：上面的近窗档位（近 30 / 60 / 100 / 全部）
+                  <strong class="font-semibold">不影响选号</strong>，只用于走势分布参考。
+                  要先选「热号偏好 / 中频优先 / 冷号偏好」并保存，近窗档位才会参与选号。
+                </p>
                 <p class="text-xs leading-relaxed text-slate-400">
                   走势加权管「偏热 / 偏冷 / 中频」；避冷加权管「冷号排后 + 金额封顶」；两者独立，可同时生效。
                 </p>

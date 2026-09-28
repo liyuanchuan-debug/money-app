@@ -714,10 +714,19 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               <StatChip tone="neutral" size="sm">{{ trendWindowLabel }}</StatChip>
             </div>
 
-            <p class="text-xs leading-relaxed text-slate-500">
-              按本池近窗特码出现频次，在各波动桶内切出主推 / 次选 / 防守三段（热→中→冷）。
+            <!-- 不加权时窗口对选号无影响：必须醒目提示，否则会被误解成「选了视窗就开启了加权」 -->
+            <p
+              v-if="trendBias === 'neutral'"
+              class="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-200"
+            >
+              当前是「不加权」：近窗档位（{{ trendWindowLabel }}）只影响下方走势分布参考的展示，
+              <strong class="font-semibold">不影响选出的号码</strong>。
+              要让它参与选号，请选「热号偏好 / 中频优先 / 冷号偏好」任一。
+            </p>
+            <p v-else class="text-xs leading-relaxed text-slate-500">
+              已按本池近窗特码出现频次，在各波动桶内按该偏好切出主推 / 次选 / 防守三段：
+              热号偏好取最热段为主推，冷号偏好取最冷段为主推，中频优先取最接近中频段为主推。
               这是样本内经验频率加权偏好，不是真实概率，也不承诺提高命中率。
-              「不加权」时选号回退为旧的全历史遗漏优先。
             </p>
           </GlassPanel>
         </MotionReveal>

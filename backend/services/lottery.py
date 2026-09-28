@@ -104,6 +104,12 @@ TREND_BIAS_LABELS = {
     TREND_BIAS_COLD: "近期频次加权（冷号偏好）",
     TREND_BIAS_MID: "近期频次加权（中频优先）",
 }
+# 角色带方向的白话说明（notes / 推送用）；必须与 _band_rank_prefix 的实际排序一致
+_BAND_ORDER_NOTE = {
+    TREND_BIAS_HOT: "主推=最热段、次选=中段、防守=最冷段",
+    TREND_BIAS_COLD: "主推=最冷段、次选=中段、防守=最热段",
+    TREND_BIAS_MID: "主推=最接近中频段、次选=次接近段、防守=离中频最远段",
+}
 TREND_BIAS_PATTERN = "^(" + "|".join(TREND_BIASES) + ")$"
 # 0 = 用全部样本；默认 30 与首页走势窗一致
 DEFAULT_TREND_WINDOW = 30
@@ -509,18 +515,51 @@ def role_for_focus_rank(rank: int) -> str:
     return ROLE_DEFENSE
 
 
+def _band_rank_prefix(
+    number: int,
+    *,
+    bias: str,
+    trend_counts: Counter[int],
+    mid_target: float,
+) -> tuple[float, ...]:
+    """角色带排序前缀；与 ``order_pool`` 的 ``_trend_sort_prefix`` 同键。
+
+    这样「主推带」= 该偏好下 ``order_pool`` 排在最前的号，两处口径不会打架。
+    ``neutral`` 没有偏好方向（``_trend_sort_prefix`` 返回空元组），回退为旧的
+    「近窗最热在前」展示口径 —— 此时角色带只供「走势分布参考」对照，不参与选号。
+    """
+    prefix = _trend_sort_prefix(
+        number, bias=bias, trend_counts=trend_counts, mid_target=mid_target
+    )
+    if prefix:
+        return prefix
+    return (-float(trend_counts.get(number, 0)),)
+
+
 def split_pool_into_role_bands(
     pool: list[dict[str, int]],
     trend_counts: Counter[int],
     sample_size: int,
     days_since_last: dict[int, int | None] | None = None,
+    *,
+    bias: str = TREND_BIAS_NEUTRAL,
+    mid_target: float = 0.0,
 ) -> dict[str, list[dict[str, Any]]]:
-    """同一波动桶内按近期频次切三角色带。
+    """同一波动桶内按**该偏好**的近窗频次切三角色带。
 
     规则（前后端一致、可解释）：
-    1. 桶内按「近窗出现次数降序 → 与最新号差值升序 → 号码升序」排序；
+    1. 桶内先按偏好排序键（``_band_rank_prefix``，与 ``order_pool`` 同键）排序，
+       再按「与最新号差值升序 → 号码升序」回落；
     2. 连续切成三段，尺寸 ``(n+2)//3, (n+1)//3, n//3``；
-    3. **主推** = 最热一段，**次选** = 中段，**防守** = 最冷一段。
+    3. **主推** = 该偏好最靠前的一段，**次选** = 中段，**防守** = 最靠后的一段。
+
+    ``bias`` 决定「最靠前」的含义，三种方向互不相同：
+    - ``hot``：近窗次数**降序** → 主推=最热段，防守=最冷段；
+    - ``cold``：近窗次数**升序** → 主推=最冷段，防守=最热段；
+    - ``mid``：按 ``|次数 − 近窗均值|`` **升序** → 主推=最接近中频段，
+      防守=离中频最远段（两端极值）；
+    - ``neutral``：不加权，保持旧的「最热在前」展示口径（仅供对照）。
+
     次数与占比相对「近窗样本期数」计算，是经验频率不是真实概率。
     近窗 count=0 的号额外带 ``days_since_last``（样本内距上次出现自然日；
     从未出现为 null）。
@@ -528,7 +567,12 @@ def split_pool_into_role_bands(
     ranked = sorted(
         pool,
         key=lambda item: (
-            -trend_counts.get(item["number"], 0),
+            *_band_rank_prefix(
+                item["number"],
+                bias=bias,
+                trend_counts=trend_counts,
+                mid_target=mid_target,
+            ),
             item["diff"],
             item["number"],
         ),
@@ -558,6 +602,28 @@ def split_pool_into_role_bands(
     return bands
 
 
+# 角色带口径说明：必须与 ``_band_rank_prefix`` 的实际排序一致，否则 UI 会骗人
+_BAND_RULE_HEAD = {
+    TREND_BIAS_HOT: (
+        "同一波动桶内按近窗出现次数降序切三段："
+        "主推=最热段，次选=中段，防守=最冷段；"
+    ),
+    TREND_BIAS_COLD: (
+        "同一波动桶内按近窗出现次数升序切三段："
+        "主推=最冷段，次选=中段，防守=最热段；"
+    ),
+    TREND_BIAS_MID: (
+        "同一波动桶内按「近窗次数 − 近窗均值」绝对值升序切三段："
+        "主推=最接近中频段，次选=次接近段，防守=离中频最远段；"
+    ),
+}
+# neutral / 未知：不加权时角色带仅供对照，沿用旧展示口径
+_BAND_RULE_HEAD_DEFAULT = (
+    "同一波动桶内按近窗出现次数降序切三段："
+    "主推=最热段，次选=中段，防守=最冷段；"
+)
+
+
 def build_trend_distributions(
     pools: dict[str, list[dict[str, int]]],
     trend_counts: Counter[int],
@@ -566,12 +632,21 @@ def build_trend_distributions(
     used_window: int,
     bias: str,
     days_since_last: dict[int, int | None] | None = None,
+    mid_target: float = 0.0,
 ) -> dict[str, Any]:
-    """结构化「波动 × 角色」走势分布参考（供 UI 分块展示）。"""
+    """结构化「波动 × 角色」走势分布参考（供 UI 分块展示）。
+
+    角色带按 ``bias`` 切分，与选号用的 ``wave_bands`` 同源，展示与选号一致。
+    """
     waves: dict[str, Any] = {}
     for wave in WAVE_ORDER:
         bands = split_pool_into_role_bands(
-            pools[wave], trend_counts, used_window, days_since_last
+            pools[wave],
+            trend_counts,
+            used_window,
+            days_since_last,
+            bias=bias,
+            mid_target=mid_target,
         )
         waves[wave] = {
             "type": wave,
@@ -586,9 +661,8 @@ def build_trend_distributions(
         "bias": bias,
         "bias_label": TREND_BIAS_LABELS.get(bias, bias),
         "rule": (
-            "同一波动桶内按近窗出现次数降序切三段："
-            "主推=最热段，次选=中段，防守=最冷段；"
-            "次数与占比为本池近窗经验频率，不是真实概率。"
+            _BAND_RULE_HEAD.get(bias, _BAND_RULE_HEAD_DEFAULT)
+            + "次数与占比为本池近窗经验频率，不是真实概率。"
             "近窗 0 次号附距上次出现自然日（样本内从未出现则为空）。"
         ),
         "waves": waves,
@@ -1124,9 +1198,12 @@ def recommend(
 
     走势加权（``trend_bias`` / ``trend_window``）：
     - 先按差值把候选分进小波动 / 常规 / 大跳三桶（阈值来自设置）；
-    - 每桶内按近窗出现次数切主推/次选/防守三段（见 ``split_pool_into_role_bands``）；
+    - 每桶内按**该偏好**的近窗频次排序键切主推/次选/防守三段
+      （见 ``split_pool_into_role_bands``）：``hot`` → 主推=最热段，
+      ``cold`` → 主推=最冷段，``mid`` → 主推=最接近中频段；
     - 选号时：该波动在侧重顺序里对应的角色，优先从该桶对应角色带取号；
-    - ``neutral`` 关闭加权，池内排序回退为旧的「全历史遗漏优先」。
+    - ``neutral`` 关闭加权，池内排序回退为旧的「全历史遗漏优先」，
+      且**不读** ``trend_window``（窗口只影响展示，不影响选号）。
 
     避冷加权（``avoid_cold_enabled`` / ``avoid_cold_days``，与 ``trend_bias`` 独立）：
     - 候选池排序把冷号（``days_since_last`` 超过阈值，或样本内从未出现）整体排到队尾；
@@ -1223,7 +1300,7 @@ def recommend(
     else:
         focus = list(DEFAULT_FOCUS)
 
-    # 走势分布参考：始终按频次三段切分（展示与生成共用同一套切分）
+    # 走势分布参考：按**同一偏好**切频次三段（展示与选号共用同一套切分，避免口径打架）
     trend_distributions = build_trend_distributions(
         pools,
         trend_counts,
@@ -1231,10 +1308,18 @@ def recommend(
         used_window=used_window,
         bias=trend_bias,
         days_since_last=days_since_last,
+        mid_target=mid_target,
     )
     wave_bands = {
         wave: split_pool_into_role_bands(
-            pools[wave], trend_counts, used_window, days_since_last
+            pools[wave],
+            trend_counts,
+            used_window,
+            days_since_last,
+            # 角色带按 trend_bias 定向：hot→最热段主推，cold→最冷段主推，
+            # mid→最接近中频段主推；neutral 不消费角色带（走 ordered_pools）
+            bias=trend_bias,
+            mid_target=mid_target,
         )
         for wave in WAVE_ORDER
     }
@@ -1404,7 +1489,8 @@ def recommend(
         notes.append(
             f"已按本池样本内{window_text}特码出现频次做"
             f"「{TREND_BIAS_LABELS[trend_bias]}」："
-            "各波动桶内主推/次选/防守对应频次三段（热→中→冷）；"
+            f"各波动桶内按该偏好切主推/次选/防守三段"
+            f"（{_BAND_ORDER_NOTE.get(trend_bias, _BAND_ORDER_NOTE[TREND_BIAS_HOT])}）；"
             "这是样本内加权偏好，不是真实概率，也不承诺提高命中率。"
         )
 

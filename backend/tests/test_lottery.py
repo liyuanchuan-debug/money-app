@@ -1528,17 +1528,22 @@ def test_avoid_cold_disabled_ordering_matches_legacy_pool_order():
 
 
 def _weighted_interaction_history() -> tuple[list[int], list[date]]:
-    """加权路径场景：24 出现 3 次但都在 200+ 天前（冷号，且桶内计数最高）。
+    """加权路径场景：24 是小波动桶内**唯一冷号**（200 天前），且桶内排序第一。
 
-    小波动桶其余号各出现 1 次且日期很近（非冷号）；这样 24 会落进「主推（最热）带」，
-    用于验证避冷排后在加权路径同样生效。
+    小波动桶内每号各出现 1 次（计数相等）→ 三种偏好的频次排序前缀在本桶内退化为
+    常数，hot / cold / mid 切出的角色带**完全一致**。因此本用例对三种偏好都成立，
+    验证的是「避冷排后在加权路径同样生效」，与偏好方向解耦（修复前冷/中频被错误地
+    走成热号偏好的切片，才会让「主推=最热段」这个前提对三者都看似成立）。
+
+    24 相对最新号 25 的差值最小（|24-25|=1）→ 排桶内第一、落进主推带；
+    其余小波动号日期很近（1 天前）→ 非冷号。
     """
     small_others = [n for n in _COLD_SMALL if n != COLD_TARGET]
-    history = [COLD_LATEST, COLD_TARGET, COLD_TARGET, COLD_TARGET]
-    dates = [COLD_REF, COLD_REF - timedelta(days=200),
-             COLD_REF - timedelta(days=260), COLD_REF - timedelta(days=320)]
-    history += [*small_others, *_COLD_OTHERS]
-    dates += [COLD_REF - timedelta(days=1)] * (len(small_others) + len(_COLD_OTHERS))
+    history = [COLD_LATEST, COLD_TARGET, *small_others, *_COLD_OTHERS]
+    dates = (
+        [COLD_REF, COLD_REF - timedelta(days=200)]
+        + [COLD_REF - timedelta(days=1)] * (len(small_others) + len(_COLD_OTHERS))
+    )
     return history, dates
 
 
@@ -1567,6 +1572,94 @@ def test_avoid_cold_applies_in_weighted_path_for_every_bias(bias: str):
     assert off["trend_bias"] == bias
     assert on["trend_bias"] == bias
     assert off["picks"][0]["role"] == on["picks"][0]["role"] == "primary"
+
+
+def test_trend_bias_direction_changes_role_bands():
+    """三种偏好方向必须切出**不同**的角色带。
+
+    回归：``split_pool_into_role_bands`` 原先不接收 ``bias``，而加权路径取号只走角色带
+    （``ordered_pools`` 仅作回退），于是 hot / cold / mid 退化成同一套「主推=最热段」，
+    界面上三个方向选项形同虚设。
+    """
+    latest = 25
+    # 小波动桶内计数刻意不等：24=3 次（最热）、26=2 次、23/27=1 次、其余=0 次
+    history = [25, 24, 24, 24, 26, 26, 23, 27, 10, 40]
+
+    def band_and_rule(bias: str) -> tuple[list[int], str]:
+        result = recommend(
+            latest=latest,
+            previous=10,
+            history_numbers=history,
+            settings={
+                "pick_count": 3,
+                "trend_bias": bias,
+                "trend_window": 0,
+                "avoid_cold_enabled": False,
+                "small_max": 10,
+                "normal_max": 30,
+            },
+        )
+        dist = result["trend_distributions"]
+        assert dist["bias"] == bias
+        primary = [item["number"] for item in dist["waves"]["small"]["primary"]]
+        return primary, dist["rule"]
+
+    (hot, hot_rule) = band_and_rule("hot")
+    (cold, cold_rule) = band_and_rule("cold")
+    (mid, mid_rule) = band_and_rule("mid")
+
+    # 三个方向切出三个不同的主推段（修复前恒为同一个）
+    assert len({tuple(hot), tuple(cold), tuple(mid)}) == 3, (hot, cold, mid)
+    # 热号偏好：首位是桶内最热的 24
+    assert hot[0] == 24
+    # 冷号偏好：方向相反，主推段不含最热的 24
+    assert 24 not in cold
+    # 中频优先：首位不是最热的 24
+    assert mid[0] != hot[0]
+    # 展示口径必须跟着偏好转（否则 rule 与实际切片打架，UI 会自相矛盾）
+    assert len({hot_rule, cold_rule, mid_rule}) == 3
+    assert all("主推=" in rule for rule in (hot_rule, cold_rule, mid_rule))
+
+
+def test_trend_window_ignored_for_selection_when_neutral():
+    """不加权时 trend_window **不影响选号**，只影响「走势分布参考」的展示。
+
+    回归：用户反馈「窗口从 60 改到 100，号码没变化」。neutral 走 ``ordered_pools``，
+    排序键是**全历史**遗漏计数，``_trend_sort_prefix`` 返回空元组 ——
+    近窗统计（``trend_counts``）根本没有进入选号排序键，窗口只在展示里出现。
+    """
+    latest, previous = 25, 10
+    # 近 3 期最热是 26；全样本最热是 24 —— 让「窗口不同 → 频次不同 → 角色带不同」
+    history = [25, 26, 26, 26, 24, 24, 24, 24, 23, 27]
+
+    def run(bias: str, window: int) -> dict:
+        return recommend(
+            latest=latest,
+            previous=previous,
+            history_numbers=history,
+            settings={
+                "pick_count": 3,
+                "trend_bias": bias,
+                "trend_window": window,
+                "avoid_cold_enabled": False,
+                "small_max": 10,
+                "normal_max": 30,
+            },
+        )
+
+    def picks(bias: str, window: int) -> list[int]:
+        return [p["number"] for p in run(bias, window)["picks"]]
+
+    # neutral：窗口 3 / 10（全部）选号逐元素一致
+    assert picks("neutral", 3) == picks("neutral", 10)
+    # 但展示口径确实随窗口变（诚实：不是「完全没变」，是选号没变）
+    assert run("neutral", 3)["trend_distributions"]["used_window"] == 3
+    assert run("neutral", 10)["trend_distributions"]["used_window"] == 10
+
+    # 开启偏好后，窗口才会改变选号（近 3 期最热的 26 vs 全样本最热的 24）
+    assert picks("hot", 3) != picks("hot", 10)
+    assert picks("hot", 3)[0] == 26
+    assert picks("hot", 10)[0] == 24
 
 
 @pytest.mark.parametrize("bias", ["neutral", "hot", "cold", "mid"])
