@@ -251,7 +251,13 @@ def test_zodiac_trend_full_window_has_no_insufficient_note():
 def test_backtest_known_answer():
     # 第 3 期：latest=20/prev=10 → 小波动池内「遗漏最久且差值最小」为 19，实际也是 19 → 命中
     # 第 4 期：latest=19/prev=20 → 预测 18，实际 05 → 未命中
-    result = backtest_stats(_draws([10, 20, 19, 5]), mode="even", pick_count=1)
+    # 关闭避冷加权：本用例校验回测机制与旧引擎的已知答案（避冷另有专门用例）
+    result = backtest_stats(
+        _draws([10, 20, 19, 5]),
+        mode="even",
+        pick_count=1,
+        base_settings={"avoid_cold_enabled": False},
+    )
 
     assert result["evaluated"] == 2
     assert result["hits"] == 1
@@ -313,7 +319,13 @@ def test_backtest_exclude_repeat_zodiac_shrinks_pool():
 
 
 def test_backtest_wave_breakdown():
-    result = backtest_stats(_draws([10, 20, 19, 5]), mode="even", pick_count=1)
+    # 关闭避冷加权：校验回测的波动分组统计（旧引擎已知答案）
+    result = backtest_stats(
+        _draws([10, 20, 19, 5]),
+        mode="even",
+        pick_count=1,
+        base_settings={"avoid_cold_enabled": False},
+    )
 
     realized = {item["type"]: item for item in result["wave_breakdown"]["items"]}
     assert realized["small"]["evaluated"] == 1  # |19-20| = 1
@@ -333,9 +345,21 @@ def test_backtest_wave_breakdown():
 
 
 def test_backtest_has_no_lookahead():
-    base = backtest_stats(_draws([10, 20, 19, 5]), mode="even", pick_count=1)
+    # 关闭避冷加权：本用例只校验「不使用未来数据」，与避冷特性无关
+    base_settings = {"avoid_cold_enabled": False}
+    base = backtest_stats(
+        _draws([10, 20, 19, 5]),
+        mode="even",
+        pick_count=1,
+        base_settings=base_settings,
+    )
     # 只改动最后一期（未来）；更早一期的结果必须逐字段完全一致
-    modified = backtest_stats(_draws([10, 20, 19, 45]), mode="even", pick_count=1)
+    modified = backtest_stats(
+        _draws([10, 20, 19, 45]),
+        mode="even",
+        pick_count=1,
+        base_settings=base_settings,
+    )
 
     assert base["results"][0] == modified["results"][0]
     # 最后一期的预测只依赖它之前的数据，也必须一致；只有 actual / hit 变了
@@ -364,6 +388,34 @@ def test_backtest_respects_overrides():
     assert strict["settings"]["small_max"] == 0
     assert strict["settings"]["big_min"] == 31
     assert strict["results"][0]["realized_wave_type"] == "normal"  # |19-20| = 1
+
+
+def test_backtest_reflects_avoid_cold_setting():
+    """避冷加权随 base_settings 进入回测（与财富密码同源），并如实回报生效值。"""
+    draws = _draws([10, 20, 19, 5])
+
+    off = backtest_stats(
+        draws,
+        mode="even",
+        pick_count=1,
+        base_settings={"avoid_cold_enabled": False},
+    )
+    on = backtest_stats(
+        draws,
+        mode="even",
+        pick_count=1,
+        base_settings={"avoid_cold_enabled": True, "avoid_cold_days": 60},
+    )
+
+    # 关闭：旧引擎「遗漏最久优先」→ 小波动桶里 24…19（差 1）先取
+    assert off["results"][0]["predicted"] == [19]
+    assert off["settings"]["avoid_cold_enabled"] is False
+    assert off["settings"]["avoid_cold_days"] == 60
+
+    # 开启：样本内最近出现过的 10 是非冷号 → 排到「从未出现」的冷号之前
+    assert on["results"][0]["predicted"] == [10]
+    assert on["settings"]["avoid_cold_enabled"] is True
+    assert on["settings"]["avoid_cold_days"] == 60
 
 
 def test_backtest_too_few_draws_is_insufficient():

@@ -52,6 +52,11 @@ wave-money/
 ...
 ```
 
+生肖**随农历年轮转**（春节换肖）：同一个号码在不同农历年属不同生肖 —— 01 号在
+2026 丙午马年是「马」，在 2025 乙巳蛇年是「蛇」。农历年边界表见
+`services/mark_six.py` 的 `ZODIAC_YEARS`，整表查询走 `GET /api/zodiac/table`。
+农历年只决定「这一组叫什么生肖」，不改变组内成员。
+
 最新开奖号的所有同肖号码称为**重肖**。默认**不避开**；可在设置中开启「避开重肖」（`exclude_repeat_zodiac`），开启后才排除最新一期同肖组。
 
 ### 波动规则（相邻两期差值绝对值）
@@ -79,7 +84,7 @@ wave-money/
    | 常规波动 | 小波动 → 大跳 → 常规波动 |
    | 大跳 | 小波动（回补） → 常规波动 → 大跳 |
 
-7. 每个推荐号标注：与最新开奖号的差值、所属波动类型、是否重肖、侧重等级（主推 / 次选 / 防守）
+7. 每个推荐号标注：与最新开奖号的差值、所属波动类型、是否重肖、生肖（`zodiac` / `zodiac_label`）、侧重等级（主推 / 次选 / 防守）
 
 **候选池内部排序**：先取历史遗漏最久的（历史出现次数最少），再取与最新号差值最小的。保证结果可复现。
 
@@ -237,16 +242,27 @@ npm run dev
 ```json
 {
   "latest": 21,
+  "latest_zodiac": [9, 21, 33, 45],
+  "latest_zodiac_code": "DOG",
+  "latest_zodiac_label": "狗",
+  "zodiac_date": "2026-09-26",
+  "zodiac_year": 2026,
   "previous": 11,
   "prev_wave": { "number": 11, "diff": 10, "type": "small", "label": "小波动" },
   "copy_text": "10：20元；\n20、32：各5元；\n合计：30元。",
   "picks": [
     { "number": 10, "diff": 11, "wave_type": "normal", "role": "primary",
-      "role_label": "主推", "amount": 20, "is_repeat_zodiac": false }
+      "role_label": "主推", "amount": 20, "is_repeat_zodiac": false,
+      "zodiac": "PIG", "zodiac_label": "猪" }
   ],
   "missing_waves": [{ "type": "big", "label": "大跳", "note": "本期大跳无号" }]
 }
 ```
+
+`picks[]` 的 `zodiac` / `zodiac_label` 是号码的**固定映射**：参照日取本池最新一期
+开奖日（`zodiac_date`），农历年表与 `GET /api/draws` 的 `zodiac` 同源，因此和
+`latest_zodiac`（同肖号码组）永远指向同一组号码。拿不到参照日或参照日不在已知农历年表内时，
+这些字段一律为 `null`（不猜年份）。生肖不是命中概率，也不代表某注更可能开出。
 
 ---
 

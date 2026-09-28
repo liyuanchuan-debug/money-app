@@ -5,6 +5,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from services.lottery import (
     AMOUNT_UNIT_MAX,
     AMOUNT_UNIT_MIN,
+    AVOID_COLD_DAYS_MAX,
+    AVOID_COLD_DAYS_MIN,
     MODE_PATTERN,
     NUMBER_MAX,
     NUMBER_MIN,
@@ -39,6 +41,10 @@ class SettingsOut(BaseModel):
     trend_bias: str
     # 近窗期数；0=全部样本
     trend_window: int
+    # 避冷权重：True=距上次出现超过 avoid_cold_days 天的号权重递减、金额递减；默认 True
+    avoid_cold_enabled: bool
+    # 避冷阈值（自然日）：距上次出现 ≤ 该值不惩罚；默认 60，范围 1..999
+    avoid_cold_days: int
     # 只读派生字段：恒等于 normal_max + 1，不接受外部写入
     big_min: int
 
@@ -72,6 +78,15 @@ class SettingsPatch(BaseModel):
     trend_bias: str | None = Field(default=None, pattern=TREND_BIAS_PATTERN)
     trend_window: int | None = Field(
         default=None, ge=TREND_WINDOW_MIN, le=TREND_WINDOW_MAX
+    )
+    avoid_cold_enabled: bool | None = Field(
+        default=None, description="True=开启避冷权重（距上次出现越久金额越低）；默认 True"
+    )
+    avoid_cold_days: int | None = Field(
+        default=None,
+        ge=AVOID_COLD_DAYS_MIN,
+        le=AVOID_COLD_DAYS_MAX,
+        description="避冷阈值（自然日），默认 60",
     )
     # 注意：不声明 big_min，PUT 时请求体里的 big_min 会被 Pydantic 忽略
 

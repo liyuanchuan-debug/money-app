@@ -4,13 +4,15 @@ import {
   CHIP_MODE_OPTIONS,
   TREND_BIAS_OPTIONS,
   TREND_WINDOW_OPTIONS,
+  avoidColdDaysText,
+  avoidColdWeightText,
   type ChipMode,
   type RecommendResult,
   type TrendBias,
   type TrendNumberStat,
   type TrendWaveRoles,
 } from '~/composables/useApi'
-import { normalizeDraws, scopeLabel } from '~/composables/useDraws'
+import { normalizeDraws, scopeLabel, zodiacText } from '~/composables/useDraws'
 
 definePageMeta({ role: 'VIP' })
 
@@ -119,6 +121,15 @@ const {
 const amounts = computed(() => result.value?.picks.map(pick => pick.amount) ?? [])
 const amountsEqual = computed(() =>
   amounts.value.length > 0 && new Set(amounts.value).size === 1)
+
+/** 避冷加权本次是否确实压低了金额（旧后端缺字段 → 视为未生效） */
+const avoidColdActive = computed(() =>
+  result.value?.avoid_cold?.enabled === true
+  && (result.value?.avoid_cold?.penalized_picks ?? 0) > 0)
+
+/** 实际分配到各注的合计（避冷加权压低后可能 < 最大投注金额） */
+const stakedTotal = computed(() =>
+  result.value?.staked_total ?? result.value?.total_amount ?? 0)
 
 const waveTabs = [
   { type: 'small' as const, label: '小波动' },
@@ -266,6 +277,17 @@ function pad(n: number) {
   return String(n).padStart(2, '0')
 }
 
+/**
+ * 各注号码的生肖文案（汉字标签，缺失时退到英文码）。
+ *
+ * 口径：生肖是「号码 → 生肖」的**固定映射**，随农历年（春节）轮转；
+ * 农历年由后端按本池最新一期开奖日推导，与上方「最新同肖」号码组同源。
+ * 拿不到农历年时后端返回 null —— 这里照实留空，绝不拿前端本地日期猜。
+ */
+function pickZodiac(pick: { zodiac?: string | null; zodiac_label?: string | null }): string {
+  return zodiacText(pick)
+}
+
 /** 波动 → StatChip 色调（小波动 / 常规 / 大跳） */
 const waveTones: Record<string, 'emerald' | 'amber' | 'bloom'> = {
   small: 'emerald',
@@ -400,6 +422,10 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   <span class="text-xs text-slate-500">
                     {{ result.settings?.exclude_repeat_zodiac ? '重肖（需避开）' : '最新同肖' }}
                   </span>
+                  <!-- 这一组号码对应的生肖（与卡片上的生肖同一张农历年表，不会互相打架） -->
+                  <StatChip v-if="result.latest_zodiac_label" tone="nebula" size="xs">
+                    {{ result.latest_zodiac_label }}
+                  </StatChip>
                   <StatChip
                     v-for="number in result.latest_zodiac"
                     :key="number"
@@ -565,6 +591,9 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               <StatChip tone="aqua" size="sm">模式：{{ result.mode_label }}</StatChip>
               <StatChip tone="nebula" size="sm">最大投注金额 {{ result.total_amount }} 元</StatChip>
               <StatChip tone="neutral" size="sm">金额最小单位 {{ result.amount_unit }} 元</StatChip>
+              <StatChip v-if="avoidColdActive" tone="amber" size="sm">
+                避冷加权后实投 {{ stakedTotal }} 元（省下 {{ result.avoid_cold?.reduced_total ?? 0 }} 元未再分配）
+              </StatChip>
               <StatChip tone="neutral" size="sm">
                 实际 {{ result.picks.length }} 注
               </StatChip>
@@ -574,18 +603,46 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               <StatChip v-else tone="amber" size="sm">各注金额不等（均为最小单位倍数）</StatChip>
             </div>
 
+            <!-- 避冷加权（冷号排后 + 金额封顶）：如实说明，绝不宣称提高命中率或收益 -->
+            <p
+              v-if="result.avoid_cold?.enabled"
+              class="text-xs leading-relaxed text-slate-500"
+            >
+              避冷加权已开启（阈值 {{ result.avoid_cold.days }} 天，
+              保本金额 {{ result.avoid_cold.cap_amount }} 元）：距上次出现超过阈值的号码已排到候选队列末尾
+              （非冷号优先），
+              <template v-if="avoidColdActive">
+                本次 {{ result.avoid_cold.penalized_picks }} 注因间隔过久被压低金额，合计少投
+                {{ result.avoid_cold.reduced_total }} 元（不补给其它注）。
+              </template>
+              <template v-else>本次没有距上次出现超过阈值的注，金额未受影响。</template>
+              这是样本内偏好，不是概率，也不承诺提高命中率或收益。
+            </p>
+            <p
+              v-else-if="result.avoid_cold"
+              class="text-xs leading-relaxed text-slate-500"
+            >
+              避冷加权已关闭：距上次出现多久都不影响选号与金额（可在设置页开启）。
+            </p>
+
             <!-- 各注金额一览（随机分配下通常不等，如实列出） -->
             <div class="space-y-1.5">
               <p class="text-xs text-slate-500">
-                各注金额（共 {{ amounts.length }} 注，合计 {{ result.total_amount }} 元）：
+                各注金额（共 {{ amounts.length }} 注，合计 {{ stakedTotal }} 元）：
               </p>
               <div class="flex flex-wrap gap-2">
                 <span
                   v-for="pick in result.picks"
                   :key="pick.number"
-                  class="num rounded-lg bg-white/5 px-2.5 py-1 text-sm text-slate-200"
+                  class="rounded-lg bg-white/5 px-2.5 py-1 text-sm text-slate-200"
                 >
-                  {{ pad(pick.number) }} → {{ pick.amount }} 元
+                  <span class="num">{{ pad(pick.number) }}</span>
+                  <span
+                    v-if="pickZodiac(pick)"
+                    class="ml-1 text-xs text-nebula-200"
+                  >{{ pickZodiac(pick) }}</span>
+                  <span class="mx-1 text-slate-500">→</span>
+                  <span class="num">{{ pick.amount }} 元</span>
                 </span>
               </div>
             </div>
@@ -671,6 +728,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
             <h2 class="text-lg font-medium text-white">财富密码</h2>
             <p class="text-xs text-slate-500">
               按 {{ result.mode_label }} 模式生成 {{ result.picks.length }} 注候选号码；口径：{{ scope }}。
+              生肖是「号码 → 生肖」的固定映射（随农历年轮转），不是命中概率，也不代表这注更有可能开出。
             </p>
           </MotionReveal>
 
@@ -701,6 +759,11 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   :glow="pick.role === 'primary'"
                 />
 
+                <!-- 生肖：号码的固定映射（随农历年轮转），不是命中概率 / 预测 -->
+                <StatChip tone="nebula" size="xs">
+                  生肖 {{ pickZodiac(pick) || '—' }}
+                </StatChip>
+
                 <div class="w-full space-y-1.5 text-sm">
                   <div class="flex items-center justify-between">
                     <span class="text-slate-500">差值</span>
@@ -719,6 +782,15 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                     </span>
                   </div>
                   <div class="flex items-center justify-between">
+                    <span class="text-slate-500">距上次出现</span>
+                    <span
+                      class="text-xs"
+                      :class="pick.avoid_cold_penalized ? 'text-amber-300' : 'text-slate-200'"
+                    >
+                      {{ avoidColdDaysText(pick.days_since_last) }}
+                    </span>
+                  </div>
+                  <div class="flex items-center justify-between">
                     <span class="text-slate-500">重肖</span>
                     <span
                       class="text-xs font-medium"
@@ -726,6 +798,15 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                     >
                       {{ pick.is_repeat_zodiac ? '是' : '否' }}
                     </span>
+                  </div>
+                  <div
+                    v-if="pick.avoid_cold_penalized"
+                    class="flex items-center justify-between"
+                  >
+                    <span class="text-slate-500">避冷加权</span>
+                    <StatChip tone="amber" size="xs">
+                      {{ avoidColdWeightText(pick.avoid_cold_weight) }}
+                    </StatChip>
                   </div>
                 </div>
 

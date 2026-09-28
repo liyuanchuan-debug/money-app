@@ -7,11 +7,16 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
+from datetime import date, datetime, timedelta
 
 import pytest
 
 from services.lottery import (
+    AVOID_COLD_FLOOR_WEIGHT,
     DEFAULT_AMOUNT_UNIT,
+    DEFAULT_AVOID_COLD_DAYS,
+    DEFAULT_AVOID_COLD_ENABLED,
     DEFAULT_SETTINGS,
     DEFAULT_TOTAL_AMOUNT,
     MODE_EVEN,
@@ -26,16 +31,25 @@ from services.lottery import (
     WAVE_SMALL,
     allocate_amounts,
     amount_seed_key,
+    apply_avoid_cold_amounts,
     assign_roles,
+    avoid_cold_weight,
+    build_candidate_pools,
     build_copy_text,
     classify_wave,
     clamp_settings,
+    compute_days_since_last,
+    format_number,
+    is_avoid_cold_number,
+    order_pool,
     random_allocation,
     random_amounts,
     recommend,
+    resolve_zodiac_date,
     with_derived_settings,
     zodiac_numbers,
 )
+from services.mark_six import ZODIAC_LABELS, zodiac_of
 
 DEFAULT_SMALL_MAX = 10
 DEFAULT_NORMAL_MAX = 30
@@ -114,7 +128,13 @@ def test_recommend_sweep(
         latest=latest,
         previous=previous,
         history_numbers=history,
-        settings={"total_amount": BET_UNIT * pick_count, "pick_count": pick_count},
+        settings={
+            "total_amount": BET_UNIT * pick_count,
+            "pick_count": pick_count,
+            # 本用例校验分配口径（旧行为）：显式关闭避冷权重，
+            # 否则默认开启的避冷权重会压低金额（另有专门用例覆盖新行为）。
+            "avoid_cold_enabled": False,
+        },
         mode=mode,
     )
 
@@ -322,6 +342,8 @@ def test_documented_default_amounts():
             previous=15,
             history_numbers=history,
             mode=mode,
+            # 校验产品默认分配口径（旧行为）：关闭避冷权重
+            settings={"avoid_cold_enabled": False},
         )
         got = [pick["amount"] for pick in result["picks"]]
         assert got == amounts, f"{mode}: 期望 {amounts}，实际 {got}"
@@ -336,14 +358,15 @@ def test_single_mode_bets_whole_total_amount():
             latest=20,
             previous=15,
             history_numbers=[15, 20],
-            settings={"total_amount": total, "pick_count": 3},
+            # 关闭避冷权重：本用例校验单挑的旧分配口径
+            settings={"total_amount": total, "pick_count": 3, "avoid_cold_enabled": False},
             mode=MODE_SINGLE,
         )
         assert len(result["picks"]) == 1
         assert result["picks"][0]["amount"] == expected_amount
         assert result["total_amount"] == expected_amount
         num = result["picks"][0]["number"]
-        assert result["copy_text"] == f"{num}：{expected_amount}元；\n合计：{expected_amount}元。"
+        assert result["copy_text"] == f"{num:02d}：{expected_amount}元；\n合计：{expected_amount}元。"
 
 
 def test_single_mode_budget_ignores_configured_pick_count():
@@ -354,7 +377,7 @@ def test_single_mode_budget_ignores_configured_pick_count():
             latest=20,
             previous=15,
             history_numbers=[15, 20],
-            settings={"total_amount": 30, "pick_count": configured},
+            settings={"total_amount": 30, "pick_count": configured, "avoid_cold_enabled": False},
             mode=MODE_SINGLE,
         )
         amounts.add(result["picks"][0]["amount"])
@@ -459,7 +482,13 @@ def test_recommend_random_end_to_end():
         latest=20,
         previous=15,
         history_numbers=[15, 20, 3, 44],
-        settings={"total_amount": 100, "amount_unit": 5, "pick_count": 3},
+        # 关闭避冷权重：校验随机分配的旧金额口径
+        settings={
+            "total_amount": 100,
+            "amount_unit": 5,
+            "pick_count": 3,
+            "avoid_cold_enabled": False,
+        },
         mode=MODE_RANDOM,
         period=270,
     )
@@ -481,7 +510,12 @@ def test_recommend_random_is_reproducible_for_same_period():
         latest=20,
         previous=15,
         history_numbers=[15, 20, 3, 44],
-        settings={"total_amount": 100, "amount_unit": 5, "pick_count": 3},
+        settings={
+            "total_amount": 100,
+            "amount_unit": 5,
+            "pick_count": 3,
+            "avoid_cold_enabled": False,
+        },
         mode=MODE_RANDOM,
         period=270,
     )
@@ -495,7 +529,12 @@ def test_recommend_random_respects_explicit_amount_seed():
         latest=20,
         previous=15,
         history_numbers=[15, 20, 3, 44],
-        settings={"total_amount": 100, "amount_unit": 5, "pick_count": 3},
+        settings={
+            "total_amount": 100,
+            "amount_unit": 5,
+            "pick_count": 3,
+            "avoid_cold_enabled": False,
+        },
         mode=MODE_RANDOM,
         period=270,
     )
@@ -514,7 +553,13 @@ def test_recommend_random_notes_are_surfaced():
         latest=20,
         previous=15,
         history_numbers=[15, 20],
-        settings={"total_amount": 10, "amount_unit": 5, "pick_count": 3},
+        # 关闭避冷权重：校验随机分配降级说明（避免避冷额外改写金额）
+        settings={
+            "total_amount": 10,
+            "amount_unit": 5,
+            "pick_count": 3,
+            "avoid_cold_enabled": False,
+        },
         mode=MODE_RANDOM,
         period=1,
     )
@@ -538,7 +583,7 @@ def test_even_copy_text_lists_amounts_when_total_not_divisible():
     ]
     text = build_copy_text(MODE_EVEN, picks)
     assert "各34元" not in text
-    assert text == "9：34元；\n19、31：各33元；\n合计：100元。"
+    assert text == "09：34元；\n19、31：各33元；\n合计：100元。"
 
 
 def test_random_copy_text_lists_each_amount():
@@ -548,7 +593,7 @@ def test_random_copy_text_lists_each_amount():
         {"number": 31, "amount": 50, "role_label": "防守"},
     ]
     text = build_copy_text(MODE_RANDOM, picks)
-    assert text == "9：15元；\n19：35元；\n31：50元；\n合计：100元。"
+    assert text == "09：15元；\n19：35元；\n31：50元；\n合计：100元。"
 
 
 def test_even_copy_text_merges_equal_amounts():
@@ -557,11 +602,40 @@ def test_even_copy_text_merges_equal_amounts():
         {"number": 19, "amount": 10, "role_label": "次选"},
         {"number": 31, "amount": 10, "role_label": "防守"},
     ]
-    assert build_copy_text(MODE_EVEN, picks) == "9、19、31：各10元；\n合计：30元。"
+    assert build_copy_text(MODE_EVEN, picks) == "09、19、31：各10元；\n合计：30元。"
+
+
+def test_copy_text_pads_single_digit_numbers():
+    """个位号码补前导 0；两位号码原样；合计金额不补零。"""
+    picks = [
+        {"number": 7, "amount": 15, "role_label": "主推"},
+        {"number": 39, "amount": 15, "role_label": "次选"},
+    ]
+    assert build_copy_text(MODE_WEIGHTED, picks) == (
+        "07、39：各15元；\n合计：30元。"
+    )
+
+
+def test_copy_text_keeps_two_digit_numbers_unchanged():
+    """两位数号码（13 / 49）不因补零被改写。"""
+    picks = [
+        {"number": 13, "amount": 20, "role_label": "主推"},
+        {"number": 49, "amount": 30, "role_label": "次选"},
+    ]
+    assert build_copy_text(MODE_EVEN, picks) == "13：20元；\n49：30元；\n合计：50元。"
+
+
+def test_format_number_helper():
+    """format_number：个位补零到两位，两位数原样。"""
+    assert format_number(1) == "01"
+    assert format_number(9) == "09"
+    assert format_number(13) == "13"
+    assert format_number(49) == "49"
+    assert format_number("7") == "07"
 
 
 def test_copy_text_user_sample_format():
-    """用户约定样例：独额 + 同额合并 + 分号换行 + 合计。"""
+    """用户约定样例：独额 + 同额合并 + 分号换行 + 合计（两位数不补零）。"""
     picks = [
         {"number": 30, "amount": 20, "role_label": "主推"},
         {"number": 15, "amount": 15, "role_label": "次选"},
@@ -621,6 +695,9 @@ def test_recommend_allows_repeat_zodiac_when_disabled():
             "exclude_repeat_zodiac": False,
             "pick_count": 3,
             "trend_bias": "neutral",
+            # 本用例只校验「避开重肖」开关：关闭避冷加权，
+            # 否则默认开启的避冷加权会把同肖冷号排到队尾（另有专门用例覆盖）
+            "avoid_cold_enabled": False,
         },
     )
     picked = {pick["number"] for pick in result["picks"]}
@@ -799,7 +876,14 @@ def test_bet_count_override_changes_pick_length():
 
     history = [22, 40, 15, 30, 21, 16, 14, 19, 25, 18]
     base = clamp_settings(
-        {"pick_count": 6, "total_amount": 50, "amount_unit": 5, "mode": MODE_EVEN}
+        {
+            "pick_count": 6,
+            "total_amount": 50,
+            "amount_unit": 5,
+            "mode": MODE_EVEN,
+            # 校验注数覆盖的旧分配口径：关闭避冷权重
+            "avoid_cold_enabled": False,
+        }
     )
     # 模拟 router：bet_count → settings["pick_count"]（仅本请求）
     overridden = dict(base)
@@ -960,3 +1044,713 @@ def test_settings_api_legacy_hot_reads_neutral_until_manually_set():
         assert client.get("/api/settings").json()["trend_bias"] == "hot"
         # 还原，避免影响其它用例（每个用例独立 store，这里只是幂等收尾）
         client.put("/api/settings", json={"trend_bias": "neutral"})
+
+
+# --------------------------------------------------------------------------- #
+# 14. 避冷加权：距上次出现越久 → 选号排后、金额越低（最多给保本金额）
+# --------------------------------------------------------------------------- #
+COLD_LATEST = 25
+COLD_TARGET = 24  # |24-25|=1 → 小波动；桶内差值最小，桶内排序第一
+COLD_REF = date(2026, 9, 27)
+
+# 最新号为 25 时的小波动桶号码（差 ≤ 10），用于构造「整桶都是冷号」的场景
+_COLD_SMALL = [
+    n
+    for n in range(1, 50)
+    if n != COLD_LATEST
+    and classify_wave(abs(n - COLD_LATEST), DEFAULT_SMALL_MAX, DEFAULT_NORMAL_MAX)
+    == WAVE_SMALL
+]
+_COLD_OTHERS = [
+    n for n in range(1, 50) if n != COLD_LATEST and n not in _COLD_SMALL
+]
+
+
+def _cold_history(days: int | None) -> tuple[list[int], list[date]]:
+    """构造「小波动桶内**全部是冷号**、target 仍排桶内第一」的历史序列。
+
+    这样无论避冷加权是否把冷号排后，``target``（24）都会被选中，
+    金额口径才可稳定断言：
+    - 常规 / 大跳桶的号码各出现两次、日期很近 → 非冷号；
+    - 小波动桶的号码各出现一次、日期很久远（200 天）→ 整桶都是冷号；
+    - ``days is None`` → target 样本内从未出现（最冷）；
+      否则 target 出现在序列末尾，``days_since_last`` 恰好是 ``days``。
+    """
+    small_others = [n for n in _COLD_SMALL if n != COLD_TARGET]
+    history = [COLD_LATEST, *_COLD_OTHERS, *_COLD_OTHERS, *small_others]
+    dates = (
+        [COLD_REF]
+        + [COLD_REF - timedelta(days=1)] * (2 * len(_COLD_OTHERS))
+        + [COLD_REF - timedelta(days=200)] * len(small_others)
+    )
+    if days is not None:
+        history.append(COLD_TARGET)
+        dates.append(COLD_REF - timedelta(days=int(days)))
+    return history, dates
+
+
+def _cold_recommend(
+    days: int | None,
+    *,
+    enabled: bool = True,
+    threshold: int = DEFAULT_AVOID_COLD_DAYS,
+    total: int = 50,
+    unit: int = DEFAULT_AMOUNT_UNIT,
+    mode: str = MODE_SINGLE,
+) -> dict:
+    history, dates = _cold_history(days)
+    return recommend(
+        latest=COLD_LATEST,
+        previous=15,
+        history_numbers=history,
+        history_dates=dates,
+        settings={
+            "total_amount": total,
+            "amount_unit": unit,
+            "pick_count": 1,
+            "avoid_cold_enabled": enabled,
+            "avoid_cold_days": threshold,
+        },
+        mode=mode,
+    )
+
+
+def test_avoid_cold_weight_rule():
+    """权重口径：≤ 阈值不惩罚；> 阈值 inverse 衰减；从未出现取地板值。"""
+    assert avoid_cold_weight(0, threshold=60) == 1.0
+    assert avoid_cold_weight(59, threshold=60) == 1.0
+    # 正好等于阈值：不惩罚（用户约定 60 天不降权重）
+    assert avoid_cold_weight(60, threshold=60) == 1.0
+    # 2 倍阈值 → 0.5；4 倍 → 0.25
+    assert avoid_cold_weight(120, threshold=60) == pytest.approx(0.5)
+    assert avoid_cold_weight(240, threshold=60) == pytest.approx(0.25)
+    # 本池样本内从未出现 → 最冷，取地板权重
+    assert avoid_cold_weight(None, threshold=60) == AVOID_COLD_FLOOR_WEIGHT
+    # 关闭 → 恒 1.0（含「从未出现」与极冷值）
+    assert avoid_cold_weight(None, enabled=False) == 1.0
+    assert avoid_cold_weight(9999, enabled=False) == 1.0
+
+
+def test_avoid_cold_defaults_on_and_clamped():
+    assert DEFAULT_AVOID_COLD_ENABLED is True
+    assert DEFAULT_AVOID_COLD_DAYS == 60
+    assert DEFAULT_SETTINGS["avoid_cold_enabled"] is True
+    assert DEFAULT_SETTINGS["avoid_cold_days"] == 60
+    assert clamp_settings({})["avoid_cold_enabled"] is True
+    assert clamp_settings({})["avoid_cold_days"] == 60
+    # 缺失 / 脏值 → 默认开启；显式 false 才关闭
+    assert clamp_settings({"avoid_cold_enabled": None})["avoid_cold_enabled"] is True
+    assert clamp_settings({"avoid_cold_enabled": "false"})["avoid_cold_enabled"] is False
+    # 阈值钳到 1..999，非数字回退默认 60
+    assert clamp_settings({"avoid_cold_days": 0})["avoid_cold_days"] == 1
+    assert clamp_settings({"avoid_cold_days": 99999})["avoid_cold_days"] == 999
+    assert clamp_settings({"avoid_cold_days": "abc"})["avoid_cold_days"] == 60
+
+
+def test_apply_avoid_cold_amounts_cap_and_floor():
+    """金额规则：只降不升、cap = 1 个最小单位、不足 1 个单位归 0。"""
+    # 权重 0.5：25 → min(12.5, 5 元保本) = 5；权重 1.0 的注原样保留
+    assert apply_avoid_cold_amounts([25, 5], [0.5, 1.0], amount_unit=5) == ([5, 5], 1)
+    # 权重 0：金额归 0
+    assert apply_avoid_cold_amounts([25], [0.0], amount_unit=5) == ([0], 1)
+    # 极冷（权重极小）：50×0.06=3 元 < 1 个单位 → 0
+    assert apply_avoid_cold_amounts([50], [0.06], amount_unit=5) == ([0], 1)
+    # 全 1.0（关闭避冷）→ 与输入逐元素相同
+    base = [10, 10, 10, 10, 5, 5]
+    assert apply_avoid_cold_amounts(base, [1.0] * 6, amount_unit=5) == (base, 0)
+
+
+def test_avoid_cold_exactly_threshold_no_penalty():
+    """正好 60 天：权重 1.0，金额与不可冷时完全一致。"""
+    result = _cold_recommend(DEFAULT_AVOID_COLD_DAYS)
+    pick = result["picks"][0]
+
+    assert pick["number"] == COLD_TARGET
+    assert pick["days_since_last"] == DEFAULT_AVOID_COLD_DAYS
+    assert pick["avoid_cold_penalized"] is False
+    assert pick["avoid_cold_weight"] == 1.0
+    assert pick["amount"] == 50  # 单挑整份预算，未被压低
+    assert result["avoid_cold"]["penalized_picks"] == 0
+    assert result["staked_total"] == 50
+
+
+def test_avoid_cold_double_threshold_halves_weight_and_reduces_amount():
+    """120 天（2×阈值）：权重 0.5，金额被压到保本金额 5 元。"""
+    result = _cold_recommend(120)
+    pick = result["picks"][0]
+
+    assert pick["days_since_last"] == 120
+    assert pick["avoid_cold_weight"] == pytest.approx(0.5)
+    assert pick["avoid_cold_penalized"] is True
+    # 50 × 0.5 = 25 → cap（1×unit=5）压到 5
+    assert pick["amount"] == 5
+    assert pick["amount"] <= result["amount_unit"]
+    assert result["avoid_cold"]["penalized_picks"] == 1
+    assert result["avoid_cold"]["cap_amount"] == result["amount_unit"] == 5
+    assert result["staked_total"] == 5
+    # 省下的预算不补给其它注（本用例只有 1 注）
+    assert result["avoid_cold"]["reduced_total"] == 45
+
+
+def test_avoid_cold_very_cold_floors_down_to_zero():
+    """极冷（999 天，权重 60/999≈0.06）与「样本内从未出现」都归 0，号码仍列出。"""
+    for days in (999, None):
+        result = _cold_recommend(days)
+        pick = result["picks"][0]
+
+        assert pick["number"] == COLD_TARGET
+        assert pick["days_since_last"] == days  # None = 样本内未出现
+        assert pick["avoid_cold_penalized"] is True
+        assert pick["amount"] == 0
+        assert result["staked_total"] == 0
+
+
+def test_avoid_cold_disabled_matches_legacy_amounts():
+    """关闭避冷：权重全 1.0、无惩罚标记，金额回到改造前的分配口径。"""
+    enabled = _cold_recommend(120)
+    disabled = _cold_recommend(120, enabled=False)
+    pick = disabled["picks"][0]
+
+    assert pick["amount"] == 50
+    assert pick["avoid_cold_penalized"] is False
+    assert pick["avoid_cold_weight"] == 1.0
+    assert disabled["avoid_cold"]["enabled"] is False
+    assert disabled["avoid_cold"]["penalized_picks"] == 0
+    assert disabled["staked_total"] == disabled["total_amount"] == 50
+    # 与直接调用基础分配算法一致 = 等同改造前行为
+    assert [p["amount"] for p in disabled["picks"]] == allocate_amounts(
+        MODE_SINGLE, assign_roles(1), 50, amount_unit=DEFAULT_AMOUNT_UNIT
+    )
+    # 同一天数下，开启避冷确实把金额压低
+    assert enabled["picks"][0]["amount"] < pick["amount"]
+    # 无论开关，picks 都带 days_since_last
+    assert disabled["picks"][0]["days_since_last"] == 120
+
+
+def test_avoid_cold_cap_holds_across_all_modes():
+    """四种模式都不崩，且被压低的注金额 ≤ 保本金额、仍是最小单位倍数。"""
+    for mode in MODES:
+        for days in (120, 300):
+            result = _cold_recommend(days, mode=mode)
+            penalized = [p for p in result["picks"] if p["avoid_cold_penalized"]]
+            assert penalized, f"{mode}/{days}: 应至少有一注被压低"
+            for pick in penalized:
+                assert pick["amount"] <= result["amount_unit"]
+                assert pick["amount"] % result["amount_unit"] == 0
+            # 未被压低时总投入不超过预算
+            assert result["staked_total"] <= result["total_amount"]
+
+
+def test_recommend_picks_carry_days_since_last():
+    """picks 的每一项都必须带 days_since_last（int | None）。"""
+    result = recommend(
+        latest=20,
+        previous=15,
+        history_numbers=[15, 20, 3, 44],
+        settings={"pick_count": 3, "avoid_cold_enabled": False},
+    )
+    assert result["picks"]
+    for pick in result["picks"]:
+        assert "days_since_last" in pick
+        assert pick["days_since_last"] is None or isinstance(
+            pick["days_since_last"], int
+        )
+    # 47 从未在样本内出现 → None（不编造天数）
+    assert all(
+        pick["days_since_last"] is None
+        for pick in result["picks"]
+        if pick["number"] not in (15, 20, 3, 44)
+    )
+
+
+def test_avoid_cold_notes_are_honest():
+    """notes 必须说明「冷号排后 + 金额封顶」、样本偏好、非概率 / 非收益承诺。"""
+    result = _cold_recommend(120)
+    joined = "；".join(result["notes"])
+    assert "避冷加权" in joined
+    assert "保本金额" in joined
+    assert "不是概率计算" in joined
+    assert "不承诺提高命中率或收益" in joined
+    # 选号排后必须如实说明（含「全桶冷号仍照常取用」的兜底口径）
+    assert "排到候选队列末尾" in joined
+    assert "不会因此少出号" in joined
+    # 禁止任何确定性盈利表述
+    for banned in ("稳赚", "必胜", "保证盈利", "保本盈利"):
+        assert banned not in joined
+
+    # 关闭时如实说明是旧行为
+    off = _cold_recommend(120, enabled=False)
+    assert any("避冷加权已关闭" in note for note in off["notes"])
+
+
+def test_settings_api_avoid_cold_roundtrip():
+    from fastapi.testclient import TestClient
+
+    from main import app
+
+    with TestClient(app) as client:
+        body = client.get("/api/settings").json()
+        assert body["avoid_cold_enabled"] is True
+        assert body["avoid_cold_days"] == 60
+
+        updated = client.put(
+            "/api/settings",
+            json={"avoid_cold_enabled": False, "avoid_cold_days": 90},
+        ).json()
+        assert updated["avoid_cold_enabled"] is False
+        assert updated["avoid_cold_days"] == 90
+        assert client.get("/api/settings").json()["avoid_cold_days"] == 90
+
+        restored = client.put(
+            "/api/settings",
+            json={"avoid_cold_enabled": True, "avoid_cold_days": 60},
+        ).json()
+        assert restored["avoid_cold_enabled"] is True
+        assert restored["avoid_cold_days"] == 60
+        assert restored["total_amount"] == body["total_amount"]
+
+
+def test_memory_store_persists_avoid_cold_settings():
+    from repository import MemoryStore
+    from services.auth import GLOBAL_SETTINGS_USER_ID
+
+    store = MemoryStore()
+    saved = asyncio.run(
+        store.update_settings({"avoid_cold_enabled": False, "avoid_cold_days": 120})
+    )
+    assert saved["avoid_cold_enabled"] is False
+    assert saved["avoid_cold_days"] == 120
+
+    again = asyncio.run(store.get_settings())
+    assert again["avoid_cold_enabled"] is False
+    assert again["avoid_cold_days"] == 120
+    # 落库值必须是英文 / 数字，禁止汉字
+    bucket = store._settings[GLOBAL_SETTINGS_USER_ID]  # noqa: SLF001
+    assert bucket["avoid_cold_enabled"] is False
+    assert bucket["avoid_cold_days"] == 120
+
+
+# --------------------------------------------------------------------------- #
+# 15. 避冷加权 · 选号排后（与 trend_bias 独立；关闭 = 严格 no-op）
+# --------------------------------------------------------------------------- #
+def test_is_avoid_cold_number_rule():
+    """冷号判定：> 阈值 或 样本内从未出现；≤ 阈值不算冷；关闭恒 False。"""
+    assert is_avoid_cold_number(60, threshold=60) is False
+    assert is_avoid_cold_number(61, threshold=60) is True
+    assert is_avoid_cold_number(None, threshold=60) is True
+    assert is_avoid_cold_number(9999, enabled=False) is False
+    assert is_avoid_cold_number(None, enabled=False) is False
+
+
+def test_order_pool_pushes_cold_numbers_to_back():
+    """冷号（含样本内从未出现）排到队列末尾；关闭时与旧行为逐元素一致。"""
+    pool = [{"number": 24, "diff": 1}, {"number": 26, "diff": 1}]
+    # 24 遗漏最少 → 旧行为排最前；26 差值相同但出现次数多
+    counts = Counter({24: 1, 26: 5})
+    days = {24: 197, 26: 3}
+
+    legacy = order_pool(pool, counts)
+    assert [item["number"] for item in legacy] == [24, 26]
+
+    pushed = order_pool(
+        pool,
+        counts,
+        avoid_cold_enabled=True,
+        avoid_cold_days=60,
+        days_since_last=days,
+    )
+    assert [item["number"] for item in pushed] == [26, 24]
+
+    # 样本内从未出现（None）同样算冷号，排到末尾
+    never = order_pool(
+        pool,
+        counts,
+        avoid_cold_enabled=True,
+        avoid_cold_days=60,
+        days_since_last={24: None, 26: 3},
+    )
+    assert [item["number"] for item in never] == [26, 24]
+
+    # 关闭避冷 → 与旧行为逐元素一致（严格 no-op）
+    off = order_pool(
+        pool,
+        counts,
+        avoid_cold_enabled=False,
+        avoid_cold_days=60,
+        days_since_last=days,
+    )
+    assert [item["number"] for item in off] == [item["number"] for item in legacy]
+
+
+@pytest.mark.parametrize("bias", ["neutral", "hot", "cold", "mid"])
+def test_order_pool_cold_ordering_independent_of_trend_bias(bias: str):
+    """避冷排后与 trend_bias 独立：非冷号整体在前，两组内部保持各自原相对顺序。"""
+    pool = [
+        {"number": 24, "diff": 1},
+        {"number": 26, "diff": 1},
+        {"number": 23, "diff": 2},
+    ]
+    counts = Counter({24: 1, 26: 5, 23: 3})
+    trend_counts = Counter({24: 9, 23: 7, 26: 1})
+    days = {24: 197, 26: 3, 23: 500}  # 26 非冷；24 / 23 冷
+
+    kwargs = dict(
+        trend_bias=bias,
+        trend_counts=trend_counts,
+        mid_target=5.0,
+    )
+    without = order_pool(pool, counts, **kwargs)
+    with_cold = order_pool(
+        pool,
+        counts,
+        avoid_cold_enabled=True,
+        avoid_cold_days=60,
+        days_since_last=days,
+        **kwargs,
+    )
+
+    def is_cold(number: int) -> bool:
+        return is_avoid_cold_number(days[number], threshold=60)
+
+    # 期望 = 非冷号（保持 without 的相对顺序）在前，冷号（同样保持相对顺序）在后
+    expected = [i for i in without if not is_cold(i["number"])] + [
+        i for i in without if is_cold(i["number"])
+    ]
+    assert [i["number"] for i in with_cold] == [i["number"] for i in expected]
+    assert len(with_cold) == len(without)  # 冷号不删除，始终留在池内
+
+
+def _stale_and_fresh_history() -> tuple[list[int], list[date]]:
+    """用户线上回归场景：24 距上次出现 197 天，26 刚出现过。
+
+    除 24 外每个号都出现两次且日期很近（非冷号，遗漏计数 2）；24 只出现一次、
+    日期在 197 天前（遗漏计数 1 → neutral 旧行为必然排最前）。
+    """
+    others = [n for n in range(1, 50) if n not in (COLD_LATEST, COLD_TARGET)]
+    history = [COLD_LATEST, *others, *others, COLD_TARGET]
+    dates = (
+        [COLD_REF]
+        + [COLD_REF - timedelta(days=1)] * (2 * len(others))
+        + [COLD_REF - timedelta(days=197)]
+    )
+    return history, dates
+
+
+def test_avoid_cold_regression_stale_number_not_taken_first():
+    """回归：197 天未出现的号不能再因为「遗漏最久」被首选。"""
+    history, dates = _stale_and_fresh_history()
+    base = {
+        "latest": COLD_LATEST,
+        "previous": None,
+        "history_numbers": history,
+        "history_dates": dates,
+        "mode": MODE_SINGLE,
+    }
+    off = recommend(
+        **base, settings={"pick_count": 1, "avoid_cold_enabled": False}
+    )
+    on = recommend(**base, settings={"pick_count": 1, "avoid_cold_enabled": True})
+
+    # 旧行为（关闭避冷）：遗漏最久的 24 被首选 —— 这正是用户反馈的问题
+    assert off["picks"][0]["number"] == COLD_TARGET
+    assert off["picks"][0]["days_since_last"] == 197
+    assert off["picks"][0]["avoid_cold_penalized"] is False
+
+    # 新行为（开启避冷）：197 天的冷号被排后，非冷号 26 先被取到
+    assert on["picks"][0]["number"] == 26
+    assert on["picks"][0]["days_since_last"] == 1
+    assert on["picks"][0]["avoid_cold_penalized"] is False
+    # 冷号仍在候选池内（只是排后），并未被删除
+    pools = build_candidate_pools(COLD_LATEST, DEFAULT_SMALL_MAX, DEFAULT_NORMAL_MAX)
+    small_numbers = {item["number"] for item in pools[WAVE_SMALL]}
+    assert COLD_TARGET in small_numbers
+
+
+def test_avoid_cold_all_cold_bucket_still_fills_picks():
+    """某波动桶只剩冷号：仍能照常取号，不少出号、不误报「无号」。"""
+    # 小波动桶全部样本内从未出现（整桶冷号）；其余桶都是近期的非冷号
+    history = [COLD_LATEST, *_COLD_OTHERS, *_COLD_OTHERS]
+    dates = [COLD_REF] + [COLD_REF - timedelta(days=1)] * (2 * len(_COLD_OTHERS))
+
+    result = recommend(
+        latest=COLD_LATEST,
+        previous=None,
+        history_numbers=history,
+        history_dates=dates,
+        settings={"pick_count": 5, "avoid_cold_enabled": True},
+    )
+    picks = result["picks"]
+
+    assert len(picks) == 5  # 注数补齐，没有因为整桶冷号而少出号
+    # 整桶冷号不误报「无号」（latest=25 时大跳桶本来就无号，与本用例无关）
+    missing_types = {item["type"] for item in result["missing_waves"]}
+    assert WAVE_SMALL not in missing_types
+    assert not any("小波动无号" in note for note in result["notes"])
+    # 小波动桶全是冷号 → 兜底仍然取到了小波动号
+    assert picks[0]["wave_type"] == WAVE_SMALL
+    assert picks[0]["days_since_last"] is None  # 样本内未出现
+    assert picks[0]["avoid_cold_penalized"] is True
+    # 冷号排在末尾：所有非冷号都排在该桶冷号之前
+    small_indexes = [
+        index for index, pick in enumerate(picks) if pick["wave_type"] == WAVE_SMALL
+    ]
+    assert small_indexes  # 冷号确实被取到（兜底生效）
+
+
+def test_avoid_cold_disabled_ordering_matches_legacy_pool_order():
+    """关闭避冷：每个波动桶的排序与「不带避冷参数」的旧排序逐元素一致。"""
+    history, dates = _stale_and_fresh_history()
+    pools = build_candidate_pools(
+        COLD_LATEST, DEFAULT_SMALL_MAX, DEFAULT_NORMAL_MAX
+    )
+    counts = Counter(n for n in history if n != COLD_LATEST)
+    days = compute_days_since_last(history, dates)
+
+    for pool in pools.values():
+        legacy = order_pool(pool, counts)
+        off = order_pool(
+            pool,
+            counts,
+            avoid_cold_enabled=False,
+            avoid_cold_days=60,
+            days_since_last=days,
+        )
+        assert [i["number"] for i in off] == [i["number"] for i in legacy]
+        # 开启时长度不变（冷号不删除）
+        on = order_pool(
+            pool,
+            counts,
+            avoid_cold_enabled=True,
+            avoid_cold_days=60,
+            days_since_last=days,
+        )
+        assert len(on) == len(legacy)
+
+
+def _weighted_interaction_history() -> tuple[list[int], list[date]]:
+    """加权路径场景：24 出现 3 次但都在 200+ 天前（冷号，且桶内计数最高）。
+
+    小波动桶其余号各出现 1 次且日期很近（非冷号）；这样 24 会落进「主推（最热）带」，
+    用于验证避冷排后在加权路径同样生效。
+    """
+    small_others = [n for n in _COLD_SMALL if n != COLD_TARGET]
+    history = [COLD_LATEST, COLD_TARGET, COLD_TARGET, COLD_TARGET]
+    dates = [COLD_REF, COLD_REF - timedelta(days=200),
+             COLD_REF - timedelta(days=260), COLD_REF - timedelta(days=320)]
+    history += [*small_others, *_COLD_OTHERS]
+    dates += [COLD_REF - timedelta(days=1)] * (len(small_others) + len(_COLD_OTHERS))
+    return history, dates
+
+
+@pytest.mark.parametrize("bias", ["hot", "cold", "mid"])
+def test_avoid_cold_applies_in_weighted_path_for_every_bias(bias: str):
+    """加权路径下避冷排后同样生效，且不改变所选 trend_bias。"""
+    history, dates = _weighted_interaction_history()
+    base = {
+        "latest": COLD_LATEST,
+        "previous": None,
+        "history_numbers": history,
+        "history_dates": dates,
+        "mode": MODE_SINGLE,
+    }
+    common = {"pick_count": 1, "trend_bias": bias, "trend_window": 0}
+
+    off = recommend(**base, settings={**common, "avoid_cold_enabled": False})
+    on = recommend(**base, settings={**common, "avoid_cold_enabled": True})
+
+    # 冷号 24 是小波动桶内最热（主推带）→ 关闭避冷时被首选
+    assert off["picks"][0]["number"] == COLD_TARGET
+    assert off["picks"][0]["days_since_last"] == 200
+    # 开启避冷后，主推带里的非冷号 26 先被取到（冷号整体排后）
+    assert on["picks"][0]["number"] == 26
+    # 两个维度互不干扰：trend_bias 原样保留，选号仍走同一套角色带
+    assert off["trend_bias"] == bias
+    assert on["trend_bias"] == bias
+    assert off["picks"][0]["role"] == on["picks"][0]["role"] == "primary"
+
+
+@pytest.mark.parametrize("bias", ["neutral", "hot", "cold", "mid"])
+def test_avoid_cold_does_not_change_trend_bias(bias: str):
+    """避冷加权只影响排序 / 金额，绝不改写 trend_bias 取值。"""
+    history, dates = _stale_and_fresh_history()
+    result = recommend(
+        latest=COLD_LATEST,
+        previous=None,
+        history_numbers=history,
+        history_dates=dates,
+        settings={
+            "pick_count": 3,
+            "trend_bias": bias,
+            "avoid_cold_enabled": True,
+            "avoid_cold_days": 60,
+        },
+    )
+    assert result["trend_bias"] == bias
+    assert result["settings"]["trend_bias"] == bias
+    assert result["settings"]["avoid_cold_enabled"] is True
+    assert result["avoid_cold"]["enabled"] is True
+
+
+
+
+# --------------------------------------------------------------------------- #
+# 9. 号码 → 生肖（固定映射，随农历年轮转；只增不改）
+# --------------------------------------------------------------------------- #
+# 2026-02-17 是丙午马年春节（生肖表边界）；下面统一用春节前后的开奖日做参照。
+ZODIAC_REF_DATE = date(2026, 3, 11)          # 2026 马年内
+ZODIAC_REF_NEW_YEAR = date(2026, 2, 17)      # 春节当天 → 马年
+ZODIAC_REF_NEW_YEAR_EVE = date(2026, 2, 16)  # 春节前一天 → 仍属 2025 蛇年
+
+
+def _zodiac_picks(history_dates: list[date] | None) -> dict:
+    """latest=1 的确定性场景：前十注固定为 2..9 / 12 / 32（含个位与两位号）。
+
+    关闭避冷加权只为让金额分配干净，不影响选号顺序（本用例不校验金额）。
+    """
+    return recommend(
+        latest=1,
+        previous=None,
+        history_numbers=[1],
+        history_dates=history_dates,
+        settings={"pick_count": 10, "avoid_cold_enabled": False},
+    )
+
+
+def test_resolve_zodiac_date_reads_latest_draw_date():
+    """生肖参照日 = 历史序列里最新一期的开奖日（最新在前）；拿不到就 None。"""
+    assert resolve_zodiac_date([ZODIAC_REF_DATE, date(2026, 3, 10)]) == ZODIAC_REF_DATE
+    assert resolve_zodiac_date([datetime(2026, 3, 11, 21, 30)]) == ZODIAC_REF_DATE
+    assert resolve_zodiac_date(["2026-03-11"]) == ZODIAC_REF_DATE
+    assert resolve_zodiac_date([]) is None
+    assert resolve_zodiac_date(None) is None
+    # 日期解析失败时不猜年份，直接留空
+    assert resolve_zodiac_date(["not-a-date"]) is None
+
+
+def test_recommend_picks_all_carry_zodiac():
+    """每一注都必须带 zodiac / zodiac_label，且标签与英文码一一对应。"""
+    result = _zodiac_picks([ZODIAC_REF_DATE])
+    assert result["picks"]
+    for pick in result["picks"]:
+        assert "zodiac" in pick and "zodiac_label" in pick
+        # 已知农历年内必须给出生肖（不是 null）
+        assert pick["zodiac"] in ZODIAC_LABELS
+        assert pick["zodiac_label"] == ZODIAC_LABELS[pick["zodiac"]]
+    # 口径溯源：参照日 / 农历年 / 最新号生肖
+    assert result["zodiac_date"] == ZODIAC_REF_DATE.isoformat()
+    assert result["zodiac_year"] == 2026
+    assert result["latest_zodiac_code"] == "HORSE"
+    assert result["latest_zodiac_label"] == "马"
+    # 旧字段一字不改（只增不改）
+    assert result["latest_zodiac"] == zodiac_numbers(1)
+
+
+def test_recommend_pick_zodiac_values_for_single_and_double_digit():
+    """个位号与两位号都要给出正确生肖（2026 马年表）。"""
+    result = _zodiac_picks([ZODIAC_REF_DATE])
+    by_number = {pick["number"]: pick for pick in result["picks"]}
+    assert {n for n in by_number if n < 10}, "用例必须覆盖个位号"
+    assert {n for n in by_number if n >= 10}, "用例必须覆盖两位号"
+
+    # 个位号：02 → 蛇、09 → 狗
+    assert (by_number[2]["zodiac"], by_number[2]["zodiac_label"]) == ("SNAKE", "蛇")
+    assert (by_number[9]["zodiac"], by_number[9]["zodiac_label"]) == ("DOG", "狗")
+    # 两位号：12 → 羊
+    assert (by_number[12]["zodiac"], by_number[12]["zodiac_label"]) == ("GOAT", "羊")
+
+    # 逐号与权威生肖表核对（绝不另造一套映射）
+    for number, pick in by_number.items():
+        assert pick["zodiac"] == zodiac_of(number, ZODIAC_REF_DATE)
+
+
+def test_recommend_pick_zodiac_agrees_with_latest_zodiac_chip():
+    """卡片生肖与「最新同肖」号码组永远同组：号码在同肖组 ⟺ 生肖相同。
+
+    号码分组（zodiac_numbers，与农历年无关）与生肖表（zodiac_of，随农历年轮转）
+    都是 ``(n - 1) % 12`` 的分组，农历年只决定这一组叫什么名字。
+    """
+    result = _zodiac_picks([ZODIAC_REF_DATE])
+    latest_group = set(result["latest_zodiac"])
+    latest_code = result["latest_zodiac_code"]
+    assert latest_code is not None
+    for pick in result["picks"]:
+        in_latest_group = pick["number"] in latest_group
+        assert in_latest_group is (pick["zodiac"] == latest_code)
+        # 同一分组口径下，重肖标记也必须与「生肖相同」一致
+        assert in_latest_group is (pick["is_repeat_zodiac"] is True)
+
+
+def test_recommend_zodiac_follows_lunar_new_year_boundary():
+    """春节换肖：同一号码在春节前后属不同生肖，但同肖号码组不变。"""
+    before = _zodiac_picks([ZODIAC_REF_NEW_YEAR_EVE])  # 仍属 2025 蛇年
+    after = _zodiac_picks([ZODIAC_REF_NEW_YEAR])       # 已是 2026 马年
+
+    assert before["zodiac_year"] == 2025
+    assert after["zodiac_year"] == 2026
+    # 01 号所属生肖：蛇年 = 蛇，马年 = 马
+    assert before["latest_zodiac_code"] == "SNAKE"
+    assert after["latest_zodiac_code"] == "HORSE"
+    # 号码分组与农历年无关，两年完全一致
+    assert before["latest_zodiac"] == after["latest_zodiac"] == zodiac_numbers(1)
+
+    before_picks = {pick["number"]: pick for pick in before["picks"]}
+    after_picks = {pick["number"]: pick for pick in after["picks"]}
+    assert before_picks[9]["zodiac"] == "ROOSTER"   # 蛇年 09 → 鸡
+    assert after_picks[9]["zodiac"] == "DOG"        # 马年 09 → 狗
+    assert before_picks[12]["zodiac"] == "HORSE"    # 蛇年 12 → 马
+    assert after_picks[12]["zodiac"] == "GOAT"      # 马年 12 → 羊
+
+
+def test_recommend_zodiac_degrades_without_reference_date():
+    """拿不到开奖日就不给生肖（字段仍在，值为 null），绝不拿「今天」猜农历年。"""
+    result = recommend(latest=1, previous=None, history_numbers=[1])
+    assert result["zodiac_date"] is None
+    assert result["zodiac_year"] is None
+    assert result["latest_zodiac_code"] is None
+    assert result["latest_zodiac_label"] is None
+    for pick in result["picks"]:
+        assert pick["zodiac"] is None
+        assert pick["zodiac_label"] is None
+    # 与农历年无关的号码组照常提供
+    assert result["latest_zodiac"] == zodiac_numbers(1)
+
+
+def test_recommend_zodiac_degrades_outside_known_year_table():
+    """参照日早于已知农历年表：如实留空，不按最接近的年份猜。"""
+    result = _zodiac_picks([date(2024, 5, 1)])
+    assert result["zodiac_date"] == "2024-05-01"
+    assert result["zodiac_year"] is None
+    assert result["latest_zodiac_code"] is None
+    assert all(pick["zodiac"] is None for pick in result["picks"])
+    assert all(pick["zodiac_label"] is None for pick in result["picks"])
+
+
+def test_recommend_api_picks_carry_zodiac():
+    """接口层回归：/api/recommend 每注都带生肖，与 /api/draws 的农历年表同源。"""
+    from fastapi.testclient import TestClient
+
+    import repository
+    from main import app
+
+    with TestClient(app) as client:
+        store = asyncio.run(repository.get_store())
+        asyncio.run(store.clear_draws())
+        client.post(
+            "/api/draws/quick",
+            json={
+                "special_number": 21,
+                "period": 1,
+                "draw_date": ZODIAC_REF_DATE.isoformat(),
+            },
+        )
+        body = client.post("/api/recommend", json={"mode": "single"}).json()
+
+    assert body["zodiac_date"] == ZODIAC_REF_DATE.isoformat()
+    assert body["zodiac_year"] == 2026
+    # 2026 马年表下 21（与 09 同组）→ 狗；号码组 [9, 21, 33, 45] 不变
+    assert body["latest_zodiac_code"] == "DOG"
+    assert body["latest_zodiac"] == zodiac_numbers(21)
+    assert body["picks"]
+    for pick in body["picks"]:
+        assert pick["zodiac"] == zodiac_of(pick["number"], ZODIAC_REF_DATE)
+        assert pick["zodiac_label"] == ZODIAC_LABELS[pick["zodiac"]]

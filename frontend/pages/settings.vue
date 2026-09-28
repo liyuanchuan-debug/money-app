@@ -1,5 +1,9 @@
 <script setup lang="ts">
 import {
+  AVOID_COLD_DAYS_MAX,
+  AVOID_COLD_DAYS_MIN,
+  AVOID_COLD_DEFAULT_DAYS,
+  AVOID_COLD_LABEL,
   CHIP_MODE_OPTIONS,
   TREND_BIAS_OPTIONS,
   TREND_WINDOW_OPTIONS,
@@ -52,6 +56,9 @@ const form = reactive({
   exclude_repeat_zodiac: false,
   trend_bias: 'neutral' as TrendBias,
   trend_window: 30,
+  // 避冷加权：默认开启（与后端 DEFAULT_SETTINGS 一致），阈值默认 60 天
+  avoid_cold_enabled: true,
+  avoid_cold_days: AVOID_COLD_DEFAULT_DAYS,
 })
 
 const derivedBigMin = computed(() => form.normal_max + 1)
@@ -99,6 +106,11 @@ async function load() {
     if (isChipMode(settings.mode)) form.mode = settings.mode
     if (isTrendBias(settings.trend_bias)) form.trend_bias = settings.trend_bias
     if (typeof settings.trend_window === 'number') form.trend_window = settings.trend_window
+    // 缺字段 / 旧后端 → 默认开启避冷（与 DEFAULT_SETTINGS 一致），阈值回退 60
+    form.avoid_cold_enabled = settings.avoid_cold_enabled !== false
+    form.avoid_cold_days = typeof settings.avoid_cold_days === 'number'
+      ? settings.avoid_cold_days
+      : AVOID_COLD_DEFAULT_DAYS
   } catch (err: any) {
     errorMessage.value = err?.data?.detail || err?.message || '加载设置失败'
   } finally {
@@ -116,6 +128,12 @@ function validate(): string | null {
     { label: '默认注数', value: form.pick_count, min: 1, max: 10 },
     { label: '最大投注金额', value: form.total_amount, min: 1, max: 100000 },
     { label: '金额最小单位', value: form.amount_unit, min: 1, max: 10000 },
+    {
+      label: '避冷阈值（天）',
+      value: form.avoid_cold_days,
+      min: AVOID_COLD_DAYS_MIN,
+      max: AVOID_COLD_DAYS_MAX,
+    },
   ]
   for (const field of fields) {
     if (!Number.isInteger(field.value) || field.value < field.min || field.value > field.max) {
@@ -165,6 +183,8 @@ async function save() {
       exclude_repeat_zodiac: form.exclude_repeat_zodiac,
       trend_bias: form.trend_bias,
       trend_window: form.trend_window,
+      avoid_cold_enabled: form.avoid_cold_enabled,
+      avoid_cold_days: form.avoid_cold_days,
     })
     form.small_max = settings.small_max
     form.normal_max = settings.normal_max
@@ -176,6 +196,10 @@ async function save() {
     if (isChipMode(settings.mode)) form.mode = settings.mode
     if (isTrendBias(settings.trend_bias)) form.trend_bias = settings.trend_bias
     if (typeof settings.trend_window === 'number') form.trend_window = settings.trend_window
+    form.avoid_cold_enabled = settings.avoid_cold_enabled !== false
+    form.avoid_cold_days = typeof settings.avoid_cold_days === 'number'
+      ? settings.avoid_cold_days
+      : AVOID_COLD_DEFAULT_DAYS
     infoMessage.value = '设置已保存'
   } catch (err: any) {
     errorMessage.value = err?.data?.detail || err?.message || '保存失败'
@@ -455,11 +479,65 @@ const readonlyInputClass
                     {{ option.label }}
                   </GlassButton>
                 </div>
+                <p class="text-xs leading-relaxed text-slate-400">
+                  走势加权管「偏热 / 偏冷 / 中频」；避冷加权管「冷号排后 + 金额封顶」；两者独立，可同时生效。
+                </p>
                 <p class="text-xs leading-relaxed text-slate-500">
                   没手动设置过时一律是「不加权」：等同旧的全历史遗漏优先，旧版本残留的「热号偏好」不会自动生效。
                   选好热 / 中 / 冷号偏好后要点「保存设置」才生效；生效后各波动桶内按近窗出现频次切主推 / 次选 / 防守三段参与选号。
                   这是样本内经验频率偏好，不承诺提高命中率。波浪买入法页可临时切换，不改这里的默认值。
                 </p>
+
+                <!-- 避冷加权：本组内的**独立开关**（不是第 5 个走势加权选项，互不排斥） -->
+                <div class="mt-1 space-y-2 rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-3">
+                  <div class="flex flex-wrap items-center justify-between gap-3">
+                    <div class="space-y-1">
+                      <p id="avoid-cold-label" class="text-sm font-medium text-slate-200">
+                        {{ AVOID_COLD_LABEL }}
+                      </p>
+                      <p class="text-xs leading-relaxed text-slate-500">
+                        冷号排后 + 金额封顶：距上次出现超过「避冷阈值」的号码（含本池样本内从未出现的号码）
+                        排到候选队列末尾；间隔越久权重越低、配置金额越低，最多只给「保本金额」
+                        （1 个金额最小单位 = {{ form.amount_unit }} 元）；不足 1 个最小单位的注金额记 0
+                        （号码仍列出），省下的预算不补给其它注。
+                      </p>
+                    </div>
+                    <GlassButton
+                      role="switch"
+                      :aria-checked="form.avoid_cold_enabled"
+                      aria-labelledby="avoid-cold-label"
+                      :variant="form.avoid_cold_enabled ? 'primary' : 'glass'"
+                      class="min-h-[44px] shrink-0 px-4 text-base"
+                      @click="form.avoid_cold_enabled = !form.avoid_cold_enabled"
+                    >
+                      {{ form.avoid_cold_enabled ? '已开启' : '已关闭' }}
+                    </GlassButton>
+                  </div>
+                  <div class="flex flex-wrap items-start gap-3">
+                    <div class="space-y-1.5">
+                      <label for="avoid-cold-days" class="block text-xs text-slate-400">
+                        避冷阈值（天）
+                      </label>
+                      <input
+                        id="avoid-cold-days"
+                        v-model.number="form.avoid_cold_days"
+                        type="number"
+                        :min="AVOID_COLD_DAYS_MIN"
+                        :max="AVOID_COLD_DAYS_MAX"
+                        inputmode="numeric"
+                        :disabled="!form.avoid_cold_enabled"
+                        :class="form.avoid_cold_enabled ? inputClass : readonlyInputClass"
+                      >
+                    </div>
+                    <p class="max-w-md text-xs leading-relaxed text-slate-500">
+                      距上次出现 ≤ {{ form.avoid_cold_days }} 天不惩罚（正好等于阈值也不惩罚），
+                      超过则权重 = 阈值 ÷ 天数（{{ form.avoid_cold_days }} 天=1.0、
+                      {{ form.avoid_cold_days * 2 }} 天≈0.5、{{ form.avoid_cold_days * 4 }} 天≈0.25）；
+                      本池样本内从未出现的号按最冷处理（金额记 0）。
+                      这是样本内偏好，不是概率，也不承诺提高命中率或收益。
+                    </p>
+                  </div>
+                </div>
               </div>
 
               <hr class="glass-hairline">

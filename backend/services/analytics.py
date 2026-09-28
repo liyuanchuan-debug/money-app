@@ -675,6 +675,9 @@ def backtest_stats(
                         "mode",
                         "pick_count",
                         "exclude_repeat_zodiac",
+                        # 避冷加权（additive）：回测与财富密码同源，需如实回报生效值
+                        "avoid_cold_enabled",
+                        "avoid_cold_days",
                     )
                 },
                 "big_min": derive_big_min(cfg["normal_max"]),

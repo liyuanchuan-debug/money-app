@@ -1,4 +1,4 @@
-﻿# 本地一键启动 + 内网穿透（Cloudflare 快速隧道）
+# 本地一键启动 + 内网穿透（Cloudflare 快速隧道）
 #
 # 作用：在本机把「后端 API + 前端生产构建 + 公网隧道」一起拉起来，
 #       最后打印一个 https://xxx.trycloudflare.com 地址，手机/外部网络可直接访问。
@@ -207,13 +207,42 @@ if (-not $url) {
 
 # 从公网侧回环验证一次，确认真的可访问
 Write-Step '验证公网可达性'
+$tunnelHost = ([uri]$url).Host
+$reachable = $false
 try {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $r = Invoke-WebRequest "$url/api/health" -UseBasicParsing -TimeoutSec 60
     $sw.Stop()
     Write-Ok "GET $url/api/health -> $($r.StatusCode)  ($($sw.ElapsedMilliseconds) ms)"
+    $reachable = $true
 } catch {
-    Write-Warn "公网自测失败：$($_.Exception.Message)"
+    Write-Warn "本机 DNS 未能解析该域名：$($_.Exception.Message)"
+}
+
+if (-not $reachable) {
+    # 国内公共 DNS（如阿里 120.77.11.214）对新隧道域名的 A 记录常有几分钟延迟，
+    # 期间只返回 AAAA；而本机若无全局 IPv6 就完全连不上。
+    # 这不代表隧道坏了 —— 用公共 DNS 取 IPv4 再 --resolve 绕过本机解析来区分两种情况。
+    Write-Warn '改用公共 DNS 取 IPv4，并绕过本机 DNS 复测…'
+    $ip = $null
+    foreach ($dns in @('8.8.8.8', '223.5.5.5', '119.29.29.29')) {
+        $txt = (& nslookup $tunnelHost $dns 2>$null | Out-String)
+        $found = [regex]::Matches($txt, '\b\d{1,3}(?:\.\d{1,3}){3}\b') |
+            ForEach-Object { $_.Value } |
+            Where-Object { $_ -ne $dns -and $_ -notmatch '^(127\.|0\.)' }
+        if ($found) { $ip = $found[0]; break }
+    }
+    if ($ip) {
+        $code = (& curl.exe -s -o NUL -w '%{http_code}' --max-time 45 --resolve "$tunnelHost`:443:$ip" "$url/api/health")
+        if ($code -eq '200') {
+            Write-Ok "隧道本身可达（经 $ip 直连 200）"
+            Write-Warn '本机 DNS 尚未同步：稍等几分钟即可正常访问；手机用蜂窝数据通常立即可用'
+            $reachable = $true
+        } else {
+            Write-Warn "经 $ip 直连返回 $code"
+        }
+    }
+    if (-not $reachable) { Write-Warn '无法确认公网可达性，请用手机实测该地址' }
 }
 
 Write-Host ''

@@ -23,6 +23,13 @@ export interface LotterySettings {
   trend_bias: TrendBias
   /** 近窗期数；0=全部样本；默认 30 */
   trend_window: number
+  /**
+   * 避冷加权：True=距上次出现超过 avoid_cold_days 天的号权重递减、金额递减；
+   * 默认 True（旧后端缺字段时同样按开启处理）。
+   */
+  avoid_cold_enabled: boolean
+  /** 避冷阈值（自然日）：距上次出现 ≤ 该值不惩罚；默认 60，范围 1..999 */
+  avoid_cold_days: number
   /** 只读派生字段：恒为 normal_max + 1 */
   big_min: number
 }
@@ -39,6 +46,8 @@ export interface LotterySettingsPatch {
   exclude_repeat_zodiac?: boolean
   trend_bias?: TrendBias
   trend_window?: number
+  avoid_cold_enabled?: boolean
+  avoid_cold_days?: number
 }
 
 export interface Pick {
@@ -50,9 +59,25 @@ export interface Pick {
   role_label: string
   amount: number
   is_repeat_zodiac: boolean
+  /**
+   * 号码 → 生肖的固定映射（英文码 + 汉字标签），随农历年（春节）轮转。
+   * 与 `latest_zodiac` 指向同一组号码（农历年只决定这一组叫什么名字）。
+   * null = 后端拿不到开奖参照日 / 参照日不在已知农历年表内 —— 不猜年份，前端照实留空。
+   */
+  zodiac?: string | null
+  zodiac_label?: string | null
   /** 近窗内出现次数（走势加权依据） */
   trend_count?: number
   trend_note?: string
+  /**
+   * 距本池样本内最近一次出现的自然日数（后端 compute_days_since_last）。
+   * null = 本池样本内从未出现（按最冷处理，不编造天数）。
+   */
+  days_since_last?: number | null
+  /** 该注是否被避冷加权压低（只降不升；关闭避冷时恒为 false） */
+  avoid_cold_penalized?: boolean
+  /** 避冷加权（1.0=不惩罚；越久越低；样本内未出现为 0） */
+  avoid_cold_weight?: number
 }
 
 export interface TrendNumberStat {
@@ -87,6 +112,15 @@ export interface TrendDistributions {
 export interface RecommendResult {
   latest: number
   latest_zodiac: number[]
+  /**
+   * 「最新同肖」这一组的生肖（与 `latest_zodiac` 恒为同一组号码）；
+   * null = 农历年未知（参照日缺失或不在已知表内）。
+   */
+  latest_zodiac_code?: string | null
+  latest_zodiac_label?: string | null
+  /** 生肖口径溯源：参照日 = 本池最新一期开奖日（YYYY-MM-DD）与其农历年；未知时 null */
+  zodiac_date?: string | null
+  zodiac_year?: number | null
   previous: number | null
   prev_wave: { number: number; diff: number; type: string; label: string } | null
   settings: LotterySettings
@@ -97,6 +131,20 @@ export interface RecommendResult {
   total_amount: number
   /** 本次分配使用的金额最小单位（注码粒度） */
   amount_unit: number
+  /** 实际分配到各注的合计（避冷加权压低后可能 < total_amount） */
+  staked_total?: number
+  /** 避冷加权本次生效摘要（只增不改；penalized_picks=0 表示未压低任何注） */
+  avoid_cold?: {
+    enabled: boolean
+    /** 避冷阈值（自然日） */
+    days: number
+    /** 保本金额 = 1 个金额最小单位 */
+    cap_amount: number
+    penalized_picks: number
+    budget_total: number
+    /** 被避冷省下、未再分配的金额 */
+    reduced_total: number
+  }
   focus_order: Array<{ type: string; label: string }>
   picks: Pick[]
   missing_waves: Array<{ type: string; label: string; note: string }>
@@ -188,6 +236,37 @@ export const TREND_WINDOW_OPTIONS = [
   { value: 100, label: '近 100 期' },
   { value: 0, label: '全部样本' },
 ] as const
+
+/* ---------------------------------------------------------------------- */
+/* 避冷加权（冷号排后 + 金额封顶，只降不升）                                */
+/* ---------------------------------------------------------------------- */
+/**
+ * 避冷加权：与「近期走势加权」是**两个独立维度**（可同时生效）——
+ *   1）冷号排后：距上次出现超过阈值的号（含样本内从未出现）排到候选队列末尾；
+ *   2）金额封顶：权重随天数递减，金额最多给「保本金额」（1 个金额最小单位）。
+ * 取值 / 口径与后端 ``services/lottery.py`` 的 ``avoid_cold_weight`` /
+ * ``is_avoid_cold_number`` 同源；这里的汉字只用于展示，不参与任何落库判定。
+ * 这是样本内偏好，不是概率，也不承诺提高命中率或收益。
+ */
+export const AVOID_COLD_LABEL = '避冷加权'
+/** 避冷阈值默认值（自然日） */
+export const AVOID_COLD_DEFAULT_DAYS = 60
+export const AVOID_COLD_DAYS_MIN = 1
+export const AVOID_COLD_DAYS_MAX = 999
+
+/** 避冷加权展示文案（0 = 样本内从未出现 → 金额归 0；勿写成概率） */
+export function avoidColdWeightText(weight: number | null | undefined): string {
+  if (weight == null || !Number.isFinite(weight)) return '—'
+  if (weight >= 1) return '不降权'
+  if (weight <= 0) return '样本内未出现 · 金额归 0'
+  return `权重 ${Math.round(weight * 100)}%`
+}
+
+/** 距上次出现展示文案：null = 本池样本内从未出现（不编造天数） */
+export function avoidColdDaysText(days: number | null | undefined): string {
+  if (days == null || !Number.isFinite(days)) return '样本内未出现'
+  return `${Math.trunc(days)} 天前`
+}
 
 /* ---------------------------------------------------------------------- */
 /* 开奖总表（每期只保留特码）                                               */

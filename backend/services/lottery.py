@@ -11,6 +11,8 @@ from collections import Counter
 from datetime import date, datetime
 from typing import Any, Iterable, Sequence
 
+from services.mark_six import lunar_year_for, zodiac_label, zodiac_of
+
 NUMBER_MIN = 1
 NUMBER_MAX = 49
 ZODIAC_STEP = 12
@@ -69,6 +71,21 @@ DEFAULT_ODDS = 47
 ODDS_MIN = 1
 ODDS_MAX = 999
 
+# 避冷加权（软偏好；与 trend_bias **互相独立**）。两条规则，均按「距上次出现自然日」：
+#   1）选号排后：距上次出现 > 阈值的号码（含样本内从未出现 = None）排到候选队列末尾，
+#      非冷号优先被取到；冷号始终留在池内，某桶全是冷号时照常取用（不少出号）；
+#   2）金额封顶：权重 = 阈值 / 天数（越久越低），金额最多给「保本金额」= 1 个最小单位，
+#      向下取整到最小单位倍数，不足 1 个单位记 0；省下的预算不补给其它注。
+# 口径：样本内偏好，不是概率、不是收益承诺，也不承诺提高命中率。
+#   - 距上次出现 ≤ 阈值 → 不惩罚（权重 1.0，正好等于阈值也算不惩罚）；
+#   - 距上次出现 > 阈值 → 权重 = 阈值 / 天数（越久越低：60 天 1.0、120 天 0.5、240 天 0.25）；
+#   - 本池样本内从未出现（days_since_last 为 None）→ 视为最冷，取地板权重 0（金额归 0）。
+DEFAULT_AVOID_COLD_ENABLED = True
+DEFAULT_AVOID_COLD_DAYS = 60
+AVOID_COLD_DAYS_MIN = 1
+AVOID_COLD_DAYS_MAX = 999
+AVOID_COLD_FLOOR_WEIGHT = 0.0
+
 # 近期走势加权（软偏好）。口径：本池近 W 期经验频率，不是真实概率；
 # 回测未证实相对随机有优势 —— notes / UI 禁止写「提高命中率」。
 TREND_BIAS_NEUTRAL = "neutral"
@@ -121,6 +138,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 走势加权：默认不加权；neutral=关闭，等同旧池内排序
     "trend_bias": TREND_BIAS_NEUTRAL,
     "trend_window": DEFAULT_TREND_WINDOW,
+    # 避冷加权：默认开启；距上次出现超过 avoid_cold_days 天的号越久权重越低、
+    # 配置金额越低，最多只给「保本金额」（1 个金额最小单位）。旧数据缺失时按默认开启。
+    "avoid_cold_enabled": DEFAULT_AVOID_COLD_ENABLED,
+    "avoid_cold_days": DEFAULT_AVOID_COLD_DAYS,
     # 显式标记：False = 用户从未手动设置过走势加权（含存量旧默认 hot 遗留行）
     TREND_BIAS_EXPLICIT_KEY: False,
 }
@@ -152,7 +173,12 @@ def zodiac_group(number: int) -> int:
 
 
 def zodiac_numbers(number: int, include_self: bool = True) -> list[int]:
-    """返回与 number 同肖的全部号码（01/13/25/37/49 形式）。"""
+    """返回与 number 同肖的全部号码（01/13/25/37/49 形式）。
+
+    与 ``services.mark_six.zodiac_of()`` 的分组恒等（都是 ``(n - 1) % 12``）：
+    农历年只决定「这一组叫什么生肖」，不改变组内成员。所以同肖号列表与
+    汉字生肖这两个口径永远指向同一组号码，不会互相矛盾。
+    """
     group = zodiac_group(number)
     found = [
         n for n in range(NUMBER_MIN, NUMBER_MAX + 1) if zodiac_group(n) == group
@@ -160,6 +186,26 @@ def zodiac_numbers(number: int, include_self: bool = True) -> list[int]:
     if not include_self:
         found = [n for n in found if n != number]
     return found
+
+
+def resolve_zodiac_date(history_dates: Iterable[Any] | None) -> date | None:
+    """推荐口径的「生肖参照日」= 历史序列里最新一期的开奖日（约定最新在前）。
+
+    生肖归属随**农历年**轮转（春节换肖），汉字只能由某一期开奖日推出；
+    这里取本池最新一期开奖日，与 ``GET /api/draws`` 给同一期补的 ``zodiac``
+    同源（同 ``services.mark_six`` 农历年表）。
+
+    拿不到日期（离线调用、日期缺失）时返回 ``None``，上游据此把生肖字段落成
+    ``null`` —— 宁可不给，也不拿「今天」替猜农历年（春节前后会猜错）。
+    """
+    if history_dates is None:
+        return None
+    for raw in history_dates:
+        try:
+            return _as_date(raw)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def classify_wave(diff: int, small_max: int = 10, normal_max: int = 30) -> str:
@@ -232,6 +278,20 @@ def clamp_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     except (TypeError, ValueError):
         window = DEFAULT_TREND_WINDOW
     merged["trend_window"] = min(TREND_WINDOW_MAX, max(TREND_WINDOW_MIN, window))
+
+    # 避冷加权：布尔开关缺失 / 脏值一律回退为默认 True（默认开启）；
+    # 阈值钳到 1..999，缺失 / 脏值回退为默认 60 天
+    merged["avoid_cold_enabled"] = coerce_bool(
+        merged.get("avoid_cold_enabled"),
+        default=bool(DEFAULT_SETTINGS["avoid_cold_enabled"]),
+    )
+    try:
+        cold_days = int(merged["avoid_cold_days"])
+    except (TypeError, ValueError):
+        cold_days = DEFAULT_AVOID_COLD_DAYS
+    merged["avoid_cold_days"] = min(
+        AVOID_COLD_DAYS_MAX, max(AVOID_COLD_DAYS_MIN, cold_days)
+    )
     return merged
 
 
@@ -263,6 +323,8 @@ def merge_settings_patch(
     """把可写 patch 叠加到当前配置，并维护「手动设置过走势加权」标记。
 
     - 只接受 ``DEFAULT_SETTINGS`` 里的键（``big_min`` 等派生字段永远写不进去）；
+      避冷加权两项（``avoid_cold_enabled`` / ``avoid_cold_days``）同在
+      ``DEFAULT_SETTINGS`` 内，因此由下面的通用循环原样接收（无需特殊分支）；
     - 本次**显式提交** ``trend_bias``（非 None）→ 打上
       ``trend_bias_explicit=True``，此后按用户选择生效；
     - 未提交则沿用当前值：``current`` 已按读取口径解析过，存量遗留的 hot
@@ -306,7 +368,13 @@ def derive_bet_unit(
 
 
 def with_derived_settings(cfg: dict[str, Any]) -> dict[str, Any]:
-    """在配置上附加只读派生字段，仅用于接口返回，不落库。"""
+    """在配置上附加只读派生字段，仅用于接口返回，不落库。
+
+    避冷加权两项（``avoid_cold_enabled`` / ``avoid_cold_days``）是**可写设置项**，
+    由上面的 ``**cfg`` 原样带出（与 ``exclude_repeat_zodiac`` / ``trend_bias`` /
+    ``trend_window`` 的既有模式一致），此处不再重复派生；「保本金额」恒等于
+    ``amount_unit``（1 个最小注码单位），前端可据此展示，无需落库。
+    """
     return {
         **cfg,
         "big_min": derive_big_min(cfg["normal_max"]),
@@ -552,28 +620,50 @@ def order_pool(
     trend_bias: str = TREND_BIAS_NEUTRAL,
     trend_counts: Counter[int] | None = None,
     mid_target: float = 0.0,
+    avoid_cold_enabled: bool = False,
+    avoid_cold_days: int = DEFAULT_AVOID_COLD_DAYS,
+    days_since_last: dict[int, int | None] | None = None,
 ) -> list[dict[str, int]]:
     """池内排序。
 
     ``neutral``：先取全历史遗漏最久（出现少），再取差值最小 —— 旧行为。
     非 ``neutral``：先按近窗频次偏好（热/冷/中频），再回落旧键。
+
+    避冷加权（``avoid_cold_enabled``，与 ``trend_bias`` **互相独立**）：
+    开启时在排序键最前面加一档「冷号标记」，把 ``days_since_last`` 超过
+    ``avoid_cold_days``（含样本内从未出现 = ``None``）的号码整体排到队列**末尾**，
+    让非冷号优先被取到。冷号始终留在池内（不删除），因此某桶全是冷号时
+    仍能正常取号，不会少出号。关闭时（默认参数）排序与改造前逐元素一致。
     """
     counts = trend_counts or Counter()
     bias = trend_bias if trend_bias in TREND_BIASES else TREND_BIAS_NEUTRAL
+    cold_enabled = bool(avoid_cold_enabled)
+    cold_limit = _clamp_avoid_cold_days(avoid_cold_days)
+    days_map = days_since_last or {}
 
     def sort_key(item: dict[str, int]) -> tuple:
+        number = item["number"]
+        cold_prefix: tuple = ()
+        if cold_enabled:
+            cold_prefix = (
+                1
+                if is_avoid_cold_number(
+                    days_map.get(number), enabled=True, threshold=cold_limit
+                )
+                else 0,
+            )
         prefix = _trend_sort_prefix(
-            item["number"],
+            number,
             bias=bias,
             trend_counts=counts,
             mid_target=mid_target,
         )
         baseline = (
-            history_counts.get(item["number"], 0),
+            history_counts.get(number, 0),
             item["diff"],
             item["number"],
         )
-        return (*prefix, *baseline)
+        return (*cold_prefix, *prefix, *baseline)
 
     return sorted(pool, key=sort_key)
 
@@ -582,9 +672,22 @@ def take_from_role_band(
     bands: dict[str, list[dict[str, Any]]],
     preferred_role: str,
     used: set[int],
+    *,
+    is_cold: Any = None,
 ) -> dict[str, Any] | None:
-    """从偏好角色带取号；空则按 主推→次选→防守 回退。"""
+    """从偏好角色带取号；空则按 主推→次选→防守 回退。
+
+    ``is_cold(number) -> bool`` 非空时（避冷加权开启）分两轮：
+    先在角色优先顺序里挑**非冷号**；只有当所有角色带都只剩冷号时，
+    才回退到冷号 —— 保证冷号排后但仍可选（不会少出号、不会误报「无号」）。
+    ``is_cold`` 为 ``None``（关闭避冷）时行为与改造前逐元素一致。
+    """
     order = [preferred_role] + [r for r in ROLE_ORDER if r != preferred_role]
+    if is_cold is not None:
+        for role in order:
+            for item in bands.get(role, []):
+                if item["number"] not in used and not is_cold(item["number"]):
+                    return item
     for role in order:
         for item in bands.get(role, []):
             if item["number"] not in used:
@@ -784,6 +887,117 @@ def allocate_amounts(
     return [part * unit for part in parts]
 
 
+def _clamp_avoid_cold_days(threshold: Any) -> int:
+    """避冷阈值统一钳到 1..999；非法值回退默认 60。"""
+    try:
+        limit = int(threshold)
+    except (TypeError, ValueError):
+        limit = DEFAULT_AVOID_COLD_DAYS
+    return min(AVOID_COLD_DAYS_MAX, max(AVOID_COLD_DAYS_MIN, limit))
+
+
+def is_avoid_cold_number(
+    days_since_last: int | None,
+    *,
+    enabled: bool = True,
+    threshold: int = DEFAULT_AVOID_COLD_DAYS,
+) -> bool:
+    """避冷判定：该号是否算「冷号」（间隔超过阈值，或样本内从未出现）。
+
+    与 ``avoid_cold_weight`` 共用同一档口径：``d <= threshold`` 不算冷号；
+    ``days_since_last is None``（本池样本内从未出现）算最冷。
+    ``enabled=False`` 时恒为 ``False``（关闭 = 旧行为，严格 no-op）。
+    """
+    if not enabled:
+        return False
+    limit = _clamp_avoid_cold_days(threshold)
+    if days_since_last is None:
+        return True
+    try:
+        days = int(days_since_last)
+    except (TypeError, ValueError):
+        return True
+    return days > limit
+
+
+def avoid_cold_weight(
+    days_since_last: int | None,
+    *,
+    enabled: bool = True,
+    threshold: int = DEFAULT_AVOID_COLD_DAYS,
+) -> float:
+    """避冷加权（软偏好 / 只降不升）。
+
+    口径（唯一实现，前后端文案必须与它一致）：
+
+    - ``enabled=False`` → 恒为 ``1.0``，行为与改造前完全一致（关闭即旧行为）；
+    - ``days_since_last`` 为**自然日**（见 ``compute_days_since_last``）：
+      ``d <= threshold`` → ``1.0``（正好等于阈值不惩罚）；
+      ``d > threshold`` → ``threshold / d``（60 天 1.0、120 天 0.5、240 天 0.25）；
+    - ``days_since_last is None``（本池样本内从未出现）→ 视为最冷，取地板值
+      ``AVOID_COLD_FLOOR_WEIGHT``（0.0 → 金额归 0），不编造天数。
+
+    只影响该注的分配金额（选号排后由 ``order_pool`` / ``take_from_role_band`` 负责，
+    见 ``is_avoid_cold_number``）；这是样本内偏好，不是概率，也不承诺收益。
+    """
+    if not enabled:
+        return 1.0
+    limit = _clamp_avoid_cold_days(threshold)
+
+    if days_since_last is None:
+        # 样本内从未出现：没有天数可算，按最冷处理
+        return AVOID_COLD_FLOOR_WEIGHT
+    try:
+        days = int(days_since_last)
+    except (TypeError, ValueError):
+        return AVOID_COLD_FLOOR_WEIGHT
+    if days <= limit:
+        return 1.0
+    return limit / days
+
+
+def _floor_to_unit(value: float, unit: int) -> int:
+    """向下取整到 ``unit`` 的整数倍；不足 1 个单位 → 0（该注不再分配金额）。"""
+    unit = max(1, int(unit))
+    if value is None or value <= 0:
+        return 0
+    return int(float(value) // unit) * unit
+
+
+def apply_avoid_cold_amounts(
+    amounts: list[int],
+    weights: list[float],
+    *,
+    amount_unit: int = DEFAULT_AMOUNT_UNIT,
+) -> tuple[list[int], int]:
+    """按避冷加权压低各注金额（只降不升；省下的预算不补给其它注）。
+
+    - ``target = 原金额 × 权重``；
+    - ``cap = 保本金额 = 1 × amount_unit``（一个最小注码单位）；
+    - 结果 = ``min(target, cap)`` 再向下取整到 ``amount_unit`` 的整数倍；
+    - 不足 1 个单位 → ``0``（号码仍在 picks 里，只是不再分配金额）。
+
+    返回 ``(新金额列表, 被压低的注数)``。权重 ``>= 1.0`` 的注金额原样保留，
+    因此 ``enabled=False``（全 1.0）时输出与输入逐元素相同。
+    """
+    unit = max(1, int(amount_unit))
+    cap = unit
+    out: list[int] = []
+    reduced = 0
+    for index, base in enumerate(amounts):
+        weight = float(weights[index]) if index < len(weights) else 1.0
+        original = int(base)
+        if weight >= 1.0:
+            out.append(original)
+            continue
+        target = float(original) * weight
+        value = _floor_to_unit(min(target, float(cap)), unit)
+        if value != original:
+            reduced += 1
+        out.append(value)
+    return out, reduced
+
+
 def prepare_budget(
     mode: str,
     total: int,
@@ -832,6 +1046,15 @@ def prepare_budget(
     return {"allocated_total": floored, "pick_count": count, "notes": notes}
 
 
+def format_number(number: Any) -> str:
+    """把号码格式化为定宽两位数字串（1-49 → ``01``…``49``）。
+
+    仅用于展示 / 复制文案：个位数补前导 0（``9`` → ``09``），两位数原样返回
+    （``13`` → ``13``，``49`` → ``49``）。金额等其它数字不使用本函数。
+    """
+    return f"{int(number):02d}"
+
+
 def build_copy_text(mode: str, picks: list[dict[str, Any]]) -> str:
     """生成一键复制的竞猜投注串（金额文案必须跟各注实际金额一致）。
 
@@ -839,6 +1062,9 @@ def build_copy_text(mode: str, picks: list[dict[str, Any]]) -> str:
     - 单号独额：``号码：金额元；``
     - 相同金额合并：``号1、号2：各金额元；``
     - 组间用中文分号，分号后换行；末行 ``合计：N元。``
+
+    号码一律经 ``format_number`` 补零为两位（``9`` → ``09``，``13`` 保持 ``13``）；
+    ``合计`` 是金额，不做补零。
     """
     del mode  # 格式统一，不再按模式分支
     if not picks:
@@ -859,7 +1085,7 @@ def build_copy_text(mode: str, picks: list[dict[str, Any]]) -> str:
 
     lines: list[str] = []
     for amount, numbers in groups:
-        joined = "、".join(str(n) for n in numbers)
+        joined = "、".join(format_number(n) for n in numbers)
         if len(numbers) == 1:
             lines.append(f"{joined}：{amount}元；")
         else:
@@ -893,12 +1119,19 @@ def recommend(
     - ``period``：当前期号（用于派生随机分配种子，保证同期刷新结果稳定）。
     - ``history_dates``：与 ``history_numbers`` 等长、最新在前的开奖日；用于近窗 0 次号的
       ``days_since_last``（自然日差）。缺省时回退为期数差。
+      同时用于生肖：参照日取 ``history_dates[0]``（本池最新一期开奖日）→ 农历年 →
+      生肖表，给每注补上 ``zodiac`` / ``zodiac_label``（缺失则落 null，不猜年份）。
 
     走势加权（``trend_bias`` / ``trend_window``）：
     - 先按差值把候选分进小波动 / 常规 / 大跳三桶（阈值来自设置）；
     - 每桶内按近窗出现次数切主推/次选/防守三段（见 ``split_pool_into_role_bands``）；
     - 选号时：该波动在侧重顺序里对应的角色，优先从该桶对应角色带取号；
     - ``neutral`` 关闭加权，池内排序回退为旧的「全历史遗漏优先」。
+
+    避冷加权（``avoid_cold_enabled`` / ``avoid_cold_days``，与 ``trend_bias`` 独立）：
+    - 候选池排序把冷号（``days_since_last`` 超过阈值，或样本内从未出现）整体排到队尾；
+    - 加权路径的取号也先在角色带里挑非冷号，整桶都冷才回退（冷号不删除、不少出号）；
+    - 关闭时（``avoid_cold_enabled=False``）排序与金额均与改造前逐元素一致。
     """
     cfg = clamp_settings(settings)
     mode = mode if mode in MODES else cfg["mode"]
@@ -930,6 +1163,14 @@ def recommend(
 
     history = list(history_numbers)
     dates_list = list(history_dates) if history_dates is not None else None
+    # 生肖参照日（只增不改）：本池最新一期开奖日 → 农历年 → 生肖表。
+    # 与 GET /api/draws 给该期补的 zodiac 同源，且与 latest_zodiac 的号码分组恒等
+    # （农历年只决定这一组叫什么生肖）；拿不到日期就整块留 null，绝不用「今天」猜。
+    zodiac_date = resolve_zodiac_date(dates_list)
+    zodiac_year = lunar_year_for(zodiac_date) if zodiac_date is not None else None
+    latest_zodiac_code = (
+        zodiac_of(int(latest), zodiac_date) if zodiac_date is not None else None
+    )
     # 最新号本身不计入遗漏统计
     history_counts: Counter[int] = Counter(
         n for n in history if n != latest
@@ -941,6 +1182,18 @@ def recommend(
         history, trend_window
     )
     days_since_last = compute_days_since_last(history, dates_list)
+    # 避冷加权（选号排后 + 金额封顶）总开关；与 trend_bias 完全独立，关闭 = 旧行为
+    cold_enabled = bool(cfg["avoid_cold_enabled"])
+    cold_days = int(cfg["avoid_cold_days"])
+
+    def _is_cold_number(number: int) -> bool:
+        """该号是否为冷号（间隔 > 阈值，或样本内从未出现）。"""
+        return is_avoid_cold_number(
+            days_since_last.get(int(number)), enabled=True, threshold=cold_days
+        )
+
+    # 仅在开启时把判定函数交给取号逻辑（关闭时传 None → 严格 no-op）
+    cold_predicate: Any = _is_cold_number if cold_enabled else None
     # 中频目标：近窗内「出现过的号码」的平均次数；全空则 0
     mid_target = (
         sum(trend_counts.values()) / max(1, len(set(trend_counts)))
@@ -993,6 +1246,10 @@ def recommend(
             trend_bias=trend_bias,
             trend_counts=trend_counts,
             mid_target=mid_target,
+            # 避冷加权：冷号整体排到队列末尾（与 trend_bias 独立；关闭时严格 no-op）
+            avoid_cold_enabled=cold_enabled,
+            avoid_cold_days=cold_days,
+            days_since_last=days_since_last,
         )
         for w in WAVE_ORDER
     }
@@ -1019,6 +1276,9 @@ def recommend(
             row for row in ordered_pools[wave] if row["number"] != number
         ]
         count = int(trend_counts.get(number, 0))
+        pick_zodiac = (
+            zodiac_of(number, zodiac_date) if zodiac_date is not None else None
+        )
         picks.append(
             {
                 "number": number,
@@ -1026,6 +1286,9 @@ def recommend(
                 "wave_type": wave,
                 "trend_count": count,
                 "trend_note": f"近{used_window}期出现{count}次",
+                # 号码 → 生肖的固定映射（随农历年轮转）；没有农历年时为 null
+                "zodiac": pick_zodiac,
+                "zodiac_label": zodiac_label(pick_zodiac),
             }
         )
 
@@ -1038,7 +1301,9 @@ def recommend(
             _annex_pick(wave, item)
             return True
         preferred = role_for_focus_rank(focus.index(wave))
-        band_item = take_from_role_band(wave_bands[wave], preferred, used_numbers)
+        band_item = take_from_role_band(
+            wave_bands[wave], preferred, used_numbers, is_cold=cold_predicate
+        )
         if band_item is None:
             item = ordered_pools[wave][0]
             _annex_pick(wave, item)
@@ -1064,7 +1329,7 @@ def recommend(
                 _annex_pick(wave, ordered_pools[wave][0])
             else:
                 band_item = take_from_role_band(
-                    wave_bands[wave], preferred, used_numbers
+                    wave_bands[wave], preferred, used_numbers, is_cold=cold_predicate
                 )
                 if band_item is None:
                     _annex_pick(wave, ordered_pools[wave][0])
@@ -1083,12 +1348,35 @@ def recommend(
         seed=seed_key,
     )
 
-    for pick, role, amount in zip(picks, roles, amounts):
+    # 避冷加权：把「距上次出现超过阈值」的注金额压低（选号排后已在 order_pool /
+    # take_from_role_band 生效），省下的预算不补给其它注；关闭时权重全为 1.0。
+    cold_weights = [
+        avoid_cold_weight(
+            days_since_last.get(int(pick["number"])),
+            enabled=cold_enabled,
+            threshold=cold_days,
+        )
+        for pick in picks
+    ]
+    budget_total = sum(int(amount) for amount in amounts)
+    cold_reduced_count = 0
+    if cold_enabled:
+        amounts, cold_reduced_count = apply_avoid_cold_amounts(
+            amounts, cold_weights, amount_unit=cfg["amount_unit"]
+        )
+    staked_total = sum(int(amount) for amount in amounts)
+
+    for index, (pick, role, amount) in enumerate(zip(picks, roles, amounts)):
+        cold_weight = cold_weights[index] if index < len(cold_weights) else 1.0
         pick["role"] = role
         pick["role_label"] = ROLE_LABELS[role]
         pick["amount"] = amount
         pick["wave_label"] = WAVE_LABELS[pick["wave_type"]]
         pick["is_repeat_zodiac"] = zodiac_group(pick["number"]) == zodiac_group(latest)
+        # 避冷加权附加字段（只增不改）：距上次出现自然日 / 是否被压低 / 权重
+        pick["days_since_last"] = days_since_last.get(int(pick["number"]))
+        pick["avoid_cold_penalized"] = bool(cold_enabled and cold_weight < 1.0)
+        pick["avoid_cold_weight"] = round(float(cold_weight), 4)
 
     notes: list[str] = [*allocation_notes]
     if previous is None:
@@ -1120,11 +1408,48 @@ def recommend(
             "这是样本内加权偏好，不是真实概率，也不承诺提高命中率。"
         )
 
+    # 避冷加权：如实说明「选号排后 + 金额压顶」两条规则与口径，不做任何收益承诺
+    if cold_enabled:
+        notes.append(
+            f"避冷加权已开启（阈值 {cold_days} 天）：距上次出现超过 {cold_days} 天的号码"
+            "（含本池样本内从未出现的号码）已排到候选队列末尾，非冷号优先被取到；"
+            "若某类波动桶内只剩冷号，仍照常取用，不会因此少出号或报「无号」。"
+        )
+        if cold_reduced_count:
+            notes.append(
+                f"避冷加权金额封顶：{cold_reduced_count} 注距上次出现超过 {cold_days} 天，"
+                f"权重随天数递减（{cold_days} 天=1.0、{cold_days * 2} 天≈0.5、"
+                f"{cold_days * 4} 天≈0.25），金额最多给到保本金额 "
+                f"{cfg['amount_unit']} 元（1 个金额最小单位）；"
+                "不足 1 个最小单位的注金额记 0（号码仍列出），"
+                f"省下的 {budget_total - staked_total} 元不补给其它注。"
+            )
+        else:
+            notes.append(
+                f"避冷加权已开启（阈值 {cold_days} 天），本次没有距上次出现超过阈值的注，"
+                "金额未受影响。"
+            )
+        notes.append(
+            "避冷加权只把「距上次出现较久」的号码排到后面并压低其投注金额，"
+            "是本池样本内的偏好，不是概率计算，也不承诺提高命中率或收益。"
+        )
+    else:
+        notes.append(
+            "避冷加权已关闭：距上次出现多久都不影响选号与金额（旧行为）。"
+        )
+
     # 派生展示值（deprecated）：均分后再向下对齐到 amount_unit
     effective_notes = max(1, len(picks))
     return {
         "latest": latest,
         "latest_zodiac": zodiac_numbers(latest),
+        # 生肖汉字（只增不改）：与 latest_zodiac 指向同一组号码（农历年只决定组名），
+        # 供卡片/徽章展示；农历年未知（参照日缺失或早于已知表）时一律 null。
+        "latest_zodiac_code": latest_zodiac_code,
+        "latest_zodiac_label": zodiac_label(latest_zodiac_code),
+        # 生肖口径溯源：参照日（本池最新一期开奖日）与其农历年；未知时为 null
+        "zodiac_date": zodiac_date.isoformat() if zodiac_date is not None else None,
+        "zodiac_year": zodiac_year,
         "previous": previous,
         "prev_wave": prev_wave,
         "settings": with_derived_settings(cfg),
@@ -1136,6 +1461,18 @@ def recommend(
         ),
         "total_amount": total,
         "amount_unit": cfg["amount_unit"],
+        # 实际分配到各注的合计（避冷加权压低后可能 < total_amount；只增不改旧字段）
+        "staked_total": staked_total,
+        # 避冷加权本次的生效摘要（只增不改；无被压低注时 penalized_picks = 0）
+        "avoid_cold": {
+            "enabled": cold_enabled,
+            "days": cold_days,
+            # 保本金额 = 1 个金额最小单位
+            "cap_amount": cfg["amount_unit"],
+            "penalized_picks": cold_reduced_count,
+            "budget_total": budget_total,
+            "reduced_total": budget_total - staked_total,
+        },
         "focus_order": [{"type": w, "label": WAVE_LABELS[w]} for w in focus],
         "picks": picks,
         "missing_waves": missing_waves,
