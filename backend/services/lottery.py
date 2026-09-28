@@ -111,8 +111,8 @@ _BAND_ORDER_NOTE = {
     TREND_BIAS_MID: "主推=最接近中频段、次选=次接近段、防守=离中频最远段",
 }
 TREND_BIAS_PATTERN = "^(" + "|".join(TREND_BIASES) + ")$"
-# 0 = 用全部样本；默认 30 与首页走势窗一致
-DEFAULT_TREND_WINDOW = 30
+# 0 = 用全部样本；默认 20（本池 6 注对照常用近窗，设置页首档）
+DEFAULT_TREND_WINDOW = 20
 TREND_WINDOW_MIN = 0
 TREND_WINDOW_MAX = 500
 # 「是否由用户**手动设置过**走势加权」的内部元数据键（落在 settings 表里）。
@@ -120,6 +120,27 @@ TREND_WINDOW_MAX = 500
 # 读取时只有该标记为 True 才按存值生效；否则一律回退 neutral（不加权）。
 # 该键是内部标记，不进入对外设置契约（SettingsOut / 前端类型）。
 TREND_BIAS_EXPLICIT_KEY = "trend_bias_explicit"
+
+# 选号策略：wave_round = 旧「每波动桶轮流取号」；score_top = 全候选打分取 Top-N。
+# score_top 只改「进前 N 注的号码集合」（影响命中/Δ）；金额分配仍走原模式。
+# 口径：样本内对照用，禁止写成「已提高命中率」。
+PICK_STRATEGY_WAVE_ROUND = "wave_round"
+PICK_STRATEGY_SCORE_TOP = "score_top"
+PICK_STRATEGIES = [PICK_STRATEGY_WAVE_ROUND, PICK_STRATEGY_SCORE_TOP]
+PICK_STRATEGY_LABELS = {
+    PICK_STRATEGY_WAVE_ROUND: "波动轮取（旧）",
+    PICK_STRATEGY_SCORE_TOP: "打分 Top-N（对照Δ）",
+}
+PICK_STRATEGY_PATTERN = "^(" + "|".join(PICK_STRATEGIES) + ")$"
+DEFAULT_PICK_STRATEGY = PICK_STRATEGY_WAVE_ROUND
+# 打分权重（只影响 score_top）：正号 = 该项越大越优先被扣分后排后（见 score_candidate）。
+# 默认接近「中频 + 侧重波段 + 近号差值」；walk-forward 调参可覆盖落库值。
+DEFAULT_SCORE_W_FOCUS = 1.0
+DEFAULT_SCORE_W_MID = 2.0
+DEFAULT_SCORE_W_OMIT = 0.0
+DEFAULT_SCORE_W_DIFF = 0.5
+SCORE_WEIGHT_MIN = -5.0
+SCORE_WEIGHT_MAX = 5.0
 
 # 波动回补逻辑：上期波动类型 → 本期侧重顺序（第一个即主推方向）
 FOCUS_BY_PREV_WAVE: dict[str, list[str]] = {
@@ -148,6 +169,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 配置金额越低，最多只给「保本金额」（1 个金额最小单位）。旧数据缺失时按默认开启。
     "avoid_cold_enabled": DEFAULT_AVOID_COLD_ENABLED,
     "avoid_cold_days": DEFAULT_AVOID_COLD_DAYS,
+    # 选号策略与打分权重（score_top 才读权重；wave_round 忽略）
+    "pick_strategy": DEFAULT_PICK_STRATEGY,
+    "score_w_focus": DEFAULT_SCORE_W_FOCUS,
+    "score_w_mid": DEFAULT_SCORE_W_MID,
+    "score_w_omit": DEFAULT_SCORE_W_OMIT,
+    "score_w_diff": DEFAULT_SCORE_W_DIFF,
     # 显式标记：False = 用户从未手动设置过走势加权（含存量旧默认 hot 遗留行）
     TREND_BIAS_EXPLICIT_KEY: False,
 }
@@ -298,6 +325,22 @@ def clamp_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     merged["avoid_cold_days"] = min(
         AVOID_COLD_DAYS_MAX, max(AVOID_COLD_DAYS_MIN, cold_days)
     )
+
+    strategy = str(merged.get("pick_strategy") or "").strip().lower()
+    merged["pick_strategy"] = (
+        strategy if strategy in PICK_STRATEGIES else DEFAULT_PICK_STRATEGY
+    )
+    for weight_key, default in (
+        ("score_w_focus", DEFAULT_SCORE_W_FOCUS),
+        ("score_w_mid", DEFAULT_SCORE_W_MID),
+        ("score_w_omit", DEFAULT_SCORE_W_OMIT),
+        ("score_w_diff", DEFAULT_SCORE_W_DIFF),
+    ):
+        try:
+            weight = float(merged[weight_key])
+        except (TypeError, ValueError):
+            weight = float(default)
+        merged[weight_key] = min(SCORE_WEIGHT_MAX, max(SCORE_WEIGHT_MIN, weight))
     return merged
 
 
@@ -1170,6 +1213,117 @@ def build_copy_text(mode: str, picks: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def clamp_score_weights(raw: dict[str, Any] | None = None) -> dict[str, float]:
+    """把打分权重钳到 ``SCORE_WEIGHT_MIN..MAX``；缺省用默认值。"""
+    src = raw if isinstance(raw, dict) else {}
+    out: dict[str, float] = {}
+    for key, default in (
+        ("score_w_focus", DEFAULT_SCORE_W_FOCUS),
+        ("score_w_mid", DEFAULT_SCORE_W_MID),
+        ("score_w_omit", DEFAULT_SCORE_W_OMIT),
+        ("score_w_diff", DEFAULT_SCORE_W_DIFF),
+    ):
+        try:
+            weight = float(src.get(key, default))
+        except (TypeError, ValueError):
+            weight = float(default)
+        out[key] = min(SCORE_WEIGHT_MAX, max(SCORE_WEIGHT_MIN, weight))
+    return out
+
+
+def score_candidate(
+    *,
+    wave: str,
+    diff: int,
+    number: int,
+    focus: Sequence[str],
+    trend_counts: Counter[int],
+    mid_target: float,
+    days_since_last: dict[int, int | None] | None,
+    weights: dict[str, float],
+) -> float:
+    """候选打分：分数越高越优先进入 Top-N（仅 ``score_top`` 路径使用）。
+
+    特征（越大越好，权重为正时强化该方向）：
+    - focus：侧重顺序越靠前加分越多；
+    - mid：越接近近窗中频加分越多；
+    - omit：遗漏天数越少加分越多（权重为负则偏好更冷号）；
+    - diff：与最新号差值越小加分越多。
+
+    这是样本内排序键，不是概率，也不承诺提高命中率。
+    """
+    try:
+        focus_rank = list(focus).index(wave)
+    except ValueError:
+        focus_rank = len(WAVE_ORDER)
+    count = float(trend_counts.get(int(number), 0))
+    mid_dist = abs(count - float(mid_target))
+    days_map = days_since_last or {}
+    raw_days = days_map.get(int(number))
+    if raw_days is None:
+        omit_feat = 4.0  # 从未出现：按「约 4 倍默认阈值」的冷度
+    else:
+        omit_feat = min(max(0, int(raw_days)), 365) / float(DEFAULT_AVOID_COLD_DAYS)
+
+    w = clamp_score_weights(weights)
+    # 统一写成「越高越好」
+    return (
+        -w["score_w_focus"] * float(focus_rank)
+        - w["score_w_mid"] * mid_dist
+        - w["score_w_omit"] * omit_feat
+        - w["score_w_diff"] * (float(diff) / float(NUMBER_MAX))
+    )
+
+
+def select_score_top_candidates(
+    pools: dict[str, list[dict[str, int]]],
+    *,
+    pick_count: int,
+    focus: Sequence[str],
+    trend_counts: Counter[int],
+    mid_target: float,
+    days_since_last: dict[int, int | None] | None,
+    weights: dict[str, float],
+) -> list[dict[str, Any]]:
+    """从三类波动池打分，取分数最高的 ``pick_count`` 个（稳定排序）。"""
+    scored: list[tuple[float, int, int, str, dict[str, int]]] = []
+    for wave in WAVE_ORDER:
+        for item in pools.get(wave) or []:
+            number = int(item["number"])
+            diff = int(item["diff"])
+            points = score_candidate(
+                wave=wave,
+                diff=diff,
+                number=number,
+                focus=focus,
+                trend_counts=trend_counts,
+                mid_target=mid_target,
+                days_since_last=days_since_last,
+                weights=weights,
+            )
+            # 分数降序；平手按 diff、number 升序，保证可复现
+            scored.append((points, -diff, -number, wave, item))
+    scored.sort(reverse=True)
+    selected: list[dict[str, Any]] = []
+    used: set[int] = set()
+    for points, _neg_diff, _neg_num, wave, item in scored:
+        number = int(item["number"])
+        if number in used:
+            continue
+        used.add(number)
+        selected.append(
+            {
+                "number": number,
+                "diff": int(item["diff"]),
+                "wave_type": wave,
+                "score": round(float(points), 6),
+            }
+        )
+        if len(selected) >= max(1, int(pick_count)):
+            break
+    return selected
+
+
 # --------------------------------------------------------------------------- #
 # 主入口
 # --------------------------------------------------------------------------- #
@@ -1352,8 +1506,12 @@ def recommend(
 
     picks: list[dict[str, Any]] = []
     used_numbers: set[int] = set()
+    pick_strategy = str(cfg.get("pick_strategy") or DEFAULT_PICK_STRATEGY)
+    if pick_strategy not in PICK_STRATEGIES:
+        pick_strategy = DEFAULT_PICK_STRATEGY
+    score_weights = clamp_score_weights(cfg)
 
-    def _annex_pick(wave: str, item: dict[str, Any]) -> None:
+    def _annex_pick(wave: str, item: dict[str, Any], *, score: float | None = None) -> None:
         number = int(item["number"])
         used_numbers.add(number)
         # 从有序池里摘掉，避免后续再取到同一号
@@ -1364,62 +1522,82 @@ def recommend(
         pick_zodiac = (
             zodiac_of(number, zodiac_date) if zodiac_date is not None else None
         )
-        picks.append(
-            {
-                "number": number,
-                "diff": int(item["diff"]),
-                "wave_type": wave,
-                "trend_count": count,
-                "trend_note": f"近{used_window}期出现{count}次",
-                # 号码 → 生肖的固定映射（随农历年轮转）；没有农历年时为 null
-                "zodiac": pick_zodiac,
-                "zodiac_label": zodiac_label(pick_zodiac),
-            }
-        )
+        row = {
+            "number": number,
+            "diff": int(item["diff"]),
+            "wave_type": wave,
+            "trend_count": count,
+            "trend_note": f"近{used_window}期出现{count}次",
+            # 号码 → 生肖的固定映射（随农历年轮转）；没有农历年时为 null
+            "zodiac": pick_zodiac,
+            "zodiac_label": zodiac_label(pick_zodiac),
+        }
+        if score is not None:
+            row["score"] = float(score)
+        picks.append(row)
 
-    def _take_for_wave(wave: str) -> bool:
-        """从该波动桶取一个号。加权开启时优先走侧重角色对应的频次带。"""
-        if not ordered_pools[wave]:
-            return False
-        if trend_bias == TREND_BIAS_NEUTRAL:
-            item = ordered_pools[wave][0]
-            _annex_pick(wave, item)
-            return True
-        preferred = role_for_focus_rank(focus.index(wave))
-        band_item = take_from_role_band(
-            wave_bands[wave], preferred, used_numbers, is_cold=cold_predicate
-        )
-        if band_item is None:
-            item = ordered_pools[wave][0]
-            _annex_pick(wave, item)
-            return True
-        _annex_pick(wave, band_item)
-        return True
+    if pick_strategy == PICK_STRATEGY_SCORE_TOP:
+        # 打分 Top-N：跨波动桶统一取分最高的 N 个（只改集合，不改金额规则）
+        for selected in select_score_top_candidates(
+            pools,
+            pick_count=pick_count,
+            focus=focus,
+            trend_counts=trend_counts,
+            mid_target=mid_target,
+            days_since_last=days_since_last,
+            weights=score_weights,
+        ):
+            wave = str(selected["wave_type"])
+            _annex_pick(
+                wave,
+                {"number": selected["number"], "diff": selected["diff"]},
+                score=float(selected.get("score") or 0.0),
+            )
+    else:
 
-    # 决策 1：候选选取固定按 WAVE_ORDER（小波动 → 常规波动 → 大跳）逐类取一个，
-    # 与侧重/回补顺序解耦；侧重顺序只用于角色分配，以及加权时的角色带映射。
-    for wave in WAVE_ORDER:
-        if len(picks) >= pick_count:
-            break
-        _take_for_wave(wave)
-
-    # 决策 2：某类无解导致不足注数时，从仍有候选的池中补齐（允许同类多取）
-    for wave in WAVE_ORDER:
-        if len(picks) >= pick_count:
-            break
-        while len(picks) < pick_count and ordered_pools[wave]:
-            # 补齐时按「即将落到的角色顺位」偏好对应频次带
-            preferred = assign_roles(pick_count)[len(picks)]
+        def _take_for_wave(wave: str) -> bool:
+            """从该波动桶取一个号。加权开启时优先走侧重角色对应的频次带。"""
+            if not ordered_pools[wave]:
+                return False
             if trend_bias == TREND_BIAS_NEUTRAL:
-                _annex_pick(wave, ordered_pools[wave][0])
-            else:
-                band_item = take_from_role_band(
-                    wave_bands[wave], preferred, used_numbers, is_cold=cold_predicate
-                )
-                if band_item is None:
+                item = ordered_pools[wave][0]
+                _annex_pick(wave, item)
+                return True
+            preferred = role_for_focus_rank(focus.index(wave))
+            band_item = take_from_role_band(
+                wave_bands[wave], preferred, used_numbers, is_cold=cold_predicate
+            )
+            if band_item is None:
+                item = ordered_pools[wave][0]
+                _annex_pick(wave, item)
+                return True
+            _annex_pick(wave, band_item)
+            return True
+
+        # 决策 1：候选选取固定按 WAVE_ORDER（小波动 → 常规波动 → 大跳）逐类取一个，
+        # 与侧重/回补顺序解耦；侧重顺序只用于角色分配，以及加权时的角色带映射。
+        for wave in WAVE_ORDER:
+            if len(picks) >= pick_count:
+                break
+            _take_for_wave(wave)
+
+        # 决策 2：某类无解导致不足注数时，从仍有候选的池中补齐（允许同类多取）
+        for wave in WAVE_ORDER:
+            if len(picks) >= pick_count:
+                break
+            while len(picks) < pick_count and ordered_pools[wave]:
+                # 补齐时按「即将落到的角色顺位」偏好对应频次带
+                preferred = assign_roles(pick_count)[len(picks)]
+                if trend_bias == TREND_BIAS_NEUTRAL:
                     _annex_pick(wave, ordered_pools[wave][0])
                 else:
-                    _annex_pick(wave, band_item)
+                    band_item = take_from_role_band(
+                        wave_bands[wave], preferred, used_numbers, is_cold=cold_predicate
+                    )
+                    if band_item is None:
+                        _annex_pick(wave, ordered_pools[wave][0])
+                    else:
+                        _annex_pick(wave, band_item)
 
     # 角色按侧重顺序分配 —— 在侧重顺序中出现越靠前的波动类型越优先，
     # 依次获得 主推 / 次选 / 防守…（focus 恒含全部三类波动）。
@@ -1524,6 +1702,16 @@ def recommend(
             "避冷加权已关闭：距上次出现多久都不影响选号与金额（旧行为）。"
         )
 
+    if pick_strategy == PICK_STRATEGY_SCORE_TOP:
+        notes.append(
+            "选号策略为打分 Top-N：在候选池内按侧重波段、中频接近度、遗漏与差值综合打分后取前 N 注；"
+            "这是样本内排序对照（用于相对随机命中差），不是真实概率，也不承诺提高命中率。"
+        )
+    else:
+        notes.append(
+            "选号策略为波动轮取：先按小/常/大跳各取一注，不足再按波动桶补齐（旧行为）。"
+        )
+
     # 派生展示值（deprecated）：均分后再向下对齐到 amount_unit
     effective_notes = max(1, len(picks))
     return {
@@ -1541,6 +1729,10 @@ def recommend(
         "settings": with_derived_settings(cfg),
         "mode": mode,
         "mode_label": MODE_LABELS[mode],
+        "pick_strategy": pick_strategy,
+        "pick_strategy_label": PICK_STRATEGY_LABELS.get(
+            pick_strategy, pick_strategy
+        ),
         # 向后兼容：bet_unit 仍回，语义见 derive_bet_unit
         "bet_unit": derive_bet_unit(
             total, effective_notes, MODE_EVEN, cfg["amount_unit"]

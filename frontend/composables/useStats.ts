@@ -292,6 +292,20 @@ export interface BacktestSettings {
   effective_pick_count: number
   /** 避开重肖是否生效（与 /api/settings 同源；老后端可能缺此字段） */
   exclude_repeat_zodiac?: boolean
+  /** 走势加权偏好 / 近窗（扫描与单次回测均回报；老后端可能缺） */
+  trend_bias?: string
+  trend_bias_label?: string
+  trend_window?: number
+  avoid_cold_enabled?: boolean
+  avoid_cold_days?: number
+}
+
+export interface BacktestVerdict {
+  kind: 'insufficient' | 'noise' | 'beyond'
+  label: string
+  text: string
+  /** 后端字段 within_noise */
+  within_noise?: boolean
 }
 
 export interface BacktestStats extends StatsEnvelope {
@@ -323,15 +337,70 @@ export interface BacktestStats extends StatsEnvelope {
   hit_rate_minus_baseline: number | null
   /** 命中率的抽样标准误（0 - 1）；无法计算时为 null */
   hit_rate_standard_error: number | null
+  /** 与前端 backtestVerdict 同口径的判定（后端 additive；老后端可能缺） */
+  verdict?: BacktestVerdict
   average_available_numbers: number | null
   /** 实际特码落在候选池内的比例 —— 命中率的理论上限 */
   actual_in_pool_rate: number | null
   actual_in_pool_note: string
-  /** 按**当期实际**波动分类（事后归因） */
-  wave_breakdown: { items: BacktestWaveBucket[] }
-  /** 按**预测当时已知**的上一期波动分类 */
-  wave_breakdown_by_prev: { items: BacktestWaveBucket[] }
-  results: BacktestResultRow[]
+  /** 按**当期实际**波动分类（事后归因）；扫描接口不返回 */
+  wave_breakdown?: { items: BacktestWaveBucket[] }
+  /** 按**预测当时已知**的上一期波动分类；扫描接口不返回 */
+  wave_breakdown_by_prev?: { items: BacktestWaveBucket[] }
+  /** 逐期明细；扫描接口不返回 */
+  results?: BacktestResultRow[]
+  notes: string[]
+}
+
+/* -------------------------------------------------------------------------- */
+/* 参数扫描 POST /api/stats/backtest/sweep                                       */
+/* -------------------------------------------------------------------------- */
+
+export interface BacktestSweepRow {
+  trend_bias: string
+  trend_bias_label: string
+  trend_window: number
+  trend_window_label: string
+  avoid_cold_enabled: boolean
+  avoid_cold_days: number
+  mode: string
+  pick_count: number
+  effective_pick_count: number
+  evaluated: number
+  hits: number
+  hit_rate: number | null
+  random_baseline_hit_rate: number
+  hit_rate_minus_baseline: number | null
+  hit_rate_standard_error: number | null
+  actual_in_pool_rate: number | null
+  verdict: BacktestVerdict
+  /** 是否与扫描时的已保存设置（held）在三轴上一致 */
+  matches_baseline: boolean
+}
+
+export interface BacktestSweepStats extends StatsEnvelope {
+  axes: {
+    trend_bias: string[]
+    trend_window: number[]
+    avoid_cold_enabled: boolean[]
+  }
+  held_settings: {
+    mode: string
+    pick_count: number
+    small_max: number
+    normal_max: number
+    big_min: number
+    exclude_repeat_zodiac: boolean
+    avoid_cold_days: number
+    trend_bias: string
+    trend_window: number
+    avoid_cold_enabled: boolean
+  }
+  combo_count: number
+  beyond_count: number
+  noise_count: number
+  insufficient_count: number
+  rows: BacktestSweepRow[]
   notes: string[]
 }
 
@@ -408,6 +477,22 @@ export interface BacktestPayload {
   small_max?: number
   normal_max?: number
   limit?: number
+}
+
+/**
+ * POST /api/stats/backtest/sweep 的请求体。
+ * 轴列表省略 = 后端默认（bias×window×avoid_cold ≈ 32 组）；空列表由后端回退默认。
+ * 只读，不写库。
+ */
+export interface BacktestSweepPayload {
+  mode?: string
+  pick_count?: number
+  small_max?: number
+  normal_max?: number
+  limit?: number
+  trend_biases?: string[]
+  trend_windows?: number[]
+  avoid_cold_values?: boolean[]
 }
 
 /* -------------------------------------------------------------------------- */
@@ -586,6 +671,17 @@ export function useStats() {
      */
     backtest: (payload: BacktestPayload = {}) =>
       statsFetch<BacktestStats>('/api/stats/backtest', {
+        method: 'POST',
+        body: payload,
+      }),
+
+    /**
+     * 6b. 参数扫描（样本内对照，只读）。
+     * 默认网格 trend_bias × trend_window × avoid_cold；不写库、不改设置。
+     * 排序按命中率降序仅便于浏览，不是最优策略。
+     */
+    backtestSweep: (payload: BacktestSweepPayload = {}) =>
+      statsFetch<BacktestSweepStats>('/api/stats/backtest/sweep', {
         method: 'POST',
         body: payload,
       }),

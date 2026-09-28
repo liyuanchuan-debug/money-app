@@ -647,3 +647,142 @@ def test_real_database_connection_is_hard_blocked(monkeypatch):
     with pytest.raises(RuntimeError):
         asyncio.run(db.init_pool())
 
+
+# --------------------------------------------------------------------------- #
+# 10. 参数扫描（方案 A：样本内对照，只读，不写库）
+# --------------------------------------------------------------------------- #
+def test_backtest_sweep_known_grid_and_honesty():
+    """默认网格 = bias×window×avoid_cold；每行带判定；文案禁止「提高命中率」。"""
+    from services.analytics import backtest_sweep
+
+    # 足够走步：min_prior=2 → 可评估 8 期
+    draws = _draws([10, 20, 15, 25, 12, 30, 18, 22, 14, 28])
+    result = backtest_sweep(
+        draws,
+        base_settings={
+            "mode": "even",
+            "pick_count": 3,
+            "trend_bias": "neutral",
+            "trend_window": 30,
+            "avoid_cold_enabled": False,
+        },
+        # 缩网格，加快单测：2×2×2 = 8 组
+        trend_biases=["neutral", "hot"],
+        trend_windows=[30, 0],
+        avoid_cold_values=[False, True],
+    )
+
+    assert result["combo_count"] == 8
+    assert len(result["rows"]) == 8
+    assert result["axes"]["trend_bias"] == ["neutral", "hot"]
+    assert result["held_settings"]["pick_count"] == 3
+    # 排序：命中率降序（None 垫底）
+    rates = [row["hit_rate"] for row in result["rows"] if row["hit_rate"] is not None]
+    assert rates == sorted(rates, reverse=True)
+    # 每行都有判定
+    for row in result["rows"]:
+        assert row["verdict"]["kind"] in ("insufficient", "noise", "beyond")
+        assert "label" in row["verdict"] and "text" in row["verdict"]
+        assert "trend_bias_label" in row
+        assert "trend_window_label" in row
+    # 当前设置那一行必须能标出来
+    assert any(row["matches_baseline"] for row in result["rows"])
+    # 诚实口径：禁止包装成「已优化 / 提高命中率」
+    joined = "；".join(result["notes"])
+    assert "只读" in joined
+    assert "不是" in joined  # 「不是最优策略」
+    assert "禁止" in joined and "提高命中率" in joined
+    for banned in ("全市场", "全量市场", "市场最"):
+        assert banned not in joined
+
+
+def test_backtest_sweep_include_results_off_keeps_response_lean():
+    """扫描路径不得拖出逐期明细（响应体要能进前端表格）。"""
+    from services.analytics import backtest_stats
+
+    draws = _draws([10, 20, 15, 25, 12, 30])
+    lean = backtest_stats(
+        draws,
+        base_settings={"pick_count": 3, "mode": "even"},
+        include_results=False,
+        include_wave_breakdown=False,
+    )
+    assert "results" not in lean
+    assert "wave_breakdown" not in lean
+    assert "verdict" in lean
+    assert "trend_bias" in lean["settings"]
+    assert "trend_window" in lean["settings"]
+
+    full = backtest_stats(
+        draws, base_settings={"pick_count": 3, "mode": "even"}
+    )
+    assert "results" in full and "wave_breakdown" in full
+    assert "verdict" in full
+
+
+def test_backtest_sweep_http_endpoint(client):
+    """POST /api/stats/backtest/sweep：只读、缩网格可复现、不改设置。"""
+    # 手工导入少量期数（够走步即可）；避免拉全量 200 期拖慢扫网格
+    lines = []
+    start = date(2026, 6, 1)
+    for index, number in enumerate([10, 20, 15, 25, 12, 30, 18, 22]):
+        day = start + timedelta(days=index)
+        lines.append(f"{index + 1}期 {day.isoformat()}：+{number:02d}马")
+    imported = client.post(
+        "/api/draws/import", json={"text": "\n".join(lines), "replace_existing": True}
+    )
+    assert imported.status_code == 200
+
+    before = client.get("/api/settings").json()
+
+    body = client.post(
+        "/api/stats/backtest/sweep",
+        json={
+            "trend_biases": ["neutral", "hot"],
+            "trend_windows": [30],
+            "avoid_cold_values": [False],
+            "pick_count": 3,
+        },
+    ).json()
+
+    assert body["combo_count"] == 2
+    assert len(body["rows"]) == 2
+    assert body["held_settings"]["pick_count"] == 3
+    assert all(row["verdict"]["kind"] for row in body["rows"])
+    # 扫描不得改写设置
+    after = client.get("/api/settings").json()
+    assert after["trend_bias"] == before["trend_bias"]
+    assert after["trend_window"] == before["trend_window"]
+    assert after["avoid_cold_enabled"] == before["avoid_cold_enabled"]
+
+    # 文案禁词
+    text = client.post(
+        "/api/stats/backtest/sweep",
+        json={
+            "trend_biases": ["neutral"],
+            "trend_windows": [30],
+            "avoid_cold_values": [False],
+        },
+    ).text
+    for banned in ("全市场", "全量市场", "市场最"):
+        assert banned not in text
+    assert "本池已导入" in text
+
+
+def test_backtest_single_includes_verdict_field(client):
+    """单次回测响应也带 verdict（与扫描同口径），前端可选用。"""
+    lines = []
+    start = date(2026, 6, 1)
+    for index, number in enumerate([10, 20, 15, 25, 12, 30]):
+        day = start + timedelta(days=index)
+        lines.append(f"{index + 1}期 {day.isoformat()}：+{number:02d}马")
+    imported = client.post(
+        "/api/draws/import", json={"text": "\n".join(lines), "replace_existing": True}
+    )
+    assert imported.status_code == 200
+    body = client.post("/api/stats/backtest", json={"pick_count": 3}).json()
+    assert "verdict" in body
+    assert body["verdict"]["kind"] in ("insufficient", "noise", "beyond")
+    assert "trend_bias" in body["settings"]
+    assert "trend_window" in body["settings"]
+

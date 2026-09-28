@@ -14,6 +14,7 @@ from services.lottery import (
     ODDS_MIN,
     PICK_COUNT_MAX,
     PICK_COUNT_MIN,
+    PICK_STRATEGY_PATTERN,
     TOTAL_AMOUNT_MAX,
     TOTAL_AMOUNT_MIN,
     TREND_BIAS_PATTERN,
@@ -45,6 +46,12 @@ class SettingsOut(BaseModel):
     avoid_cold_enabled: bool
     # 避冷阈值（自然日）：距上次出现 ≤ 该值不惩罚；默认 60，范围 1..999
     avoid_cold_days: int
+    # 选号策略：wave_round|score_top
+    pick_strategy: str
+    score_w_focus: float
+    score_w_mid: float
+    score_w_omit: float
+    score_w_diff: float
     # 只读派生字段：恒等于 normal_max + 1，不接受外部写入
     big_min: int
 
@@ -88,6 +95,15 @@ class SettingsPatch(BaseModel):
         le=AVOID_COLD_DAYS_MAX,
         description="避冷阈值（自然日），默认 60",
     )
+    pick_strategy: str | None = Field(
+        default=None,
+        pattern=PICK_STRATEGY_PATTERN,
+        description="wave_round=波动轮取；score_top=打分Top-N对照Δ",
+    )
+    score_w_focus: float | None = Field(default=None, ge=-5, le=5)
+    score_w_mid: float | None = Field(default=None, ge=-5, le=5)
+    score_w_omit: float | None = Field(default=None, ge=-5, le=5)
+    score_w_diff: float | None = Field(default=None, ge=-5, le=5)
     # 注意：不声明 big_min，PUT 时请求体里的 big_min 会被 Pydantic 忽略
 
 

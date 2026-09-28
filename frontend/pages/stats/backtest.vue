@@ -31,8 +31,14 @@ definePageMeta({ role: 'VIP' })
  *      「需要 VIP 权限」状态，不得白屏、不得静默失败、不得 fail-open 放行；
  *      该降级分支已实现在 StatsPageFrame 的错误态里（required-role="VIP"），此处不再重复判断。
  */
-import { CHIP_MODE_OPTIONS } from '~/composables/useApi'
-import type { BacktestPayload, BacktestStats } from '~/composables/useStats'
+import { CHIP_MODE_OPTIONS, useApi } from '~/composables/useApi'
+import type {
+  BacktestPayload,
+  BacktestStats,
+  BacktestSweepPayload,
+  BacktestSweepRow,
+  BacktestSweepStats,
+} from '~/composables/useStats'
 import {
   STATS_DEFAULT_SAMPLE_LIMIT,
   backtestVerdict,
@@ -45,6 +51,7 @@ import {
 } from '~/composables/useStats'
 
 const api = useStats()
+const lotteryApi = useApi()
 const sampleLimit = ref(STATS_DEFAULT_SAMPLE_LIMIT)
 
 /** '' = 不覆盖该字段，沿用当前用户**已保存的设置**（不是前端硬编码，也不是 DEFAULT_SETTINGS） */
@@ -179,6 +186,83 @@ const visibleResults = computed(() =>
 )
 
 const outOfPoolCount = computed(() => results.value.filter(row => !row.actual_in_candidate_pool).length)
+
+/* ---------------- 参数扫描（方案 A：样本内对照，默认不写回设置） ---------------- */
+
+const sweepPayload = computed<BacktestSweepPayload>(() => {
+  const body: BacktestSweepPayload = { limit: sampleLimit.value }
+  if (modeOverride.value) body.mode = modeOverride.value
+  if (pickOverride.value !== '') body.pick_count = Number(pickOverride.value)
+  return body
+})
+
+/**
+ * 扫描默认不自动跑（约 32 组 × 走步，偏重）：用户点「开始扫描」才拉。
+ * 与上方单次回测共用 sampleLimit / mode / pick 覆盖项，保证对照口径一致。
+ */
+const sweepLoaded = ref(false)
+const {
+  data: sweepData,
+  pending: sweepPending,
+  error: sweepError,
+  refresh: refreshSweep,
+} = await useAsyncData<BacktestSweepStats>(
+  'stats-backtest-sweep',
+  () => api.backtestSweep(sweepPayload.value),
+  { immediate: false },
+)
+
+async function runSweep() {
+  sweepLoaded.value = true
+  await refreshSweep()
+}
+
+const sweepRows = computed(() => sweepData.value?.rows ?? [])
+
+const applyingKey = ref<string | null>(null)
+const applyMessage = ref('')
+const applyError = ref('')
+
+function sweepRowKey(row: BacktestSweepRow): string {
+  return `${row.trend_bias}|${row.trend_window}|${row.avoid_cold_enabled ? 1 : 0}`
+}
+
+function verdictTone(kind: string | undefined): 'bloom' | 'aqua' | 'neutral' {
+  if (kind === 'noise' || kind === 'insufficient') return 'bloom'
+  if (kind === 'beyond') return 'aqua'
+  return 'neutral'
+}
+
+/**
+ * 显式「应用到设置」：只写扫描轴上的三项（+ avoid_cold_days 保持该行值）。
+ * 文案必须说清：样本内对照，不是已验证优势，不承诺提高命中率。
+ */
+async function applySweepRow(row: BacktestSweepRow) {
+  applyMessage.value = ''
+  applyError.value = ''
+  const key = sweepRowKey(row)
+  applyingKey.value = key
+  try {
+    await lotteryApi.updateSettings({
+      trend_bias: row.trend_bias as 'neutral' | 'hot' | 'mid' | 'cold',
+      trend_window: row.trend_window,
+      avoid_cold_enabled: row.avoid_cold_enabled,
+      avoid_cold_days: row.avoid_cold_days,
+    })
+    applyMessage.value = (
+      `已写入设置：${row.trend_bias_label} · ${row.trend_window_label} · `
+      + `避冷${row.avoid_cold_enabled ? '开' : '关'}。`
+      + '这是本池样本内对照，不是已验证优势，也不承诺提高命中率。'
+      + '财富密码页下次生成会用新设置。'
+    )
+    // 刷新单次回测与扫描「当前设置」标记
+    await Promise.all([refresh(), refreshSweep()])
+  } catch (err: any) {
+    applyError.value = err?.data?.detail || err?.message || '写入设置失败'
+  } finally {
+    applyingKey.value = null
+  }
+}
 </script>
 
 <template>
@@ -482,6 +566,142 @@ const outOfPoolCount = computed(() => results.value.filter(row => !row.actual_in
         </GlassPanel>
       </MotionReveal>
       <MotionReveal :index="6">
+        <!-- 参数扫描：样本内对照，默认不写回设置 -->
+        <GlassPanel padding="lg" rounded="3xl" class="space-y-4">
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div class="space-y-1">
+              <h2 class="text-lg font-medium text-white">参数扫描（样本内对照）</h2>
+              <p class="text-xs leading-relaxed text-slate-500">
+                网格扫描走势偏好 × 近窗 × 避冷开关（约 32 组），每组走与财富密码同源的 walk-forward 回测。
+                排序按命中率降序<strong class="font-medium text-slate-300">仅便于浏览，不是最优策略</strong>；
+                默认不写回设置。判定口径与上方单次回测相同。
+              </p>
+            </div>
+            <GlassButton
+              variant="primary"
+              size="sm"
+              class="min-h-[44px] shrink-0"
+              :loading="sweepPending"
+              :disabled="sweepPending"
+              @click="runSweep"
+            >
+              {{ sweepPending ? '扫描中…' : (sweepLoaded ? '重新扫描' : '开始扫描') }}
+            </GlassButton>
+          </div>
+
+          <p class="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-100">
+            样本内排名靠前 ≠ 已验证优势。差值落在抽样噪声内时，无法证明该组优于随机；
+            超过噪声也不构成对未来命中能力的任何承诺。禁止把结果说成「已优化命中率」。
+          </p>
+
+          <p v-if="sweepError" class="text-xs text-bloom-200">
+            扫描失败：{{ (sweepError as any)?.data?.detail || (sweepError as any)?.message || '未知错误' }}
+          </p>
+
+          <template v-if="sweepData">
+            <div class="flex flex-wrap gap-2">
+              <StatChip tone="neutral" size="sm">共 {{ sweepData.combo_count }} 组</StatChip>
+              <StatChip tone="bloom" size="sm">噪声内 {{ sweepData.noise_count }}</StatChip>
+              <StatChip tone="aqua" size="sm">超噪声 {{ sweepData.beyond_count }}</StatChip>
+              <StatChip
+                v-if="sweepData.insufficient_count"
+                tone="neutral"
+                size="sm"
+              >
+                数据不足 {{ sweepData.insufficient_count }}
+              </StatChip>
+            </div>
+
+            <ul class="space-y-1 text-[11px] leading-relaxed text-slate-500">
+              <li v-for="(note, index) in sweepData.notes" :key="index">
+                {{ note }}
+              </li>
+            </ul>
+
+            <p
+              v-if="applyMessage"
+              class="rounded-xl border border-emerald-400/30 bg-emerald-400/10 px-3 py-2 text-xs leading-relaxed text-emerald-100"
+            >
+              {{ applyMessage }}
+            </p>
+            <p v-if="applyError" class="text-xs text-bloom-200">{{ applyError }}</p>
+
+            <div class="overflow-x-auto rounded-2xl border border-white/10">
+              <table class="min-w-full text-left text-xs text-slate-200">
+                <thead class="bg-white/5 text-[11px] text-slate-400">
+                  <tr>
+                    <th class="px-3 py-2 font-medium">走势偏好</th>
+                    <th class="px-3 py-2 font-medium">近窗</th>
+                    <th class="px-3 py-2 font-medium">避冷</th>
+                    <th class="px-3 py-2 font-medium">命中率</th>
+                    <th class="px-3 py-2 font-medium">− 随机</th>
+                    <th class="px-3 py-2 font-medium">判定</th>
+                    <th class="px-3 py-2 font-medium">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="row in sweepRows"
+                    :key="sweepRowKey(row)"
+                    class="border-t border-white/5"
+                    :class="row.matches_baseline ? 'bg-aqua-400/5' : ''"
+                  >
+                    <td class="px-3 py-2">
+                      <span>{{ row.trend_bias_label }}</span>
+                      <StatChip
+                        v-if="row.matches_baseline"
+                        class="ml-1"
+                        tone="aqua"
+                        size="xs"
+                      >
+                        当前设置
+                      </StatChip>
+                    </td>
+                    <td class="num px-3 py-2">{{ row.trend_window_label }}</td>
+                    <td class="px-3 py-2">{{ row.avoid_cold_enabled ? '开' : '关' }}</td>
+                    <td class="num px-3 py-2">
+                      {{ formatRate(row.hit_rate) }}
+                      <span class="text-slate-500">
+                        （{{ row.hits }}/{{ row.evaluated }}）
+                      </span>
+                    </td>
+                    <td class="num px-3 py-2">{{ formatSignedPp(row.hit_rate_minus_baseline) }}</td>
+                    <td class="px-3 py-2">
+                      <StatChip :tone="verdictTone(row.verdict?.kind)" size="xs">
+                        {{ row.verdict?.kind === 'noise' ? '噪声内'
+                          : row.verdict?.kind === 'beyond' ? '超噪声'
+                            : row.verdict?.kind === 'insufficient' ? '数据不足'
+                              : '—' }}
+                      </StatChip>
+                    </td>
+                    <td class="px-3 py-2">
+                      <GlassButton
+                        variant="glass"
+                        size="sm"
+                        class="min-h-[36px] px-3 text-xs"
+                        :loading="applyingKey === sweepRowKey(row)"
+                        :disabled="!!applyingKey || row.matches_baseline"
+                        @click="applySweepRow(row)"
+                      >
+                        {{ row.matches_baseline ? '已是当前' : '应用到设置' }}
+                      </GlassButton>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="text-[11px] leading-relaxed text-slate-500">
+              「应用到设置」只写入走势偏好 / 近窗 / 避冷三项，并打上「已手动设置」标记；
+              不会改筹码模式或注数。写入后财富密码下次生成才用新配置。
+            </p>
+          </template>
+
+          <p v-else-if="!sweepPending" class="text-xs text-slate-500">
+            尚未扫描。点「开始扫描」后才会请求后端（只读，不改设置）。
+          </p>
+        </GlassPanel>
+      </MotionReveal>
+      <MotionReveal :index="7">
         <!-- 波动分解 -->
         <div class="grid gap-4 sm:grid-cols-2">
           <GlassPanel variant="soft" padding="sm" rounded="2xl" as="div" class="space-y-3">
@@ -517,7 +737,7 @@ const outOfPoolCount = computed(() => results.value.filter(row => !row.actual_in
           </GlassPanel>
         </div>
       </MotionReveal>
-      <MotionReveal :index="7">
+      <MotionReveal :index="8">
         <!-- 逐期明细 -->
         <GlassPanel variant="soft" padding="sm" rounded="2xl" as="div" class="space-y-3">
           <div class="space-y-2">

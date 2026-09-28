@@ -10,7 +10,7 @@
 
 权限（见 ``dependencies``，受 ``AUTH_ENFORCED`` 灰度开关控制）：
 ``/trend``、``/frequency``、``/zodiac-trend`` **匿名可读**（只读样本统计）；
-``GET /pnl``、``POST /backtest`` 属个人能力，**仅 VIP 或 ADMIN**。
+``GET /pnl``、``POST /backtest``、``POST /backtest/sweep`` 属个人能力，**仅 VIP 或 ADMIN**。
 """
 
 from __future__ import annotations
@@ -24,7 +24,11 @@ from dependencies import actor_user_id, current_user_optional, require_vip
 from repository import get_store
 from services.analytics import (
     DEFAULT_RECENT_WINDOW,
+    SWEEP_AVOID_COLD_ENABLED,
+    SWEEP_TREND_BIASES,
+    SWEEP_TREND_WINDOWS,
     backtest_stats,
+    backtest_sweep,
     frequency_stats,
     trend_stats,
     zodiac_trend_stats,
@@ -34,6 +38,9 @@ from services.lottery import (
     NUMBER_MAX,
     PICK_COUNT_MAX,
     PICK_COUNT_MIN,
+    TREND_BIASES,
+    TREND_WINDOW_MAX,
+    TREND_WINDOW_MIN,
     clamp_settings,
 )
 from services.pnl import summarize_rounds
@@ -135,6 +142,34 @@ class BacktestIn(BaseModel):
     limit: int | None = Field(default=None, ge=1, le=LIMIT_MAX)
 
 
+class BacktestSweepIn(BaseModel):
+    """参数扫描：默认扫 trend_bias × trend_window × avoid_cold；其余沿用已保存设置。
+
+    只读，不写库。可选覆盖 mode / pick_count / 波动阈值（与单次回测同口径）。
+    轴列表省略时用后端默认（约 32 组）；传空列表不合法，由服务端回退默认。
+    """
+
+    mode: str | None = Field(default=None, pattern=f"^({'|'.join(MODES)})$")
+    pick_count: int | None = Field(
+        default=None, ge=PICK_COUNT_MIN, le=PICK_COUNT_MAX
+    )
+    small_max: int | None = Field(default=None, ge=0, le=NUMBER_MAX)
+    normal_max: int | None = Field(default=None, ge=0, le=NUMBER_MAX)
+    limit: int | None = Field(default=None, ge=1, le=LIMIT_MAX)
+    trend_biases: list[str] | None = Field(
+        default=None,
+        description="要扫描的走势偏好；省略 = 默认四档",
+    )
+    trend_windows: list[int] | None = Field(
+        default=None,
+        description="要扫描的近窗；0 = 全部样本；省略 = 30/60/100/全部",
+    )
+    avoid_cold_values: list[bool] | None = Field(
+        default=None,
+        description="要扫描的避冷开关取值；省略 = [false, true]",
+    )
+
+
 @router.post("/backtest")
 async def post_backtest(
     payload: BacktestIn | None = None,
@@ -163,4 +198,55 @@ async def post_backtest(
         small_max=payload.small_max,
         normal_max=payload.normal_max,
         base_settings=base_settings,
+    )
+
+
+@router.post("/backtest/sweep")
+async def post_backtest_sweep(
+    payload: BacktestSweepIn | None = None,
+    limit: int | None = Query(default=None, ge=1, le=LIMIT_MAX),
+    actor=Depends(require_vip),
+) -> dict:
+    """财富密码参数扫描（样本内对照，只读）。
+
+    默认网格：``trend_bias × trend_window × avoid_cold_enabled``；
+    ``mode`` / ``pick_count`` / 波动阈值沿用当前用户已保存设置（可显式覆盖）。
+    **不写库、不改设置**。排序按命中率降序仅便于浏览，不是「最优策略」；
+    每行带与单次回测同口径的判定（noise / beyond / insufficient）。
+    禁止把扫描结果包装成「已优化命中率」。
+    """
+    payload = payload or BacktestSweepIn()
+    effective_limit = payload.limit if payload.limit is not None else limit
+    store = await get_store()
+    base_settings = await store.get_settings(actor_user_id(actor))
+
+    biases = payload.trend_biases
+    if biases is not None:
+        biases = [bias for bias in biases if bias in TREND_BIASES]
+        if not biases:
+            biases = list(SWEEP_TREND_BIASES)
+
+    windows = payload.trend_windows
+    if windows is not None:
+        windows = [
+            max(TREND_WINDOW_MIN, min(TREND_WINDOW_MAX, int(window)))
+            for window in windows
+        ]
+        if not windows:
+            windows = list(SWEEP_TREND_WINDOWS)
+
+    cold_values = payload.avoid_cold_values
+    if cold_values is not None and len(cold_values) == 0:
+        cold_values = list(SWEEP_AVOID_COLD_ENABLED)
+
+    return backtest_sweep(
+        await _draws_ascending(effective_limit),
+        base_settings=base_settings,
+        mode=payload.mode,
+        pick_count=payload.pick_count,
+        small_max=payload.small_max,
+        normal_max=payload.normal_max,
+        trend_biases=biases,
+        trend_windows=windows,
+        avoid_cold_values=cold_values,
     )

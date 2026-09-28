@@ -861,10 +861,52 @@ def test_trend_bias_neutral_matches_legacy_omission_order():
 
 def test_default_trend_bias_is_neutral():
     assert DEFAULT_SETTINGS["trend_bias"] == "neutral"
-    assert DEFAULT_SETTINGS["trend_window"] == 30
+    assert DEFAULT_SETTINGS["trend_window"] == 20
     assert clamp_settings({})["trend_bias"] == "neutral"
     assert clamp_settings({"trend_bias": "hot"})["trend_bias"] == "hot"
     assert clamp_settings({"trend_bias": "bogus"})["trend_bias"] == "neutral"
+
+
+def test_score_top_strategy_returns_requested_pick_count():
+    """score_top 只改集合，仍严格出 N 注；默认仍是 wave_round。"""
+    from services.lottery import PICK_STRATEGY_SCORE_TOP, PICK_STRATEGY_WAVE_ROUND
+
+    assert clamp_settings({})["pick_strategy"] == PICK_STRATEGY_WAVE_ROUND
+    history = list(range(1, 40))
+    wave = recommend(
+        latest=25,
+        previous=10,
+        history_numbers=history,
+        settings={
+            "pick_count": 6,
+            "trend_bias": "mid",
+            "trend_bias_explicit": True,
+            "trend_window": 20,
+            "pick_strategy": PICK_STRATEGY_WAVE_ROUND,
+            "avoid_cold_enabled": False,
+        },
+    )
+    score = recommend(
+        latest=25,
+        previous=10,
+        history_numbers=history,
+        settings={
+            "pick_count": 6,
+            "trend_bias": "mid",
+            "trend_bias_explicit": True,
+            "trend_window": 20,
+            "pick_strategy": PICK_STRATEGY_SCORE_TOP,
+            "avoid_cold_enabled": False,
+            "score_w_mid": 2.0,
+        },
+    )
+    assert len(wave["picks"]) == 6
+    assert len(score["picks"]) == 6
+    assert score["pick_strategy"] == PICK_STRATEGY_SCORE_TOP
+    assert all("score" in p for p in score["picks"])
+    assert any("打分 Top-N" in note or "打分" in note for note in score["notes"])
+    assert all("已提高命中率" not in note for note in score["notes"])
+    assert any("不承诺提高命中率" in note for note in score["notes"])
 
 
 def test_bet_count_override_changes_pick_length():
@@ -910,7 +952,7 @@ def test_settings_api_trend_bias_roundtrip():
     with TestClient(app) as client:
         body = client.get("/api/settings").json()
         assert body["trend_bias"] == "neutral"
-        assert body["trend_window"] == 30
+        assert body["trend_window"] == 20
 
         updated = client.put(
             "/api/settings",
@@ -922,9 +964,10 @@ def test_settings_api_trend_bias_roundtrip():
 
         restored = client.put(
             "/api/settings",
-            json={"trend_bias": "neutral", "trend_window": 30},
+            json={"trend_bias": "neutral", "trend_window": 20},
         ).json()
         assert restored["trend_bias"] == "neutral"
+        assert restored["trend_window"] == 20
         assert restored["total_amount"] == body["total_amount"]
         assert restored["exclude_repeat_zodiac"] == body["exclude_repeat_zodiac"]
 

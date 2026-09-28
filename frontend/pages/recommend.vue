@@ -3,6 +3,7 @@ import type { DrawItem } from '~/composables/useApi'
 import {
   CHIP_MODE_OPTIONS,
   TREND_BIAS_OPTIONS,
+  TREND_WINDOW_DEFAULT,
   TREND_WINDOW_OPTIONS,
   avoidColdDaysText,
   avoidColdWeightText,
@@ -45,7 +46,7 @@ const betCount = ref(6)
  * 设置页读取口径：没手动设置过就是「不加权」（neutral），所以这里默认也是 neutral。
  */
 const trendBias = ref<TrendBias>('neutral')
-const trendWindow = ref(30)
+const trendWindow = ref(TREND_WINDOW_DEFAULT)
 const activeWaveTab = ref<'small' | 'normal' | 'big'>('small')
 /** 下方「走势分布参考」大区块默认折叠，避免与卡片内同角色参考号重复刷屏 */
 const trendDistExpanded = ref(false)

@@ -6,6 +6,7 @@ import {
   AVOID_COLD_LABEL,
   CHIP_MODE_OPTIONS,
   TREND_BIAS_OPTIONS,
+  TREND_WINDOW_DEFAULT,
   TREND_WINDOW_OPTIONS,
   previewEvenAmounts,
   type ChipMode,
@@ -46,18 +47,18 @@ function isTrendBias(value: unknown): value is TrendBias {
 }
 
 const form = reactive({
-  small_max: 10,
-  normal_max: 30,
+  small_max: 15,
+  normal_max: 20,
   pick_count: 6,
   total_amount: 50,
   amount_unit: 5,
   odds: 47,
   mode: 'even' as ChipMode,
-  exclude_repeat_zodiac: false,
-  trend_bias: 'neutral' as TrendBias,
-  trend_window: 30,
-  // 避冷加权：默认开启（与后端 DEFAULT_SETTINGS 一致），阈值默认 60 天
-  avoid_cold_enabled: true,
+  exclude_repeat_zodiac: true,
+  trend_bias: 'mid' as TrendBias,
+  trend_window: TREND_WINDOW_DEFAULT,
+  // 避冷加权：本池最优方案默认关闭，阈值默认 60 天
+  avoid_cold_enabled: false,
   avoid_cold_days: AVOID_COLD_DEFAULT_DAYS,
 })
 
@@ -100,14 +101,14 @@ async function load() {
     form.total_amount = settings.total_amount ?? (settings.bet_unit * settings.pick_count)
     form.amount_unit = settings.amount_unit ?? 5
     form.odds = typeof settings.odds === 'number' ? settings.odds : 47
-    // 缺字段 / 旧后端 → 默认不避开（与 DEFAULT_SETTINGS 一致）
-    form.exclude_repeat_zodiac = settings.exclude_repeat_zodiac === true
+    // 缺字段 / 旧后端 → 默认避开重肖（与 DEFAULT_SETTINGS 一致）
+    form.exclude_repeat_zodiac = settings.exclude_repeat_zodiac !== false
     // 只在后端返回合法枚举时覆盖，避免把状态搞成取值之外的脏值
     if (isChipMode(settings.mode)) form.mode = settings.mode
     if (isTrendBias(settings.trend_bias)) form.trend_bias = settings.trend_bias
     if (typeof settings.trend_window === 'number') form.trend_window = settings.trend_window
-    // 缺字段 / 旧后端 → 默认开启避冷（与 DEFAULT_SETTINGS 一致），阈值回退 60
-    form.avoid_cold_enabled = settings.avoid_cold_enabled !== false
+    // 缺字段 / 旧后端 → 默认关闭避冷（与 DEFAULT_SETTINGS 一致），阈值回退 60
+    form.avoid_cold_enabled = settings.avoid_cold_enabled === true
     form.avoid_cold_days = typeof settings.avoid_cold_days === 'number'
       ? settings.avoid_cold_days
       : AVOID_COLD_DEFAULT_DAYS
@@ -192,11 +193,11 @@ async function save() {
     form.total_amount = settings.total_amount
     form.amount_unit = settings.amount_unit
     form.odds = typeof settings.odds === 'number' ? settings.odds : 47
-    form.exclude_repeat_zodiac = settings.exclude_repeat_zodiac === true
+    form.exclude_repeat_zodiac = settings.exclude_repeat_zodiac !== false
     if (isChipMode(settings.mode)) form.mode = settings.mode
     if (isTrendBias(settings.trend_bias)) form.trend_bias = settings.trend_bias
     if (typeof settings.trend_window === 'number') form.trend_window = settings.trend_window
-    form.avoid_cold_enabled = settings.avoid_cold_enabled !== false
+    form.avoid_cold_enabled = settings.avoid_cold_enabled === true
     form.avoid_cold_days = typeof settings.avoid_cold_days === 'number'
       ? settings.avoid_cold_days
       : AVOID_COLD_DEFAULT_DAYS
@@ -484,7 +485,7 @@ const readonlyInputClass
                   v-if="form.trend_bias === 'neutral'"
                   class="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-200"
                 >
-                  当前是「不加权」：上面的近窗档位（近 30 / 60 / 100 / 全部）
+                  当前是「不加权」：上面的近窗档位（近 20 / 30 / 60 / 100 / 全部）
                   <strong class="font-semibold">不影响选号</strong>，只用于走势分布参考。
                   要先选「热号偏好 / 中频优先 / 冷号偏好」并保存，近窗档位才会参与选号。
                 </p>

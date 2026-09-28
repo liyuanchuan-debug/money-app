@@ -30,6 +30,15 @@ export interface LotterySettings {
   avoid_cold_enabled: boolean
   /** 避冷阈值（自然日）：距上次出现 ≤ 该值不惩罚；默认 60，范围 1..999 */
   avoid_cold_days: number
+  /**
+   * 选号策略：wave_round=波动轮取（默认）；score_top=打分 Top-N（样本内对照Δ）。
+   * 不是「提高命中率」承诺。
+   */
+  pick_strategy?: 'wave_round' | 'score_top'
+  score_w_focus?: number
+  score_w_mid?: number
+  score_w_omit?: number
+  score_w_diff?: number
   /** 只读派生字段：恒为 normal_max + 1 */
   big_min: number
 }
@@ -48,6 +57,11 @@ export interface LotterySettingsPatch {
   trend_window?: number
   avoid_cold_enabled?: boolean
   avoid_cold_days?: number
+  pick_strategy?: 'wave_round' | 'score_top'
+  score_w_focus?: number
+  score_w_mid?: number
+  score_w_omit?: number
+  score_w_diff?: number
 }
 
 export interface Pick {
@@ -229,13 +243,16 @@ export const TREND_BIAS_OPTIONS: TrendBiasOption[] = [
   { value: 'cold', label: '冷号偏好' },
 ]
 
-/** 走势近窗档位（0 = 全部） */
+/** 走势近窗档位（0 = 全部）；含近 20 期（本池 6 注对照常用档） */
 export const TREND_WINDOW_OPTIONS = [
+  { value: 20, label: '近 20 期' },
   { value: 30, label: '近 30 期' },
   { value: 60, label: '近 60 期' },
   { value: 100, label: '近 100 期' },
   { value: 0, label: '全部样本' },
 ] as const
+/** 近期走势近窗默认档（与后端 DEFAULT_TREND_WINDOW 对齐） */
+export const TREND_WINDOW_DEFAULT = 20
 
 /* ---------------------------------------------------------------------- */
 /* 避冷加权（冷号排后 + 金额封顶，只降不升）                                */
@@ -253,6 +270,8 @@ export const AVOID_COLD_LABEL = '避冷加权'
 export const AVOID_COLD_DEFAULT_DAYS = 60
 export const AVOID_COLD_DAYS_MIN = 1
 export const AVOID_COLD_DAYS_MAX = 999
+/** 与后端 DEFAULT_AVOID_COLD_ENABLED 对齐：默认关闭 */
+export const AVOID_COLD_DEFAULT_ENABLED = false
 
 /** 避冷加权展示文案（0 = 样本内从未出现 → 金额归 0；勿写成概率） */
 export function avoidColdWeightText(weight: number | null | undefined): string {

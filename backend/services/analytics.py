@@ -21,12 +21,23 @@ from datetime import date, datetime
 from typing import Any, Iterable, Sequence
 
 from services.lottery import (
+    DEFAULT_AVOID_COLD_DAYS,
     DEFAULT_SETTINGS,
+    DEFAULT_TREND_WINDOW,
     MODE_SINGLE,
     NUMBER_MAX,
     NUMBER_MIN,
+    PICK_STRATEGY_SCORE_TOP,
+    PICK_STRATEGY_WAVE_ROUND,
+    TREND_BIAS_COLD,
+    TREND_BIAS_HOT,
+    TREND_BIAS_LABELS,
+    TREND_BIAS_MID,
+    TREND_BIAS_NEUTRAL,
+    TREND_BIASES,
     WAVE_LABELS,
     WAVE_ORDER,
+    clamp_score_weights,
     clamp_settings,
     classify_wave,
     derive_big_min,
@@ -60,6 +71,27 @@ MIN_PRIOR_DRAWS = 2
 STRONG_CONCLUSION_MIN_DRAWS = 490
 # 生肖走势默认观察窗口（最近 N 期）
 DEFAULT_RECENT_WINDOW = 12
+
+# 参数扫描默认轴（方案 A：样本内对照，不自动写回设置）
+# 网格 = bias × window × avoid_cold ≈ 4 × 4 × 2 = 32 组；其余旋钮沿用已保存设置
+SWEEP_TREND_BIASES: tuple[str, ...] = (
+    TREND_BIAS_NEUTRAL,
+    TREND_BIAS_HOT,
+    TREND_BIAS_MID,
+    TREND_BIAS_COLD,
+)
+SWEEP_TREND_WINDOWS: tuple[int, ...] = (20, 30, 60, 100, 0)
+SWEEP_AVOID_COLD_ENABLED: tuple[bool, ...] = (False, True)
+
+# 回测判定码（英文落库/传输；汉字只出现在 label / text）
+VERDICT_INSUFFICIENT = "insufficient"
+VERDICT_NOISE = "noise"
+VERDICT_BEYOND = "beyond"
+VERDICT_LABELS: dict[str, str] = {
+    VERDICT_INSUFFICIENT: "数据不足",
+    VERDICT_NOISE: "差值落在抽样噪声内 · 不能证明优于随机",
+    VERDICT_BEYOND: "差值超过 2 倍标准误 · 仍不构成承诺",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -114,6 +146,61 @@ def _envelope(sample_size: int) -> dict[str, Any]:
         "sample_size": sample_size,
         "data_status": code,
         "data_status_label": DATA_STATUS_LABELS[code],
+    }
+
+
+def backtest_verdict_payload(
+    *,
+    evaluated: int,
+    hit_rate: float | None,
+    baseline: float,
+    difference: float | None,
+    standard_error: float | None,
+) -> dict[str, Any]:
+    """回测判定（与前端 ``backtestVerdict`` 同口径，供 sweep / 单次回测共用）。
+
+    规则：``|命中率 − 随机参考| ≤ 2 × 抽样标准误`` → ``noise``（无法证明优于随机）；
+    超过 → ``beyond``（仍不构成承诺）；缺数 → ``insufficient``。
+    返回体含英文 ``kind`` + 汉字 ``label`` / ``text``；禁止把 beyond 包装成正面结论。
+    """
+    if (
+        evaluated <= 0
+        or hit_rate is None
+        or difference is None
+        or standard_error is None
+    ):
+        return {
+            "kind": VERDICT_INSUFFICIENT,
+            "label": VERDICT_LABELS[VERDICT_INSUFFICIENT],
+            "text": (
+                "数据不足：可评估期数不足，无法把引擎命中率与随机参考值做比较。"
+            ),
+            "within_noise": True,
+        }
+    if abs(difference) <= 2 * standard_error:
+        return {
+            "kind": VERDICT_NOISE,
+            "label": VERDICT_LABELS[VERDICT_NOISE],
+            "text": (
+                f"命中率 {hit_rate:.2%} 与随机参考值 {baseline:.2%} 相差 "
+                f"{difference:+.2%}，在 {evaluated} 期样本下抽样标准误约 "
+                f"{standard_error:.2%}；差值落在抽样噪声内"
+                f"（未超过 2 倍标准误 ≈ {2 * standard_error:.2%}），"
+                "目前无法证明该策略优于随机。"
+            ),
+            "within_noise": True,
+        }
+    return {
+        "kind": VERDICT_BEYOND,
+        "label": VERDICT_LABELS[VERDICT_BEYOND],
+        "text": (
+            f"命中率 {hit_rate:.2%} 与随机参考值 {baseline:.2%} 相差 "
+            f"{difference:+.2%}，在 {evaluated} 期样本下标准差约 "
+            f"{standard_error:.2%}；差值超过 2 倍标准误"
+            f"（≈ {2 * standard_error:.2%}），但单一小样本内的偏离仍可能由其他因素造成，"
+            "不构成对未来命中能力的任何承诺。"
+        ),
+        "within_noise": False,
     }
 
 
@@ -495,6 +582,9 @@ def backtest_stats(
     normal_max: int | None = None,
     min_prior_draws: int = MIN_PRIOR_DRAWS,
     base_settings: dict[str, Any] | None = None,
+    *,
+    include_results: bool = True,
+    include_wave_breakdown: bool = True,
 ) -> dict[str, Any]:
     """逐期走步回测推荐引擎：每期只用「该期之前」的数据，再与该期实际特码比对。
 
@@ -507,6 +597,9 @@ def backtest_stats(
     参数来源以 ``parameter_sources`` 原样回报（``saved_settings`` /
     ``request_override`` / ``default``），响应体的 ``settings`` 记录实际生效值，
     因此同一组入参仍可复现同一次回测。
+
+    ``include_results`` / ``include_wave_breakdown`` 供参数扫描（``backtest_sweep``）
+    关闭大块返回体，只保留命中率对照所需字段；单次回测保持默认 True。
 
     注意：覆盖字典必须**省略**未提供的键，绝不能写成 ``"small_max": None``——
     ``clamp_settings`` 会跳过 ``None``，若把 ``None`` 展开进合并字典就会覆盖掉
@@ -549,6 +642,7 @@ def backtest_stats(
 
     specials = [draw["special_number"] for draw in series]
     periods = [draw["period"] for draw in series]
+    dates = [draw["draw_date"] for draw in series]
 
     rows: list[dict[str, Any]] = []
     available_sum = 0
@@ -557,12 +651,15 @@ def backtest_stats(
         latest = specials[index - 1]
         previous = specials[index - 2] if index - 2 >= 0 else None
         history = specials[:index]  # 严格早于 index
+        history_dates = dates[:index]
         outcome = recommend(
             latest=latest,
             previous=previous,
             history_numbers=history,
+            history_dates=history_dates,
             settings=cfg,
             mode=effective_mode,
+            period=periods[index],
         )
         predicted = [pick["number"] for pick in outcome["picks"]]
         actual = specials[index]
@@ -664,52 +761,511 @@ def backtest_stats(
         "不参与预测；prev 波动分解用的是预测当时已知的上一期波动。"
     )
 
-    result.update(
-        {
-            "settings": {
-                **{
-                    key: cfg[key]
-                    for key in (
-                        "small_max",
-                        "normal_max",
-                        "mode",
-                        "pick_count",
-                        "exclude_repeat_zodiac",
-                        # 避冷加权（additive）：回测与财富密码同源，需如实回报生效值
-                        "avoid_cold_enabled",
-                        "avoid_cold_days",
-                    )
-                },
-                "big_min": derive_big_min(cfg["normal_max"]),
-                "effective_pick_count": effective_picks,
-            },
-            # 参数来源（additive）：saved_settings / request_override / default
-            "parameter_sources": parameter_sources,
-            "evaluation_window": window,
-            "evaluated": evaluated,
-            "hits": hits,
-            "hit_rate": hit_rate,
-            "random_baseline_hit_rate": baseline,
-            "random_baseline_note": (
-                "随机参考值 = 有效注数 / 49，相当于在 1-49 中随机取 k 个号；仅作对照。"
-            ),
-            "hit_rate_minus_baseline": difference,
-            "hit_rate_standard_error": standard_error,
-            "average_available_numbers": average_available,
-            "actual_in_pool_rate": actual_in_pool_rate,
-            "actual_in_pool_note": (
-                "实际特码落在候选池内的比例 —— 落入池外的期数引擎不可能命中，"
-                "它是命中率的理论上限。"
-                + (
-                    "（当前开启避开重肖：池外含最新同肖整组。）"
-                    if cfg["exclude_repeat_zodiac"]
-                    else "（当前未避开重肖：池外仅含上期特码本身。）"
+    verdict = backtest_verdict_payload(
+        evaluated=evaluated,
+        hit_rate=hit_rate,
+        baseline=baseline,
+        difference=difference,
+        standard_error=standard_error,
+    )
+
+    payload: dict[str, Any] = {
+        "settings": {
+            **{
+                key: cfg[key]
+                for key in (
+                    "small_max",
+                    "normal_max",
+                    "mode",
+                    "pick_count",
+                    "exclude_repeat_zodiac",
+                    # 走势加权：扫描与单次回测都要如实回报生效值
+                    "trend_bias",
+                    "trend_window",
+                    # 避冷加权（additive）：回测与财富密码同源，需如实回报生效值
+                    "avoid_cold_enabled",
+                    "avoid_cold_days",
                 )
+            },
+            "big_min": derive_big_min(cfg["normal_max"]),
+            "effective_pick_count": effective_picks,
+            "trend_bias_label": TREND_BIAS_LABELS.get(
+                cfg["trend_bias"], cfg["trend_bias"]
             ),
-            "wave_breakdown": _breakdown(rows, "realized_wave_type"),
-            "wave_breakdown_by_prev": _breakdown(rows, "prev_wave_type"),
-            "results": rows,
+        },
+        # 参数来源（additive）：saved_settings / request_override / default
+        "parameter_sources": parameter_sources,
+        "evaluation_window": window,
+        "evaluated": evaluated,
+        "hits": hits,
+        "hit_rate": hit_rate,
+        "random_baseline_hit_rate": baseline,
+        "random_baseline_note": (
+            "随机参考值 = 有效注数 / 49，相当于在 1-49 中随机取 k 个号；仅作对照。"
+        ),
+        "hit_rate_minus_baseline": difference,
+        "hit_rate_standard_error": standard_error,
+        "verdict": verdict,
+        "average_available_numbers": average_available,
+        "actual_in_pool_rate": actual_in_pool_rate,
+        "actual_in_pool_note": (
+            "实际特码落在候选池内的比例 —— 落入池外的期数引擎不可能命中，"
+            "它是命中率的理论上限。"
+            + (
+                "（当前开启避开重肖：池外含最新同肖整组。）"
+                if cfg["exclude_repeat_zodiac"]
+                else "（当前未避开重肖：池外仅含上期特码本身。）"
+            )
+        ),
+        "notes": notes,
+    }
+    if include_wave_breakdown:
+        payload["wave_breakdown"] = _breakdown(rows, "realized_wave_type")
+        payload["wave_breakdown_by_prev"] = _breakdown(rows, "prev_wave_type")
+    if include_results:
+        payload["results"] = rows
+    result.update(payload)
+    return result
+
+
+def _trend_window_label(window: int) -> str:
+    """近窗档位的展示标签（0 = 全部样本）。"""
+    if window and window > 0:
+        return f"近 {int(window)} 期"
+    return "全部样本"
+
+
+def backtest_sweep(
+    draws: Iterable[dict[str, Any]],
+    *,
+    base_settings: dict[str, Any] | None = None,
+    mode: str | None = None,
+    pick_count: int | None = None,
+    small_max: int | None = None,
+    normal_max: int | None = None,
+    trend_biases: Sequence[str] | None = None,
+    trend_windows: Sequence[int] | None = None,
+    avoid_cold_values: Sequence[bool] | None = None,
+    min_prior_draws: int = MIN_PRIOR_DRAWS,
+) -> dict[str, Any]:
+    """参数扫描：在本池样本内对照多组配置的走步命中率。
+
+    默认轴：``trend_bias × trend_window × avoid_cold_enabled``（约 32 组）；
+    ``mode`` / ``pick_count`` / 波动阈值沿用 ``base_settings``（可被显式覆盖）。
+    **只读**：不写库、不改设置；排序按命中率降序仅便于对照，**不是**「最优策略」。
+
+    每行都带与单次回测同口径的 ``verdict``；顶部 notes 禁止任何「已优化命中率」
+    类承诺。响应里的 ``baseline_settings`` 标明扫描时的固定旋钮，便于复现。
+    """
+    series = normalize_draws(draws)
+    sample_size = len(series)
+    envelope = _envelope(sample_size)
+
+    base = dict(DEFAULT_SETTINGS)
+    if base_settings:
+        base.update(
+            {
+                key: value
+                for key, value in base_settings.items()
+                if key in DEFAULT_SETTINGS and value is not None
+            }
+        )
+    held_overrides = {
+        key: value
+        for key, value in {
+            "small_max": small_max,
+            "normal_max": normal_max,
+            "pick_count": pick_count,
+            "mode": mode,
+        }.items()
+        if value is not None
+    }
+    held = clamp_settings({**base, **held_overrides})
+
+    biases = [
+        bias
+        for bias in (trend_biases if trend_biases is not None else SWEEP_TREND_BIASES)
+        if bias in TREND_BIASES
+    ] or list(SWEEP_TREND_BIASES)
+    windows = [
+        int(window)
+        for window in (
+            trend_windows if trend_windows is not None else SWEEP_TREND_WINDOWS
+        )
+    ] or list(SWEEP_TREND_WINDOWS)
+    cold_flags = list(
+        avoid_cold_values
+        if avoid_cold_values is not None
+        else SWEEP_AVOID_COLD_ENABLED
+    )
+    if not cold_flags:
+        cold_flags = list(SWEEP_AVOID_COLD_ENABLED)
+
+    rows: list[dict[str, Any]] = []
+    for bias in biases:
+        for window in windows:
+            for cold_on in cold_flags:
+                combo = {
+                    **held,
+                    "trend_bias": bias,
+                    # 扫描行视为「显式选择过偏好」，否则 effective_trend_bias 会把
+                    # 未打标的 hot/cold/mid 一律回退成 neutral（设置页同款门闩）。
+                    "trend_bias_explicit": True,
+                    "trend_window": window,
+                    "avoid_cold_enabled": bool(cold_on),
+                }
+                outcome = backtest_stats(
+                    series,
+                    base_settings=combo,
+                    min_prior_draws=min_prior_draws,
+                    include_results=False,
+                    include_wave_breakdown=False,
+                )
+                cfg = outcome.get("settings") or {}
+                rows.append(
+                    {
+                        "trend_bias": cfg.get("trend_bias", bias),
+                        "trend_bias_label": cfg.get(
+                            "trend_bias_label",
+                            TREND_BIAS_LABELS.get(bias, bias),
+                        ),
+                        "trend_window": cfg.get("trend_window", window),
+                        "trend_window_label": _trend_window_label(
+                            int(cfg.get("trend_window", window) or 0)
+                        ),
+                        "avoid_cold_enabled": bool(
+                            cfg.get("avoid_cold_enabled", cold_on)
+                        ),
+                        "avoid_cold_days": int(
+                            cfg.get(
+                                "avoid_cold_days",
+                                held.get(
+                                    "avoid_cold_days", DEFAULT_AVOID_COLD_DAYS
+                                ),
+                            )
+                        ),
+                        "mode": cfg.get("mode", held["mode"]),
+                        "pick_count": cfg.get("pick_count", held["pick_count"]),
+                        "effective_pick_count": cfg.get(
+                            "effective_pick_count", held["pick_count"]
+                        ),
+                        "evaluated": outcome.get("evaluated", 0),
+                        "hits": outcome.get("hits", 0),
+                        "hit_rate": outcome.get("hit_rate"),
+                        "random_baseline_hit_rate": outcome.get(
+                            "random_baseline_hit_rate"
+                        ),
+                        "hit_rate_minus_baseline": outcome.get(
+                            "hit_rate_minus_baseline"
+                        ),
+                        "hit_rate_standard_error": outcome.get(
+                            "hit_rate_standard_error"
+                        ),
+                        "actual_in_pool_rate": outcome.get("actual_in_pool_rate"),
+                        "verdict": outcome.get("verdict"),
+                        "matches_baseline": (
+                            cfg.get("trend_bias") == held.get("trend_bias")
+                            and int(cfg.get("trend_window", -1))
+                            == int(held.get("trend_window", DEFAULT_TREND_WINDOW))
+                            and bool(cfg.get("avoid_cold_enabled"))
+                            == bool(held.get("avoid_cold_enabled"))
+                        ),
+                    }
+                )
+
+    # 对照排序：命中率降序；平手按「是否当前设置 → bias → window」稳定化
+    # 排序**只为浏览**，不代表「最优」—— notes 里必须说清楚
+    def _sort_key(row: dict[str, Any]) -> tuple:
+        rate = row.get("hit_rate")
+        return (
+            0 if rate is None else 1,
+            -(rate if rate is not None else 0.0),
+            0 if row.get("matches_baseline") else 1,
+            str(row.get("trend_bias") or ""),
+            int(row.get("trend_window") or 0),
+            0 if row.get("avoid_cold_enabled") else 1,
+        )
+
+    rows.sort(key=_sort_key)
+
+    beyond_count = sum(
+        1
+        for row in rows
+        if (row.get("verdict") or {}).get("kind") == VERDICT_BEYOND
+    )
+    noise_count = sum(
+        1
+        for row in rows
+        if (row.get("verdict") or {}).get("kind") == VERDICT_NOISE
+    )
+    insufficient_count = sum(
+        1
+        for row in rows
+        if (row.get("verdict") or {}).get("kind") == VERDICT_INSUFFICIENT
+    )
+
+    notes = [
+        f"参数扫描只对照本池已导入的 {sample_size} 期样本内表现，"
+        "排序按命中率降序仅便于浏览，不是最优策略，也不构成对未来命中能力的承诺。",
+        "每组配置都走与财富密码同源的 walk-forward 回测（严格无未来函数）；"
+        "判定口径与单次回测相同：|命中率 − 随机参考| 是否落在 2 倍抽样标准误内。",
+        "本接口只读，不会改写你的设置；若要把某一组写入设置，须由你在页面上显式确认。",
+        "禁止把「样本内排名靠前」说成「已优化命中率」或「提高命中率」。",
+    ]
+    if sample_size < MIN_PRIOR_DRAWS + 1:
+        notes.append(
+            f"数据不足：样本 {sample_size} 期不足以支撑回测"
+            f"（至少需要 {MIN_PRIOR_DRAWS + 1} 期）。"
+        )
+    elif beyond_count == 0 and noise_count > 0:
+        notes.append(
+            f"本轮 {len(rows)} 组配置里，有 {noise_count} 组的命中率差值落在抽样噪声内，"
+            f"{insufficient_count} 组数据不足；**没有任何一组能证明优于随机**。"
+        )
+    elif beyond_count > 0:
+        notes.append(
+            f"本轮 {len(rows)} 组配置里，有 {beyond_count} 组的差值超过 2 倍标准误，"
+            f"{noise_count} 组仍落在噪声内；超过噪声也只是单一小样本内的偏离，"
+            "仍不构成对未来命中能力的承诺。"
+        )
+
+    envelope.update(
+        {
+            "axes": {
+                "trend_bias": list(biases),
+                "trend_window": list(windows),
+                "avoid_cold_enabled": [bool(flag) for flag in cold_flags],
+            },
+            "held_settings": {
+                "mode": held["mode"],
+                "pick_count": held["pick_count"],
+                "small_max": held["small_max"],
+                "normal_max": held["normal_max"],
+                "big_min": derive_big_min(held["normal_max"]),
+                "exclude_repeat_zodiac": held["exclude_repeat_zodiac"],
+                "avoid_cold_days": held["avoid_cold_days"],
+                "trend_bias": held["trend_bias"],
+                "trend_window": held["trend_window"],
+                "avoid_cold_enabled": held["avoid_cold_enabled"],
+            },
+            "combo_count": len(rows),
+            "beyond_count": beyond_count,
+            "noise_count": noise_count,
+            "insufficient_count": insufficient_count,
+            "rows": rows,
             "notes": notes,
         }
     )
-    return result
+    if sample_size < MIN_PRIOR_DRAWS + 1:
+        envelope["data_status"] = DATA_STATUS_INSUFFICIENT
+        envelope["data_status_label"] = DATA_STATUS_LABELS[DATA_STATUS_INSUFFICIENT]
+    return envelope
+
+
+def tune_delta_score_weights(
+    draws: Iterable[dict[str, Any]],
+    *,
+    base_settings: dict[str, Any] | None = None,
+    train_ratio: float = 0.7,
+    min_prior_draws: int = MIN_PRIOR_DRAWS,
+) -> dict[str, Any]:
+    """Walk-forward 调参：在训练窗上扫打分权重，只在验证窗比较相对随机 Δ。
+
+    - 固定 ``pick_strategy=score_top``；基线对照为同设置下的 ``wave_round``。
+    - **只认验证窗 Δ** 是否优于基线；训练窗更好不算上线依据。
+    - 禁止把结果说成「已提高命中率」；返回 notes 必须带样本内 / 无未来承诺口径。
+    """
+    series = normalize_draws(draws)
+    sample_size = len(series)
+    envelope = _envelope(sample_size)
+
+    base = dict(DEFAULT_SETTINGS)
+    if base_settings:
+        base.update(
+            {
+                key: value
+                for key, value in base_settings.items()
+                if key in DEFAULT_SETTINGS and value is not None
+            }
+        )
+    held = clamp_settings(base)
+    held["trend_bias_explicit"] = True
+
+    ratio = min(0.9, max(0.5, float(train_ratio)))
+    # 可评估期从 min_prior_draws 起；按可评估长度切 train/valid
+    eval_start = max(1, int(min_prior_draws))
+    eval_count = max(0, sample_size - eval_start)
+    train_eval = int(eval_count * ratio)
+    # 至少留 20 期验证；训练至少 30 期可评估
+    if eval_count < 50 or train_eval < 30 or (eval_count - train_eval) < 20:
+        notes = [
+            f"数据不足：可评估 {eval_count} 期，无法做 train/valid 切分调参"
+            f"（建议至少约 50 期可评估）。",
+            "本结果不构成对未来命中能力的任何承诺。",
+        ]
+        envelope.update(
+            {
+                "data_status": DATA_STATUS_INSUFFICIENT,
+                "data_status_label": DATA_STATUS_LABELS[DATA_STATUS_INSUFFICIENT],
+                "improved": False,
+                "applied_suggestion": None,
+                "baseline_valid": None,
+                "best_valid": None,
+                "notes": notes,
+            }
+        )
+        return envelope
+
+    split_index = eval_start + train_eval  # series 下标：valid 从这里开始评估
+    train_draws = series[:split_index]
+    # valid 回测需要前置历史，所以仍喂全序列，但只统计 split 之后的命中
+    # 更干净：对 train / valid 各跑 backtest_stats 子序列
+    # train：series[:split_index]；valid：用 series 全量但自定义窗口较复杂
+    # 采用：train 子序列回测；valid = series[split_index - min_prior:] 以保留前置
+
+    def _run(settings: dict[str, Any], subset: list[dict[str, Any]]) -> dict[str, Any]:
+        return backtest_stats(
+            subset,
+            base_settings=settings,
+            min_prior_draws=min_prior_draws,
+            include_results=False,
+            include_wave_breakdown=False,
+        )
+
+    baseline_settings = {
+        **held,
+        "pick_strategy": PICK_STRATEGY_WAVE_ROUND,
+    }
+    valid_subset = series[max(0, split_index - min_prior_draws) :]
+    # 对齐：valid_subset 的前 min_prior 期只作历史，评估的是原 split 之后的期
+    baseline_train = _run(baseline_settings, train_draws)
+    baseline_valid = _run(baseline_settings, valid_subset)
+
+    focus_grid = (0.0, 0.5, 1.0, 2.0)
+    mid_grid = (0.0, 1.0, 2.0, 3.0)
+    omit_grid = (-1.0, 0.0, 0.5, 1.0)
+    diff_grid = (0.0, 0.5, 1.0)
+
+    best_train: dict[str, Any] | None = None
+    candidates: list[dict[str, Any]] = []
+
+    for w_focus in focus_grid:
+        for w_mid in mid_grid:
+            for w_omit in omit_grid:
+                for w_diff in diff_grid:
+                    weights = clamp_score_weights(
+                        {
+                            "score_w_focus": w_focus,
+                            "score_w_mid": w_mid,
+                            "score_w_omit": w_omit,
+                            "score_w_diff": w_diff,
+                        }
+                    )
+                    cfg = {
+                        **held,
+                        "pick_strategy": PICK_STRATEGY_SCORE_TOP,
+                        **weights,
+                    }
+                    train_out = _run(cfg, train_draws)
+                    train_delta = train_out.get("hit_rate_minus_baseline")
+                    if train_delta is None:
+                        continue
+                    row = {
+                        "weights": weights,
+                        "train_hits": train_out.get("hits"),
+                        "train_evaluated": train_out.get("evaluated"),
+                        "train_hit_rate": train_out.get("hit_rate"),
+                        "train_delta": train_delta,
+                    }
+                    candidates.append(row)
+                    if best_train is None or train_delta > best_train["train_delta"]:
+                        best_train = row
+
+    # 取训练窗 Δ 前几名，在验证窗上裁定（降过拟合）
+    candidates.sort(key=lambda r: (-(r["train_delta"] or 0.0),))
+    shortlist = candidates[:12]
+    best_valid: dict[str, Any] | None = None
+    for row in shortlist:
+        cfg = {
+            **held,
+            "pick_strategy": PICK_STRATEGY_SCORE_TOP,
+            **row["weights"],
+        }
+        valid_out = _run(cfg, valid_subset)
+        valid_delta = valid_out.get("hit_rate_minus_baseline")
+        if valid_delta is None:
+            continue
+        judged = {
+            **row,
+            "valid_hits": valid_out.get("hits"),
+            "valid_evaluated": valid_out.get("evaluated"),
+            "valid_hit_rate": valid_out.get("hit_rate"),
+            "valid_delta": valid_delta,
+            "valid_verdict": (valid_out.get("verdict") or {}).get("kind"),
+        }
+        if best_valid is None or valid_delta > best_valid["valid_delta"]:
+            best_valid = judged
+
+    baseline_valid_delta = baseline_valid.get("hit_rate_minus_baseline")
+    improved = bool(
+        best_valid
+        and baseline_valid_delta is not None
+        and best_valid["valid_delta"] is not None
+        and best_valid["valid_delta"] > baseline_valid_delta + 1e-12
+    )
+
+    suggestion = None
+    if improved and best_valid is not None:
+        suggestion = {
+            "pick_strategy": PICK_STRATEGY_SCORE_TOP,
+            **best_valid["weights"],
+        }
+
+    notes = [
+        f"打分权重调参只使用本池已导入的 {sample_size} 期；"
+        f"训练可评估约 {baseline_train.get('evaluated')} 期，"
+        f"验证可评估约 {baseline_valid.get('evaluated')} 期（walk-forward，无未来函数）。",
+        "上线尺子只看验证窗相对随机 Δ 是否优于同设置下的波动轮取基线；"
+        "训练窗更好不算数。",
+        "禁止把本结果说成「已提高命中率」或对未来命中的承诺。",
+    ]
+    if improved and best_valid is not None:
+        notes.append(
+            f"验证窗 Δ 优于基线："
+            f"score_top Δ={best_valid['valid_delta']:.4f} "
+            f"> wave_round Δ={baseline_valid_delta:.4f}；"
+            "可将 suggestion 写入设置（显式确认）。"
+        )
+    else:
+        notes.append(
+            "验证窗未能证明 score_top 相对波动轮取基线有更高的 Δ；"
+            "保持 pick_strategy=wave_round 或仅作研究对照。"
+        )
+
+    envelope.update(
+        {
+            "train_ratio": ratio,
+            "split_index": split_index,
+            "baseline_train": {
+                "hits": baseline_train.get("hits"),
+                "evaluated": baseline_train.get("evaluated"),
+                "hit_rate": baseline_train.get("hit_rate"),
+                "delta": baseline_train.get("hit_rate_minus_baseline"),
+            },
+            "baseline_valid": {
+                "hits": baseline_valid.get("hits"),
+                "evaluated": baseline_valid.get("evaluated"),
+                "hit_rate": baseline_valid.get("hit_rate"),
+                "delta": baseline_valid_delta,
+                "verdict": (baseline_valid.get("verdict") or {}).get("kind"),
+            },
+            "best_train": best_train,
+            "best_valid": best_valid,
+            "improved": improved,
+            "applied_suggestion": suggestion,
+            "shortlist_size": len(shortlist),
+            "grid_size": len(candidates),
+            "notes": notes,
+        }
+    )
+    return envelope
