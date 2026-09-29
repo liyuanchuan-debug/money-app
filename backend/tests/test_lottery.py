@@ -206,6 +206,56 @@ def test_prev_big_focus_puts_small_first():
     assert primary["wave_type"] == WAVE_SMALL
 
 
+def test_wave_round_takes_one_per_bucket_then_refills_small():
+    """三类池都有号时：先小/常/大各 1，再按 WAVE_ORDER 从小波动补齐。"""
+    from collections import Counter
+
+    result = recommend(
+        latest=10,
+        previous=5,
+        history_numbers=[10, 5, 20, 30, 15, 25, 8, 12],
+        settings={
+            "pick_count": 6,
+            "avoid_cold_enabled": False,
+            "exclude_repeat_zodiac": False,
+            "trend_bias": "neutral",
+            "small_max": 10,
+            "normal_max": 30,
+        },
+    )
+    counts = Counter(pick["wave_type"] for pick in result["picks"])
+    assert len(result["picks"]) == 6
+    # 先各取 1，再从小波动补 3 → 小 4 / 常 1 / 大 1
+    assert counts.get(WAVE_SMALL, 0) == 4
+    assert counts.get(WAVE_NORMAL, 0) == 1
+    assert counts.get(WAVE_BIG, 0) == 1
+    assert any("波动轮取" in note for note in result["notes"])
+
+
+def test_wave_round_refills_when_small_empty():
+    """小波动池为空时，轮取后从常规/大跳补齐到注数。"""
+    from collections import Counter
+
+    result = recommend(
+        latest=5,
+        previous=40,
+        history_numbers=[5, 40, 10, 20, 15],
+        settings={
+            "pick_count": 6,
+            "avoid_cold_enabled": False,
+            "exclude_repeat_zodiac": False,
+            "trend_bias": "neutral",
+            "small_max": 0,
+            "normal_max": 30,
+        },
+    )
+    assert result["prev_wave"]["type"] == WAVE_BIG
+    counts = Counter(pick["wave_type"] for pick in result["picks"])
+    assert len(result["picks"]) == 6
+    assert counts.get(WAVE_SMALL, 0) == 0
+    assert counts.get(WAVE_NORMAL, 0) + counts.get(WAVE_BIG, 0) == 6
+
+
 # --------------------------------------------------------------------------- #
 # 6. 派生大跳下限（决策 3）
 # --------------------------------------------------------------------------- #
