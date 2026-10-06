@@ -28,6 +28,17 @@ from services.analytics import (
 )
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
+
+# 关闭「本轮新增的三类软降权 + 号码点阵 + 重号保留」，让只校验旧引擎已知答案的
+# 回测用例不被新规则影响（新规则另有专门用例覆盖）。
+LEGACY_ENGINE_OFF: dict = {
+    "avoid_cold_enabled": False,
+    "repeat_number_weight": 1.0,
+    "repeat_zodiac_weight": 1.0,
+    "stale_weight": 1.0,
+    "lattice_enabled": False,
+    "include_repeat_number": False,
+}
 REAL_DRAWS_FILE = BACKEND_DIR / "data" / "draws_70_269.txt"
 
 STATS_GET_PATHS = (
@@ -256,7 +267,7 @@ def test_backtest_known_answer():
         _draws([10, 20, 19, 5]),
         mode="even",
         pick_count=1,
-        base_settings={"avoid_cold_enabled": False},
+        base_settings=dict(LEGACY_ENGINE_OFF),
     )
 
     assert result["evaluated"] == 2
@@ -312,10 +323,21 @@ def test_backtest_exclude_repeat_zodiac_shrinks_pool():
     on = backtest_stats(
         draws, mode="even", pick_count=1, base_settings={"exclude_repeat_zodiac": True}
     )
-    assert off["average_available_numbers"] == pytest.approx(48.0)
+    # 默认保留重号：每次可用号码 = 全部 49 个（既不排重号也不排重肖）
+    assert off["average_available_numbers"] == pytest.approx(49.0)
+    # 开启避开重肖 → 去掉整组同肖（含上期特码本身）
     assert on["average_available_numbers"] == pytest.approx(45.0)
     assert off["settings"]["exclude_repeat_zodiac"] is False
     assert on["settings"]["exclude_repeat_zodiac"] is True
+
+    # 回到旧口径（显式排除上期特码本身）时才是 48
+    legacy = backtest_stats(
+        draws,
+        mode="even",
+        pick_count=1,
+        base_settings={"exclude_repeat_zodiac": False, "include_repeat_number": False},
+    )
+    assert legacy["average_available_numbers"] == pytest.approx(48.0)
 
 
 def test_backtest_wave_breakdown():
@@ -324,7 +346,7 @@ def test_backtest_wave_breakdown():
         _draws([10, 20, 19, 5]),
         mode="even",
         pick_count=1,
-        base_settings={"avoid_cold_enabled": False},
+        base_settings=dict(LEGACY_ENGINE_OFF),
     )
 
     realized = {item["type"]: item for item in result["wave_breakdown"]["items"]}
@@ -345,8 +367,8 @@ def test_backtest_wave_breakdown():
 
 
 def test_backtest_has_no_lookahead():
-    # 关闭避冷加权：本用例只校验「不使用未来数据」，与避冷特性无关
-    base_settings = {"avoid_cold_enabled": False}
+    # 关闭避冷加权与新增软降权：本用例只校验「不使用未来数据」
+    base_settings = dict(LEGACY_ENGINE_OFF)
     base = backtest_stats(
         _draws([10, 20, 19, 5]),
         mode="even",
@@ -398,7 +420,7 @@ def test_backtest_reflects_avoid_cold_setting():
         draws,
         mode="even",
         pick_count=1,
-        base_settings={"avoid_cold_enabled": False},
+        base_settings={"avoid_cold_enabled": False, **LEGACY_ENGINE_OFF},
     )
     on = backtest_stats(
         draws,

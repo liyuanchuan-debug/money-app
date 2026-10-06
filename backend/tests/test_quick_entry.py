@@ -284,10 +284,20 @@ def test_recommend_number_branch_uses_draws_history(client):
         json={"special_number": 12, "period": 2, "draw_date": "2026-06-02"},
     )
 
-    # 本用例只证明「历史序列来自 draws」：关闭避冷加权，
+    # 本用例只证明「历史序列来自 draws」：关闭避冷加权与新增的软降权 / 点阵，
     # 否则刚出现过的 24 会按「非冷号优先」被直接选中（与空历史时的结果相同），
     # 反而看不出历史对遗漏排序的影响。
-    client.put("/api/settings", json={"avoid_cold_enabled": False})
+    client.put(
+        "/api/settings",
+        json={
+            "avoid_cold_enabled": False,
+            "repeat_number_weight": 1.0,
+            "repeat_zodiac_weight": 1.0,
+            "stale_weight": 1.0,
+            "lattice_enabled": False,
+            "include_repeat_number": False,
+        },
+    )
 
     body = client.post("/api/recommend", json={"number": 25, "mode": "single"}).json()
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from datetime import date, datetime, timedelta
+from statistics import mean
 
 import pytest
 
@@ -17,8 +18,19 @@ from services.lottery import (
     DEFAULT_AMOUNT_UNIT,
     DEFAULT_AVOID_COLD_DAYS,
     DEFAULT_AVOID_COLD_ENABLED,
+    DEFAULT_LATTICE_WINDOW,
+    DEFAULT_REPEAT_NUMBER_WEIGHT,
+    DEFAULT_REPEAT_ZODIAC_WEIGHT,
+    DEFAULT_ROLE_WEIGHT_DEFENSE,
+    DEFAULT_ROLE_WEIGHT_PRIMARY,
+    DEFAULT_ROLE_WEIGHT_SECONDARY,
     DEFAULT_SETTINGS,
+    DEFAULT_STALE_PERIODS,
+    DEFAULT_STALE_WEIGHT,
     DEFAULT_TOTAL_AMOUNT,
+    AMOUNT_UNIT_MIN,
+    AMOUNT_UNIT_STEP,
+    MIN_BET_AMOUNT,
     MODE_EVEN,
     MODE_RANDOM,
     MODE_SINGLE,
@@ -26,26 +38,47 @@ from services.lottery import (
     MODES,
     PICK_COUNT_MAX,
     PICK_COUNT_MIN,
+    ROLE_DEFENSE,
+    ROLE_PRIMARY,
+    ROLE_SECONDARY,
+    ROLE_WEIGHT_MAX,
+    ROLE_WEIGHT_MIN,
+    SOFT_WEIGHT_MAX,
+    SOFT_WEIGHT_MIN,
+    STALE_PERIODS_MAX,
+    STALE_PERIODS_MIN,
+    TOTAL_AMOUNT_MAX,
+    TOTAL_AMOUNT_MIN,
     WAVE_BIG,
     WAVE_NORMAL,
     WAVE_SMALL,
     allocate_amounts,
     amount_seed_key,
     apply_avoid_cold_amounts,
+    apply_soft_weights,
     assign_roles,
     avoid_cold_weight,
+    distribute_units_by_role,
+    role_amount_weights,
+    role_weights_are_uniform,
     build_candidate_pools,
     build_copy_text,
+    build_number_lattice,
     classify_wave,
     clamp_settings,
     compute_days_since_last,
+    compute_periods_since_last,
     format_number,
     is_avoid_cold_number,
+    lattice_primary_wave,
+    lattice_weight,
     order_pool,
+    predict_wave_band,
     random_allocation,
     random_amounts,
     recommend,
     resolve_zodiac_date,
+    soft_penalty_weight,
     with_derived_settings,
     zodiac_numbers,
 )
@@ -56,6 +89,24 @@ DEFAULT_NORMAL_MAX = 30
 BET_UNIT = 10
 PREVIOUS_VALUES = [None, 1, 25, 49]
 PICK_COUNTS = [1, 2, 3, 5, 10]
+
+# 关闭「本轮新增的三类软降权 + 号码点阵」，让只校验旧口径（避冷 / 分配 / 角色带）
+# 的用例不被新规则叠加影响；新规则另有专门用例覆盖。
+LEGACY_PENALTY_OFF: dict = {
+    "repeat_number_weight": 1.0,
+    "repeat_zodiac_weight": 1.0,
+    "stale_weight": 1.0,
+    "lattice_enabled": False,
+    # 旧口径：候选池排除上期特码本身（重号）
+    "include_repeat_number": False,
+}
+
+
+def legacy_settings(**extra) -> dict:
+    """旧口径用例的设置：三类软降权与点阵全部关闭，再叠加 ``extra``。"""
+    merged = dict(LEGACY_PENALTY_OFF)
+    merged.update(extra)
+    return merged
 
 
 @pytest.fixture(autouse=True)
@@ -131,9 +182,12 @@ def test_recommend_sweep(
         settings={
             "total_amount": BET_UNIT * pick_count,
             "pick_count": pick_count,
-            # 本用例校验分配口径（旧行为）：显式关闭避冷权重，
-            # 否则默认开启的避冷权重会压低金额（另有专门用例覆盖新行为）。
+            # 本用例校验分配口径（旧行为）：显式关闭避冷权重与三类软降权，
+            # 否则它们会压低金额（另有专门用例覆盖新行为）。
             "avoid_cold_enabled": False,
+            "repeat_number_weight": 1.0,
+            "repeat_zodiac_weight": 1.0,
+            "stale_weight": 1.0,
         },
         mode=mode,
     )
@@ -156,15 +210,18 @@ def test_recommend_sweep(
     for pick in picks:
         number = pick["number"]
         assert 1 <= number <= 49
-        assert number != latest
-        # 默认不避开重肖：同肖号允许入选；仅最新号本身始终排除
         assert number not in seen
         seen.add(number)
         assert pick["diff"] == abs(number - latest)
         assert pick["wave_type"] == classify_wave(
             pick["diff"], DEFAULT_SMALL_MAX, DEFAULT_NORMAL_MAX
         )
-        assert pick["is_repeat_zodiac"] is (number in latest_zodiac)
+        # 新口径：上期特码本身**不再排除**（重号可入选，只是被降权），
+        # 默认不避开重肖；同肖标记排除重号本身。
+        assert pick["is_repeat_number"] is (number == latest)
+        assert pick["is_repeat_zodiac"] is (
+            number != latest and number in latest_zodiac
+        )
 
     assert sum(1 for pick in picks if pick["role"] == "primary") == 1
 
@@ -190,7 +247,13 @@ def test_missing_wave_reported_and_filled():
 # --------------------------------------------------------------------------- #
 def test_prev_small_focus_puts_normal_first():
     # |10 - 5| = 5 → 上期小波动，侧重顺序 [常规, 大跳, 小波动]
-    result = recommend(latest=10, previous=5, history_numbers=[10, 5])
+    # 关闭点阵：本用例只校验侧重角色分配（点阵另有专门用例覆盖）
+    result = recommend(
+        latest=10,
+        previous=5,
+        history_numbers=[10, 5],
+        settings={"lattice_enabled": False},
+    )
 
     assert result["prev_wave"]["type"] == WAVE_SMALL
     primary = next(pick for pick in result["picks"] if pick["role"] == "primary")
@@ -199,7 +262,12 @@ def test_prev_small_focus_puts_normal_first():
 
 def test_prev_big_focus_puts_small_first():
     # |1 - 40| = 39 → 上期大跳，侧重顺序 [小波动, 常规, 大跳]
-    result = recommend(latest=1, previous=40, history_numbers=[1, 40])
+    result = recommend(
+        latest=1,
+        previous=40,
+        history_numbers=[1, 40],
+        settings={"lattice_enabled": False},
+    )
 
     assert result["prev_wave"]["type"] == WAVE_BIG
     primary = next(pick for pick in result["picks"] if pick["role"] == "primary")
@@ -221,6 +289,8 @@ def test_wave_round_takes_one_per_bucket_then_refills_small():
             "trend_bias": "neutral",
             "small_max": 10,
             "normal_max": 30,
+            # 关闭点阵：本用例只校验旧的「小→常→大」轮取顺序
+            "lattice_enabled": False,
         },
     )
     counts = Counter(pick["wave_type"] for pick in result["picks"])
@@ -233,27 +303,33 @@ def test_wave_round_takes_one_per_bucket_then_refills_small():
 
 
 def test_wave_round_refills_when_small_empty():
-    """小波动池为空时，轮取后从常规/大跳补齐到注数。"""
+    """小波动池为空时，轮取后从常规/大跳补齐到注数。
+
+    用小波动桶为空来构造：``small_max = 0`` 时只有差值 0（上期特码本身）算小波动，
+    而 ``LEGACY_PENALTY_OFF`` 下候选池不含重号 → 小波动桶确实为空。
+    """
     from collections import Counter
 
     result = recommend(
         latest=5,
         previous=40,
         history_numbers=[5, 40, 10, 20, 15],
-        settings={
-            "pick_count": 6,
-            "avoid_cold_enabled": False,
-            "exclude_repeat_zodiac": False,
-            "trend_bias": "neutral",
-            "small_max": 0,
-            "normal_max": 30,
-        },
+        settings=legacy_settings(
+            pick_count=6,
+            avoid_cold_enabled=False,
+            exclude_repeat_zodiac=False,
+            trend_bias="neutral",
+            small_max=0,
+            normal_max=30,
+        ),
     )
     assert result["prev_wave"]["type"] == WAVE_BIG
     counts = Counter(pick["wave_type"] for pick in result["picks"])
     assert len(result["picks"]) == 6
     assert counts.get(WAVE_SMALL, 0) == 0
     assert counts.get(WAVE_NORMAL, 0) + counts.get(WAVE_BIG, 0) == 6
+    # 空桶如实上报
+    assert any("小波动" in item["note"] for item in result["missing_waves"])
 
 
 # --------------------------------------------------------------------------- #
@@ -375,13 +451,14 @@ def test_weighted_and_single_respect_amount_unit():
 def test_documented_default_amounts():
     """默认配置（最大投注 50 元、单位 5、6 注）下三种模式的金额必须与产品默认一致。
 
-    均注：50/5=10 个单位分给 6 注 → 2/2/2/2/1/1 单位 → 10/10/10/10/5/5。
+    均注：先给每注保底 1 个单位（6 注 = 6 个单位），余下 4 个单位按角色配额
+          主推:次选:防守 = 3:2:1 分给三组 → 主推 2、次选 1、防守 1 → 15/10/10/5/5/5。
     侧重：主推约 4/6，但须保证每注 ≥1 单位 → 5/1/1/1/1/1 → 25/5/5/5/5/5。
     单挑：整份预算押在一个号上 → 50。
     """
     history = [15, 20]
     expected = {
-        MODE_EVEN: [10, 10, 10, 10, 5, 5],
+        MODE_EVEN: [15, 10, 10, 5, 5, 5],
         MODE_WEIGHTED: [25, 5, 5, 5, 5, 5],
         MODE_SINGLE: [50],
     }
@@ -399,6 +476,25 @@ def test_documented_default_amounts():
         assert got == amounts, f"{mode}: 期望 {amounts}，实际 {got}"
         assert result["total_amount"] == 50
         assert all(amount % 5 == 0 for amount in got)
+
+
+def test_documented_default_amounts_legacy_equal_roles():
+    """角色配额设为 1:1:1 → 均注回到旧的严格均分 10/10/10/10/5/5。"""
+    result = recommend(
+        latest=20,
+        previous=15,
+        history_numbers=[15, 20],
+        mode=MODE_EVEN,
+        settings={
+            "avoid_cold_enabled": False,
+            "role_w_primary": 1,
+            "role_w_secondary": 1,
+            "role_w_defense": 1,
+        },
+    )
+    got = [pick["amount"] for pick in result["picks"]]
+    assert got == [10, 10, 10, 10, 5, 5]
+    assert sum(got) == 50
 
 
 def test_single_mode_bets_whole_total_amount():
@@ -741,14 +837,14 @@ def test_recommend_allows_repeat_zodiac_when_disabled():
         previous=40,
         history_numbers=history,
         # 关闭走势加权，才能走旧的「遗漏优先」把同肖冷号顶上来
-        settings={
-            "exclude_repeat_zodiac": False,
-            "pick_count": 3,
-            "trend_bias": "neutral",
-            # 本用例只校验「避开重肖」开关：关闭避冷加权，
-            # 否则默认开启的避冷加权会把同肖冷号排到队尾（另有专门用例覆盖）
-            "avoid_cold_enabled": False,
-        },
+        settings=legacy_settings(
+            exclude_repeat_zodiac=False,
+            pick_count=3,
+            trend_bias="neutral",
+            # 本用例只校验「避开重肖」开关：关闭避冷与三类软降权，
+            # 否则它们会把同肖号排到后面（另有专门用例覆盖新行为）
+            avoid_cold_enabled=False,
+        ),
     )
     picked = {pick["number"] for pick in result["picks"]}
     # 至少有一个同肖号入选，证明关闭时不过滤
@@ -1203,6 +1299,7 @@ def _cold_recommend(
             "pick_count": 1,
             "avoid_cold_enabled": enabled,
             "avoid_cold_days": threshold,
+            **LEGACY_PENALTY_OFF,
         },
         mode=mode,
     )
@@ -1224,16 +1321,17 @@ def test_avoid_cold_weight_rule():
     assert avoid_cold_weight(9999, enabled=False) == 1.0
 
 
-def test_avoid_cold_defaults_on_and_clamped():
-    assert DEFAULT_AVOID_COLD_ENABLED is True
+def test_avoid_cold_defaults_off_and_clamped():
+    """避冷（自然日口径）默认关闭：冷号改由按**期数**的软降权处理。"""
+    assert DEFAULT_AVOID_COLD_ENABLED is False
     assert DEFAULT_AVOID_COLD_DAYS == 60
-    assert DEFAULT_SETTINGS["avoid_cold_enabled"] is True
+    assert DEFAULT_SETTINGS["avoid_cold_enabled"] is False
     assert DEFAULT_SETTINGS["avoid_cold_days"] == 60
-    assert clamp_settings({})["avoid_cold_enabled"] is True
+    assert clamp_settings({})["avoid_cold_enabled"] is False
     assert clamp_settings({})["avoid_cold_days"] == 60
-    # 缺失 / 脏值 → 默认开启；显式 false 才关闭
-    assert clamp_settings({"avoid_cold_enabled": None})["avoid_cold_enabled"] is True
-    assert clamp_settings({"avoid_cold_enabled": "false"})["avoid_cold_enabled"] is False
+    # 缺失 / 脏值 → 默认关闭；显式 true 才开启
+    assert clamp_settings({"avoid_cold_enabled": None})["avoid_cold_enabled"] is False
+    assert clamp_settings({"avoid_cold_enabled": "true"})["avoid_cold_enabled"] is True
     # 阈值钳到 1..999，非数字回退默认 60
     assert clamp_settings({"avoid_cold_days": 0})["avoid_cold_days"] == 1
     assert clamp_settings({"avoid_cold_days": 99999})["avoid_cold_days"] == 999
@@ -1383,22 +1481,22 @@ def test_settings_api_avoid_cold_roundtrip():
 
     with TestClient(app) as client:
         body = client.get("/api/settings").json()
-        assert body["avoid_cold_enabled"] is True
+        assert body["avoid_cold_enabled"] is False
         assert body["avoid_cold_days"] == 60
 
         updated = client.put(
             "/api/settings",
-            json={"avoid_cold_enabled": False, "avoid_cold_days": 90},
+            json={"avoid_cold_enabled": True, "avoid_cold_days": 90},
         ).json()
-        assert updated["avoid_cold_enabled"] is False
+        assert updated["avoid_cold_enabled"] is True
         assert updated["avoid_cold_days"] == 90
         assert client.get("/api/settings").json()["avoid_cold_days"] == 90
 
         restored = client.put(
             "/api/settings",
-            json={"avoid_cold_enabled": True, "avoid_cold_days": 60},
+            json={"avoid_cold_enabled": False, "avoid_cold_days": 60},
         ).json()
-        assert restored["avoid_cold_enabled"] is True
+        assert restored["avoid_cold_enabled"] is False
         assert restored["avoid_cold_days"] == 60
         assert restored["total_amount"] == body["total_amount"]
 
@@ -1540,9 +1638,12 @@ def test_avoid_cold_regression_stale_number_not_taken_first():
         "mode": MODE_SINGLE,
     }
     off = recommend(
-        **base, settings={"pick_count": 1, "avoid_cold_enabled": False}
+        **base,
+        settings=legacy_settings(pick_count=1, avoid_cold_enabled=False),
     )
-    on = recommend(**base, settings={"pick_count": 1, "avoid_cold_enabled": True})
+    on = recommend(
+        **base, settings=legacy_settings(pick_count=1, avoid_cold_enabled=True)
+    )
 
     # 旧行为（关闭避冷）：遗漏最久的 24 被首选 —— 这正是用户反馈的问题
     assert off["picks"][0]["number"] == COLD_TARGET
@@ -1940,3 +2041,617 @@ def test_recommend_api_picks_carry_zodiac():
     for pick in body["picks"]:
         assert pick["zodiac"] == zodiac_of(pick["number"], ZODIAC_REF_DATE)
         assert pick["zodiac_label"] == ZODIAC_LABELS[pick["zodiac"]]
+
+
+# --------------------------------------------------------------------------- #
+# 20. 三类软降权（重号 / 同肖 / 按**期数**冷号）+ 预测波动线号码点阵
+# --------------------------------------------------------------------------- #
+def test_compute_periods_since_last_counts_draws_not_days():
+    """冷号口径按**期数**：最近出现在下标 i → i 期前出现过；未出现为 None。"""
+    result = compute_periods_since_last([7, 3, 7, 9])
+    assert result[7] == 0  # 最新一期就是 7
+    assert result[3] == 1
+    assert result[9] == 3
+    assert result[5] is None
+    assert set(result) == set(range(1, 50))
+
+
+def test_soft_penalty_weight_covers_three_kinds():
+    # 重号：与上期特码相同 → repeat_number_weight，且与「同肖」互斥
+    weight, reasons = soft_penalty_weight(
+        24,
+        latest=24,
+        periods_since_last=0,
+        sample_size=80,
+        repeat_number_weight=0.5,
+        repeat_zodiac_weight=0.8,
+        stale_periods=60,
+        stale_weight=0.3,
+    )
+    assert weight == pytest.approx(0.5)
+    assert reasons == ["repeat_number"]
+
+    # 同肖（不含重号本身）→ repeat_zodiac_weight
+    weight, reasons = soft_penalty_weight(
+        12,  # 与 24 同肖（(24-1)%12 == (12-1)%12 == 11）
+        latest=24,
+        periods_since_last=3,
+        sample_size=80,
+        repeat_number_weight=0.5,
+        repeat_zodiac_weight=0.8,
+        stale_periods=60,
+        stale_weight=0.3,
+    )
+    assert weight == pytest.approx(0.8)
+    assert reasons == ["repeat_zodiac"]
+
+    # 冷号：样本 ≥ 60 期且最近 60 期未出现 → stale_weight
+    weight, reasons = soft_penalty_weight(
+        5,
+        latest=24,
+        periods_since_last=72,
+        sample_size=80,
+        repeat_number_weight=0.5,
+        repeat_zodiac_weight=0.8,
+        stale_periods=60,
+        stale_weight=0.3,
+    )
+    assert weight == pytest.approx(0.3)
+    assert reasons == ["stale"]
+
+    # 样本不足 60 期时无法证明「60 期未出现」→ 一律不降权
+    weight, reasons = soft_penalty_weight(
+        5,
+        latest=24,
+        periods_since_last=None,
+        sample_size=20,
+        stale_periods=60,
+        stale_weight=0.3,
+    )
+    assert weight == 1.0
+    assert reasons == []
+
+    # 三类可叠加（重号 + 冷号在不同维度上，实际重号必然近 60 期出现过，这里只验相乘）
+    weight, _reasons = soft_penalty_weight(
+        5,
+        latest=24,
+        periods_since_last=60,
+        sample_size=80,
+        repeat_number_weight=1.0,
+        repeat_zodiac_weight=1.0,
+        stale_periods=60,
+        stale_weight=0.3,
+    )
+    assert weight == pytest.approx(0.3)  # 正好 60 期 → 算冷号
+
+
+def test_apply_soft_weights_discounts_but_keeps_min_bet():
+    # 权重 0.5：10 → 5；权重 1.0 原样；只降不升
+    assert apply_soft_weights([10, 10], [0.5, 1.0], amount_unit=5) == ([5, 10], 1)
+    # 权重 0.3：10 → 3 → 向下取整到单位 5 → 0 → 保底 = max(5, unit=5) = 5
+    assert apply_soft_weights([10], [0.3], amount_unit=5) == ([5], 1)
+    # 单位 5 + 每注最低 5 元：40×0.3 = 12 → 向下取整到 5 的倍数 → 10
+    assert apply_soft_weights([40], [0.3], amount_unit=5) == ([10], 1)
+    # 单位 10：40×0.3 = 12 → 10（是 10 的倍数且 ≥ 每注最低 10）
+    assert apply_soft_weights([40], [0.3], amount_unit=10) == ([10], 1)
+    # 上游压到 0（避冷封顶）不会被抬回下限
+    assert apply_soft_weights([0], [0.3], amount_unit=5) == ([0], 0)
+    # 全部 1.0 → 严格 no-op
+    assert apply_soft_weights([10, 5], [1.0, 1.0], amount_unit=5) == ([10, 5], 0)
+
+
+def test_budget_limits_are_5_to_100_and_unit_step_5():
+    """预算上限 100 元、下限 5 元；每注最低 5 元、注码按 5 元一档（常量口径）。"""
+    assert MIN_BET_AMOUNT == 5
+    assert TOTAL_AMOUNT_MIN == 5
+    assert TOTAL_AMOUNT_MAX == 100
+    assert AMOUNT_UNIT_MIN == 5
+    assert AMOUNT_UNIT_STEP == 5
+    assert clamp_settings({"total_amount": 1})["total_amount"] == 5
+    assert clamp_settings({"total_amount": 999})["total_amount"] == 100
+    assert clamp_settings({})["total_amount"] == DEFAULT_TOTAL_AMOUNT
+    # 注码单位按 5 向下取整（用户口径：按 5 的倍数来）
+    assert clamp_settings({"amount_unit": 0})["amount_unit"] == 5
+    assert clamp_settings({"amount_unit": 3})["amount_unit"] == 5
+    assert clamp_settings({"amount_unit": 7})["amount_unit"] == 5
+    assert clamp_settings({"amount_unit": 12})["amount_unit"] == 10
+    assert clamp_settings({"amount_unit": 100})["amount_unit"] == 100
+
+
+def test_soft_weight_settings_are_clamped():
+    assert DEFAULT_SETTINGS["include_repeat_number"] is True
+    assert DEFAULT_SETTINGS["repeat_number_weight"] == DEFAULT_REPEAT_NUMBER_WEIGHT
+    assert DEFAULT_SETTINGS["repeat_zodiac_weight"] == DEFAULT_REPEAT_ZODIAC_WEIGHT
+    assert DEFAULT_SETTINGS["stale_periods"] == DEFAULT_STALE_PERIODS
+    assert DEFAULT_SETTINGS["stale_weight"] == DEFAULT_STALE_WEIGHT
+    assert DEFAULT_SETTINGS["lattice_enabled"] is True
+    assert DEFAULT_SETTINGS["lattice_window"] == DEFAULT_LATTICE_WINDOW
+
+    # 权重钳到 0..1
+    assert clamp_settings({"repeat_number_weight": -1})["repeat_number_weight"] == (
+        SOFT_WEIGHT_MIN
+    )
+    assert clamp_settings({"repeat_zodiac_weight": 9})["repeat_zodiac_weight"] == (
+        SOFT_WEIGHT_MAX
+    )
+    assert clamp_settings({"stale_weight": "abc"})["stale_weight"] == DEFAULT_STALE_WEIGHT
+    # 期数钳到 1..999
+    assert clamp_settings({"stale_periods": 0})["stale_periods"] == STALE_PERIODS_MIN
+    assert clamp_settings({"stale_periods": 99999})["stale_periods"] == STALE_PERIODS_MAX
+    # 开关与窗口
+    assert clamp_settings({"include_repeat_number": "false"})[
+        "include_repeat_number"
+    ] is False
+    assert clamp_settings({"lattice_enabled": None})["lattice_enabled"] is True
+    assert clamp_settings({"lattice_window": -3})["lattice_window"] == 0
+
+
+def test_build_candidate_pools_can_keep_repeat_number():
+    latest = 24
+    off = build_candidate_pools(latest, DEFAULT_SMALL_MAX, DEFAULT_NORMAL_MAX)
+    on = build_candidate_pools(
+        latest,
+        DEFAULT_SMALL_MAX,
+        DEFAULT_NORMAL_MAX,
+        include_repeat_number=True,
+    )
+    assert all(item["number"] != latest for items in off.values() for item in items)
+    kept = [item for items in on.values() for item in items if item["number"] == latest]
+    assert len(kept) == 1
+    assert kept[0]["diff"] == 0
+    # 各池总数：排除重号 48；保留重号 49
+    assert sum(len(items) for items in off.values()) == 48
+    assert sum(len(items) for items in on.values()) == 49
+
+
+def test_predict_wave_band_and_lattice_weights():
+    # 差值序列恒定 5 → 中心 = 5、带宽 = 5~5
+    band = predict_wave_band([30, 25, 20, 15, 10], window=0)
+    assert band is not None
+    assert band["center"] == pytest.approx(5.0)
+    assert band["low"] == pytest.approx(5.0)
+    assert band["high"] == pytest.approx(5.0)
+    assert band["wave_type"] == WAVE_SMALL
+    assert band["samples"] == 4
+
+    # 样本不足两期 → 无预测（不得编造）
+    assert predict_wave_band([7]) is None
+    assert predict_wave_band([]) is None
+
+    # 点阵权重：带内 1.0；带外按距离衰减且严格小于 1.0
+    assert lattice_weight(5, band) == 1.0
+    near = lattice_weight(6, band)
+    far = lattice_weight(20, band)
+    assert 0.0 < far < near < 1.0
+    # 无预测时恒为 1.0（关闭点阵 = 旧行为）
+    assert lattice_weight(20, None) == 1.0
+
+    # 点阵覆盖 1..49，且带内标记与权重一致
+    rows = build_number_lattice(24, band, small_max=DEFAULT_SMALL_MAX, normal_max=DEFAULT_NORMAL_MAX)
+    assert len(rows) == 49
+    for row in rows:
+        assert row["diff"] == abs(row["number"] - 24)
+        assert row["in_band"] is (row["diff"] == 5)
+        assert row["is_latest"] is (row["number"] == 24)
+
+
+def test_lattice_primary_wave_picks_dominant_bucket():
+    # 带宽 16~29：全部落在常规波动（small_max=10 / normal_max=30）
+    band = {"low": 16.0, "high": 29.0}
+    assert lattice_primary_wave(band, small_max=10, normal_max=30) == WAVE_NORMAL
+    # 带宽 2~8 → 小波动
+    assert lattice_primary_wave({"low": 2.0, "high": 8.0}, small_max=10, normal_max=30) == (
+        WAVE_SMALL
+    )
+    # 无预测 → None（调用方回退旧轮取顺序）
+    assert lattice_primary_wave(None) is None
+
+
+def _long_history() -> list[int]:
+    """80 期历史：让「最近 60 期未出现」真正可判定。"""
+    series = [37, 44, 11, 26, 8, 41, 19, 5, 33, 14] * 8
+    series[0] = 37
+    return series
+
+
+def test_recommend_keeps_repeat_number_but_discounts_it():
+    """重号只降权、不排除：仍在候选池里，金额 ×0.5 并带 is_repeat_number 标记。
+
+    为了让「重号确实留在池里」可确定性验证，把波动阈值收窄到 ``small_max=0``：
+    此时小波动桶只剩重号本身（diff=0），选号必然取到它；
+    同一阈值下关闭 ``include_repeat_number`` 该桶就会空 → 反证它没有被排除。
+    """
+    history = [24] + [n for n in range(1, 50) if n != 24]
+    settings = legacy_settings(
+        pick_count=1,
+        total_amount=20,
+        amount_unit=5,
+        small_max=0,
+        include_repeat_number=True,
+        repeat_number_weight=0.5,
+        # 只打开重号降权，避免同肖/冷号干扰
+        repeat_zodiac_weight=1.0,
+        stale_weight=1.0,
+        avoid_cold_enabled=False,
+    )
+    result = recommend(
+        latest=24,
+        previous=None,
+        history_numbers=history,
+        settings=settings,
+        mode=MODE_SINGLE,
+    )
+    pick = result["picks"][0]
+    assert pick["number"] == 24
+    assert pick["is_repeat_number"] is True
+    assert pick["is_repeat_zodiac"] is False  # 重号不计入同肖标记
+    assert pick["soft_weight"] == pytest.approx(0.5)
+    assert pick["soft_reasons"] == ["repeat_number"]
+    assert pick["soft_penalized"] is True
+    assert pick["amount_reduced"] is True
+    # 20 × 0.5 = 10 → 向下取整到 5 的倍数 = 10（≥ 每注最低 5 元）；省下的不补给别注
+    assert pick["amount"] == 10
+    assert result["staked_total"] == 10
+    assert result["soft_weights"]["repeat_number_picks"] == [24]
+    assert any("重号" in note for note in result["notes"])
+
+    # 反证：候选池口径由 include_repeat_number 控制（重号只降权、不是被排除）
+    kept = build_candidate_pools(
+        24, 0, 30, include_repeat_number=True
+    )[WAVE_SMALL]
+    dropped = build_candidate_pools(
+        24, 0, 30, include_repeat_number=False
+    )[WAVE_SMALL]
+    assert [row["number"] for row in kept] == [24]
+    assert dropped == []
+
+
+def test_recommend_discounts_repeat_zodiac_but_marks_it():
+    """同肖不被排除，金额按 0.8 打折，并带 is_repeat_zodiac 标记。
+
+    确定性构造：把波动阈值收到 ``small_max=12``，让 12 / 36（都与上期 24 同肖）
+    落在小波动桶里；近 5 期只出现过这两个同肖号，桶内其余号码全部触发冷号降权（×0.3），
+    于是同肖号以 0.8 胜出；同权重再按 (差值, 号码) 取最小 → 12。
+    （选号固定按 小 → 常 → 大 逐桶取一个，与侧重顺序解耦，所以必须让目标落在小波动桶。）
+    """
+    # 近 5 期只出现过 12 / 36（同肖），填充号都放在小波动桶之外
+    history = [24, 12, 36, 2, 3, 4, 5, 6, 7]
+    result = recommend(
+        latest=24,
+        previous=None,
+        history_numbers=history,
+        settings=legacy_settings(
+            pick_count=1,
+            total_amount=20,
+            amount_unit=5,
+            small_max=12,
+            include_repeat_number=False,
+            repeat_number_weight=0.5,
+            repeat_zodiac_weight=0.8,
+            stale_periods=5,
+            stale_weight=0.3,
+            lattice_enabled=False,
+            avoid_cold_enabled=False,
+        ),
+        mode=MODE_SINGLE,
+    )
+    pick = result["picks"][0]
+    assert pick["number"] == 12
+    assert pick["is_repeat_zodiac"] is True
+    assert pick["is_repeat_number"] is False
+    assert pick["is_stale"] is False
+    assert pick["soft_weight"] == pytest.approx(0.8)
+    assert pick["soft_reasons"] == ["repeat_zodiac"]
+    # 20 × 0.8 = 16 → 向下取整到 5 的倍数 = 15
+    assert pick["amount"] == 15
+    assert result["soft_weights"]["repeat_zodiac_picks"] == [12]
+
+
+def test_recommend_stale_numbers_are_discounted_not_excluded():
+    """60 期未出现 → 降权到 0.3（仍会出号），并带 is_stale 标记。"""
+    history = _long_history()
+    result = recommend(
+        latest=37,
+        previous=44,
+        history_numbers=history,
+        settings=legacy_settings(
+            pick_count=10,
+            total_amount=100,
+            amount_unit=5,
+            include_repeat_number=False,
+            repeat_zodiac_weight=1.0,
+            stale_periods=60,
+            stale_weight=0.3,
+            lattice_enabled=False,
+        ),
+    )
+    stale = [pick for pick in result["picks"] if pick["is_stale"]]
+    assert stale, "80 期样本里应当存在最近 60 期未出现的号码"
+    for pick in stale:
+        assert pick["soft_weight"] == pytest.approx(0.3)
+        assert "stale" in pick["soft_reasons"]
+        # 只降权、不归零：金额仍 ≥ 每注最低金额
+        assert pick["amount"] >= MIN_BET_AMOUNT
+    assert result["soft_weights"]["stale_picks"] == [p["number"] for p in stale]
+    assert result["staked_total"] <= result["total_amount"]
+
+
+def test_recommend_lattice_puts_picks_inside_predicted_band():
+    """点阵开启时，出号优先落在预测波动带内（带内号足够时全部带内）。"""
+    history = [18, 7, 33, 12, 41, 5, 26, 9, 44, 3, 17, 38, 11, 22, 6, 31, 15, 47]
+    result = recommend(
+        latest=18,
+        previous=7,
+        history_numbers=history,
+        settings=legacy_settings(
+            pick_count=10,
+            total_amount=100,
+            amount_unit=5,
+            lattice_enabled=True,
+            lattice_window=30,
+        ),
+    )
+    lattice = result["lattice"]
+    band = lattice["band"]
+    assert band is not None
+    # 带宽 16~29 → 常规波动桶
+    assert lattice["primary_wave"] == WAVE_NORMAL
+    assert lattice["primary_wave_label"] == "常规波动"
+    picks = result["picks"]
+    assert len(picks) == 10
+    # 带内号码有 15 个（≥ 10 注）→ 全部落在带内
+    assert all(pick["in_lattice_band"] for pick in picks)
+    assert all(pick["lattice_weight"] == 1.0 for pick in picks)
+    assert all(
+        band["low"] <= pick["diff"] <= band["high"] for pick in picks
+    )
+    assert any("预测波动线已开启" in note for note in result["notes"])
+
+
+def test_recommend_lattice_disabled_matches_legacy_wave_round():
+    """点阵关闭时不设预测桶，回到旧的「小→常→大」轮取。"""
+    history = [18, 7, 33, 12, 41, 5, 26, 9, 44, 3]
+    result = recommend(
+        latest=18,
+        previous=7,
+        history_numbers=history,
+        settings=legacy_settings(pick_count=6),
+    )
+    lattice = result["lattice"]
+    assert lattice["enabled"] is False
+    assert lattice["band"] is None
+    assert lattice["primary_wave"] is None
+    # 点阵仍返回 1..49 的点阵行，权重全为 1.0（不影响选号）
+    assert len(lattice["numbers"]) == 49
+    assert all(row["lattice_weight"] == 1.0 for row in lattice["numbers"])
+    assert any("点阵已关闭" in note for note in result["notes"])
+
+
+def test_recommend_picks_expose_all_new_fields():
+    """接口契约：每注都带三类标记与点阵字段（只增不改旧字段）。"""
+    result = recommend(
+        latest=24,
+        previous=12,
+        history_numbers=[24, 12, *_long_history()],
+        settings={"pick_count": 5},
+    )
+    for pick in result["picks"]:
+        for key in (
+            "is_repeat_number",
+            "is_repeat_zodiac",
+            "is_stale",
+            "periods_since_last",
+            "soft_weight",
+            "soft_reasons",
+            "soft_penalized",
+            "amount_reduced",
+            "lattice_weight",
+            "in_lattice_band",
+        ):
+            assert key in pick
+    assert "soft_weights" in result
+    assert "lattice" in result
+    assert "role_quota" in result
+    assert result["soft_weights"]["min_bet_amount"] == MIN_BET_AMOUNT
+
+
+# --------------------------------------------------------------------------- #
+# 角色金额配额（主推 : 次选 : 防守；用户口径「防守的配额低一些」）
+# --------------------------------------------------------------------------- #
+def test_role_amount_weights_default_3_2_1_and_clamped():
+    weights = role_amount_weights(None)
+    assert weights == {
+        ROLE_PRIMARY: DEFAULT_ROLE_WEIGHT_PRIMARY,
+        ROLE_SECONDARY: DEFAULT_ROLE_WEIGHT_SECONDARY,
+        ROLE_DEFENSE: DEFAULT_ROLE_WEIGHT_DEFENSE,
+    }
+    assert (weights[ROLE_PRIMARY], weights[ROLE_SECONDARY], weights[ROLE_DEFENSE]) == (
+        3.0,
+        2.0,
+        1.0,
+    )
+    assert DEFAULT_SETTINGS["role_w_primary"] == 3.0
+    assert DEFAULT_SETTINGS["role_w_secondary"] == 2.0
+    assert DEFAULT_SETTINGS["role_w_defense"] == 1.0
+    # 钳到 0..10；脏值回退默认
+    assert clamp_settings({"role_w_defense": -1})["role_w_defense"] == ROLE_WEIGHT_MIN
+    assert clamp_settings({"role_w_primary": 999})["role_w_primary"] == ROLE_WEIGHT_MAX
+    assert clamp_settings({"role_w_secondary": "abc"})[
+        "role_w_secondary"
+    ] == DEFAULT_ROLE_WEIGHT_SECONDARY
+    assert role_amount_weights({"role_w_defense": 9})[ROLE_DEFENSE] == 9.0
+
+
+def test_role_weights_uniform_is_legacy_equal_split():
+    """1:1:1 → 与旧版严格均注逐注完全一致（不多不少、不换顺序）。"""
+    equal = {
+        ROLE_PRIMARY: 1.0,
+        ROLE_SECONDARY: 1.0,
+        ROLE_DEFENSE: 1.0,
+    }
+    assert role_weights_are_uniform(equal) is True
+    assert role_weights_are_uniform(None) is True
+    assert role_weights_are_uniform(role_amount_weights(None)) is False
+
+    for pick_count in (1, 3, 6, 10):
+        roles = assign_roles(pick_count)
+        for total, unit in ((50, 5), (100, 5), (100, 10), (30, 5)):
+            legacy = allocate_amounts("even", roles, total, amount_unit=unit)
+            weighted = allocate_amounts(
+                "even", roles, total, amount_unit=unit, role_weights=equal
+            )
+            assert weighted == legacy
+
+
+def test_defense_gets_the_smallest_share():
+    """默认 3:2:1：单注均值 主推 > 次选 > 防守，防守拿到最低配额。
+
+    注意：每注必须先保底 1 个单位（= 每注最低金额），所以「组总金额」还受该组注数
+    影响 —— 防守注数多于主推时，防守组总额未必低于主推组总额；真正可比的是**单注均值**。
+    """
+    roles = assign_roles(10)
+    amounts = allocate_amounts(
+        "even",
+        roles,
+        100,
+        amount_unit=5,
+        role_weights=role_amount_weights(None),
+    )
+    assert sum(amounts) == 100
+    per_role: dict[str, list[int]] = {role: [] for role in roles}
+    for role, amount in zip(roles, amounts):
+        per_role[role].append(amount)
+
+    # 单注均值：主推 > 次选 > 防守（防守最低）
+    assert (
+        mean(per_role[ROLE_PRIMARY])
+        > mean(per_role[ROLE_SECONDARY])
+        > mean(per_role[ROLE_DEFENSE])
+    )
+    # 防守组是唯一「单注均值 = 保底金额」的组（其余组都能分到余量）
+    assert max(per_role[ROLE_DEFENSE]) < min(per_role[ROLE_PRIMARY])
+    assert all(amount >= MIN_BET_AMOUNT for amount in amounts)
+    assert all(amount % 5 == 0 for amount in amounts)
+
+
+def test_defense_total_is_lowest_when_group_sizes_allow():
+    """注数相同时，防守组总金额严格最低（配额方向正确）。"""
+    # 6 注 → 主推 1 / 次选 3 / 防守 2；用 3 注对齐注数不便，这里直接看方向
+    roles = assign_roles(3)  # [primary, secondary, defense] 三组各 1 注
+    amounts = allocate_amounts(
+        "even", roles, 100, amount_unit=5, role_weights=role_amount_weights(None)
+    )
+    assert len(set(roles)) == 3
+    by_role = dict(zip(roles, amounts))
+    assert (
+        by_role[ROLE_PRIMARY] > by_role[ROLE_SECONDARY] > by_role[ROLE_DEFENSE]
+    )
+    assert sum(amounts) == 100
+
+
+def test_role_quota_is_a_noop_when_budget_is_all_floor():
+    """预算恰好 = 每注最低金额 × 注数时没有余量，角色配额不产生差异。"""
+    roles = assign_roles(10)
+    amounts = allocate_amounts(
+        "even",
+        roles,
+        50,  # 10 注 × 5 元
+        amount_unit=5,
+        role_weights=role_amount_weights(None),
+    )
+    assert amounts == [5] * 10
+
+
+def test_distribute_units_by_role_covers_budget_exactly():
+    """任意权重下：总额守恒、每注 ≥ 1 单位、覆盖不了的尾注不输出。"""
+    for weights in (
+        {ROLE_PRIMARY: 3, ROLE_SECONDARY: 2, ROLE_DEFENSE: 1},
+        {ROLE_PRIMARY: 0, ROLE_SECONDARY: 0, ROLE_DEFENSE: 1},
+        {ROLE_PRIMARY: 9, ROLE_SECONDARY: 1, ROLE_DEFENSE: 1},
+        {ROLE_PRIMARY: 10, ROLE_SECONDARY: 0, ROLE_DEFENSE: 0},
+    ):
+        for units in range(1, 25):
+            for pick_count in (1, 2, 5, 10):
+                roles = assign_roles(pick_count)
+                parts = distribute_units_by_role(units, roles, weights)
+                assert len(parts) == min(pick_count, units)
+                assert sum(parts) == units
+                assert all(part >= 1 for part in parts)
+
+    # 零权重组合：全部权重为 0 → 退化为组内均分（仍守恒）
+    parts = distribute_units_by_role(
+        20, assign_roles(10), {ROLE_PRIMARY: 0, ROLE_SECONDARY: 0, ROLE_DEFENSE: 0}
+    )
+    assert sum(parts) == 20
+
+
+def test_recommend_reports_role_quota_and_notes():
+    """推荐结果如实带出角色配额（权重 / 组总额 / 组注数）与口径说明。"""
+    history = [18, 7, 33, 12, 41, 5, 26, 9, 44, 3, 17, 38, 11, 22, 6, 31, 15, 47]
+    result = recommend(
+        latest=18,
+        previous=7,
+        history_numbers=history,
+        settings=legacy_settings(
+            pick_count=10,
+            total_amount=100,
+            amount_unit=5,
+            lattice_enabled=False,
+        ),
+    )
+    quota = result["role_quota"]
+    assert quota["applied"] is True
+    assert quota["weights"] == {
+        ROLE_PRIMARY: 3.0,
+        ROLE_SECONDARY: 2.0,
+        ROLE_DEFENSE: 1.0,
+    }
+    assert sum(quota["totals"].values()) == result["staked_total"]
+    assert sum(quota["counts"].values()) == len(result["picks"])
+    assert any("角色配额" in note for note in result["notes"])
+    # 防守组总额最低
+    assert quota["totals"][ROLE_DEFENSE] < quota["totals"][ROLE_SECONDARY]
+
+
+def test_recommend_notes_quota_noop_when_no_headroom():
+    """预算没有余量时，note 必须如实说明配额未产生金额差异（不吹效果）。"""
+    history = [18, 7, 33, 12, 41, 5, 26, 9, 44, 3, 17, 38, 11, 22, 6, 31, 15, 47]
+    result = recommend(
+        latest=18,
+        previous=7,
+        history_numbers=history,
+        settings=legacy_settings(
+            pick_count=10,
+            total_amount=50,  # 10 注 × 5 元，正好全部触底
+            amount_unit=5,
+            lattice_enabled=False,
+        ),
+    )
+    assert all(pick["amount"] == 5 for pick in result["picks"])
+    assert any("没有余量可分配" in note for note in result["notes"])
+
+
+def test_recommend_equal_role_weights_note_says_legacy():
+    history = [18, 7, 33, 12, 41, 5, 26, 9, 44, 3, 17, 38, 11, 22, 6, 31, 15, 47]
+    result = recommend(
+        latest=18,
+        previous=7,
+        history_numbers=history,
+        settings=legacy_settings(
+            pick_count=6,
+            total_amount=100,
+            amount_unit=5,
+            role_w_primary=1,
+            role_w_secondary=1,
+            role_w_defense=1,
+            lattice_enabled=False,
+        ),
+    )
+    assert result["role_quota"]["applied"] is False
+    # 与旧版严格均注逐注一致
+    expected = allocate_amounts(
+        "even", assign_roles(len(result["picks"])), 100, amount_unit=5
+    )
+    assert [pick["amount"] for pick in result["picks"]] == expected
+    assert sum(expected) == 100
+    assert any("严格均分" in note for note in result["notes"])

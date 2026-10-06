@@ -6,10 +6,11 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import random
 from collections import Counter
 from datetime import date, datetime
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from services.mark_six import lunar_year_for, zodiac_label, zodiac_of
 
@@ -57,13 +58,19 @@ MODES = [MODE_EVEN, MODE_WEIGHTED, MODE_SINGLE, MODE_RANDOM]
 MODE_PATTERN = "^(" + "|".join(MODES) + ")$"
 
 # 金额最小单位（注码粒度）：**所有模式**下每一注金额必须是它的正整数倍
-AMOUNT_UNIT_MIN = 1
+# 用户口径：按 5 元一档（最低 5 元），因此下限就是步长；写入时向下取到步长的整数倍。
+AMOUNT_UNIT_MIN = 5
 AMOUNT_UNIT_MAX = 10000
+# 注码粒度步长：金额最小单位必须是它的整数倍
+AMOUNT_UNIT_STEP = 5
 DEFAULT_AMOUNT_UNIT = 5
+# 每注最低金额（元）：所有模式下每一注的**实际金额**都不得低于它。
+# 预算不足以让每注都达到该下限时，按「能覆盖几注就出几注」降级，绝不产出低于下限的注。
+MIN_BET_AMOUNT = 5
 # 最大投注金额：**唯一的预算真值**（旧 bet_unit 已降级为派生展示值，不再是输入真值）
-TOTAL_AMOUNT_MIN = 1
-# 上限对齐旧口径的可能极值（bet_unit 10000 × pick_count 10 = 100000）
-TOTAL_AMOUNT_MAX = 100000
+# 用户口径：资金最大 100 元、最小 5 元（每注最低 5 元、按 5 元一档）
+TOTAL_AMOUNT_MIN = 5
+TOTAL_AMOUNT_MAX = 100
 DEFAULT_TOTAL_AMOUNT = 50
 DEFAULT_PICK_COUNT = 6
 # 特码兑付倍数（用户设定；默认 47，不是收益承诺）
@@ -80,11 +87,77 @@ ODDS_MAX = 999
 #   - 距上次出现 ≤ 阈值 → 不惩罚（权重 1.0，正好等于阈值也算不惩罚）；
 #   - 距上次出现 > 阈值 → 权重 = 阈值 / 天数（越久越低：60 天 1.0、120 天 0.5、240 天 0.25）；
 #   - 本池样本内从未出现（days_since_last 为 None）→ 视为最冷，取地板权重 0（金额归 0）。
-DEFAULT_AVOID_COLD_ENABLED = True
+DEFAULT_AVOID_COLD_ENABLED = False
 DEFAULT_AVOID_COLD_DAYS = 60
 AVOID_COLD_DAYS_MIN = 1
 AVOID_COLD_DAYS_MAX = 999
 AVOID_COLD_FLOOR_WEIGHT = 0.0
+
+# --------------------------------------------------------------------------- #
+# 三类「软降权」（排序靠后 + 金额打折；**不排除、不归零**）
+#
+# 与避冷加权（avoid_cold_*）的区别：避冷按**自然日**且把冷号排到队尾 + 金额归 0；
+# 本节按**期数**，只降权不排除，且金额保留「每注最低金额」下限。
+# 三类可叠加（同一号同时命中多类时权重相乘）。
+#
+# 口径：样本内偏好，不是概率、不是收益承诺，也不承诺提高命中率。
+# --------------------------------------------------------------------------- #
+# 重号：与上期特码完全相同的号码（上期出过的号）→ 不排除，降权
+DEFAULT_REPEAT_NUMBER_WEIGHT = 0.5
+# 同肖：与上期特码同肖（不含重号本身）→ 不排除，降权
+DEFAULT_REPEAT_ZODIAC_WEIGHT = 0.8
+# 冷号（按**期数**）：本池样本内连续未出现的期数超过该阈值 → 一律降权
+DEFAULT_STALE_PERIODS = 60
+STALE_PERIODS_MIN = 1
+STALE_PERIODS_MAX = 999
+DEFAULT_STALE_WEIGHT = 0.3
+# 权重取值范围（1.0 = 不降权）
+SOFT_WEIGHT_MIN = 0.0
+SOFT_WEIGHT_MAX = 1.0
+
+# --------------------------------------------------------------------------- #
+# 角色金额配额（主推 / 次选 / 防守）
+#
+# 「均注」不再严格均分：先给每注保底 1 个注码单位（= 每注最低金额），剩余预算按
+# **角色**权重分给 主推 / 次选 / 防守 三个分组，组内再均分。
+# 默认 3 : 2 : 1 —— 主推最多、防守最低（用户口径：防守的配额低一些）。
+# 三项都填相同的值（如 1:1:1）即回到旧的「严格均分」行为。
+# 口径：样本内偏好，不是概率、不是收益承诺，也不承诺提高命中率。
+# --------------------------------------------------------------------------- #
+DEFAULT_ROLE_WEIGHT_PRIMARY = 3.0
+DEFAULT_ROLE_WEIGHT_SECONDARY = 2.0
+DEFAULT_ROLE_WEIGHT_DEFENSE = 1.0
+ROLE_WEIGHT_MIN = 0.0
+ROLE_WEIGHT_MAX = 10.0
+# 角色权重缺失 / 脏值时用的兜底（1.0 = 该角色不额外加权，不影响其它角色）
+ROLE_WEIGHT_FALLBACK = 1.0
+# 角色 → 设置项键名（落库键，英文小写下划线；见 rules/database-enums-english）
+ROLE_WEIGHT_SETTING_KEYS = {
+    ROLE_PRIMARY: "role_w_primary",
+    ROLE_SECONDARY: "role_w_secondary",
+    ROLE_DEFENSE: "role_w_defense",
+}
+
+# --------------------------------------------------------------------------- #
+# 预测波动线 + 号码点阵
+#
+# 用最近 W 期相邻差值的分布估一条「预测波动线」：中心取中位数、带宽取四分位区间
+# [P25, P75]。号码点阵 = 1..49 每个号相对最新特码的差值落在这条线（带）内的程度：
+# 带内 = 1.0（满权重），带外按离带边缘的距离衰减。
+#
+# 开启后点阵权重进入选号排序的**最前档**，因此出号优先落在预测波动带内；
+# 带内号码不足以凑满注数时才自然向带外扩散（绝不报「无号」）。
+# 口径：样本内经验分布，不是真实概率。
+# --------------------------------------------------------------------------- #
+DEFAULT_LATTICE_ENABLED = True
+DEFAULT_LATTICE_WINDOW = 30
+LATTICE_WINDOW_MIN = 0
+LATTICE_WINDOW_MAX = 500
+# 带宽分位（下/上）：0.25 / 0.75 → 覆盖近窗约一半的差值样本
+LATTICE_BAND_LOW_Q = 0.25
+LATTICE_BAND_HIGH_Q = 0.75
+# 带外衰减尺度：离带边缘 d 个号位 → 权重 1 / (1 + d / LATTICE_DECAY_SCALE)
+LATTICE_DECAY_SCALE = 6.0
 
 # 近期走势加权（软偏好）。口径：本池近 W 期经验频率，不是真实概率；
 # 回测未证实相对随机有优势 —— notes / UI 禁止写「提高命中率」。
@@ -165,8 +238,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 走势加权：默认不加权；neutral=关闭，等同旧池内排序
     "trend_bias": TREND_BIAS_NEUTRAL,
     "trend_window": DEFAULT_TREND_WINDOW,
-    # 避冷加权：默认开启；距上次出现超过 avoid_cold_days 天的号越久权重越低、
-    # 配置金额越低，最多只给「保本金额」（1 个金额最小单位）。旧数据缺失时按默认开启。
+    # 避冷加权（按**自然日**，会把冷号排到队尾 + 金额归 0）：默认关闭 ——
+    # 冷号口径已由上方「stale_periods / stale_weight」按**期数**软降权取代，
+    # 两者同时开启会对冷号双重惩罚（本项更硬）。需要旧行为时可在设置页单独打开。
     "avoid_cold_enabled": DEFAULT_AVOID_COLD_ENABLED,
     "avoid_cold_days": DEFAULT_AVOID_COLD_DAYS,
     # 选号策略与打分权重（score_top 才读权重；wave_round 忽略）
@@ -177,6 +251,23 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "score_w_diff": DEFAULT_SCORE_W_DIFF,
     # 显式标记：False = 用户从未手动设置过走势加权（含存量旧默认 hot 遗留行）
     TREND_BIAS_EXPLICIT_KEY: False,
+    # ---- 三类软降权（不排除、只降权；口径见上方常量注释）----
+    # 上期出过的号（重号）是否保留在候选池内：True = 不避开、只降权（用户口径）
+    "include_repeat_number": True,
+    # 重号（上期特码本身）：0.5 = 金额/排序权重打五折
+    "repeat_number_weight": DEFAULT_REPEAT_NUMBER_WEIGHT,
+    # 同肖（与上期同肖、非重号）
+    "repeat_zodiac_weight": DEFAULT_REPEAT_ZODIAC_WEIGHT,
+    # 冷号按**期数**：连续未出现超过该期数 → 降权
+    "stale_periods": DEFAULT_STALE_PERIODS,
+    "stale_weight": DEFAULT_STALE_WEIGHT,
+    # ---- 预测波动线 + 号码点阵（参与选号）----
+    "lattice_enabled": DEFAULT_LATTICE_ENABLED,
+    "lattice_window": DEFAULT_LATTICE_WINDOW,
+    # ---- 角色金额配额（均注模式；主推 : 次选 : 防守，默认 3:2:1）----
+    "role_w_primary": DEFAULT_ROLE_WEIGHT_PRIMARY,
+    "role_w_secondary": DEFAULT_ROLE_WEIGHT_SECONDARY,
+    "role_w_defense": DEFAULT_ROLE_WEIGHT_DEFENSE,
 }
 # 存量库里的旧字段（已降级为派生值）：只在「缺失 total_amount」时用于回退预算
 LEGACY_BET_UNIT_KEY = "bet_unit"
@@ -274,6 +365,8 @@ def clamp_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     merged["amount_unit"] = min(
         AMOUNT_UNIT_MAX, max(AMOUNT_UNIT_MIN, int(merged["amount_unit"]))
     )
+    # 注码粒度按步长（默认 5 元）向下取整：用户口径「按 5 的倍数来」
+    merged["amount_unit"] -= merged["amount_unit"] % AMOUNT_UNIT_STEP
     try:
         odds_value = float(merged["odds"])
     except (TypeError, ValueError):
@@ -341,6 +434,56 @@ def clamp_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         except (TypeError, ValueError):
             weight = float(default)
         merged[weight_key] = min(SCORE_WEIGHT_MAX, max(SCORE_WEIGHT_MIN, weight))
+
+    # 三类软降权：权重钳到 0..1（1.0 = 不降权），阈值按期数钳到 1..999
+    merged["include_repeat_number"] = coerce_bool(
+        merged.get("include_repeat_number"),
+        default=bool(DEFAULT_SETTINGS["include_repeat_number"]),
+    )
+    for weight_key, default in (
+        ("repeat_number_weight", DEFAULT_REPEAT_NUMBER_WEIGHT),
+        ("repeat_zodiac_weight", DEFAULT_REPEAT_ZODIAC_WEIGHT),
+        ("stale_weight", DEFAULT_STALE_WEIGHT),
+    ):
+        try:
+            soft = float(merged[weight_key])
+        except (TypeError, ValueError):
+            soft = float(default)
+        merged[weight_key] = min(SOFT_WEIGHT_MAX, max(SOFT_WEIGHT_MIN, soft))
+
+    try:
+        stale_periods = int(merged["stale_periods"])
+    except (TypeError, ValueError):
+        stale_periods = DEFAULT_STALE_PERIODS
+    merged["stale_periods"] = min(
+        STALE_PERIODS_MAX, max(STALE_PERIODS_MIN, stale_periods)
+    )
+
+    # 预测波动线 + 点阵：布尔开关与窗口
+    merged["lattice_enabled"] = coerce_bool(
+        merged.get("lattice_enabled"),
+        default=bool(DEFAULT_SETTINGS["lattice_enabled"]),
+    )
+    try:
+        lattice_window = int(merged["lattice_window"])
+    except (TypeError, ValueError):
+        lattice_window = DEFAULT_LATTICE_WINDOW
+    merged["lattice_window"] = min(
+        LATTICE_WINDOW_MAX, max(LATTICE_WINDOW_MIN, lattice_window)
+    )
+
+    # 角色金额配额（主推 / 次选 / 防守）：钳到 0..10，缺失 / 脏值回退为默认
+    for role_key, default in (
+        (ROLE_PRIMARY, DEFAULT_ROLE_WEIGHT_PRIMARY),
+        (ROLE_SECONDARY, DEFAULT_ROLE_WEIGHT_SECONDARY),
+        (ROLE_DEFENSE, DEFAULT_ROLE_WEIGHT_DEFENSE),
+    ):
+        setting_key = ROLE_WEIGHT_SETTING_KEYS[role_key]
+        try:
+            role_weight = float(merged[setting_key])
+        except (TypeError, ValueError):
+            role_weight = float(default)
+        merged[setting_key] = min(ROLE_WEIGHT_MAX, max(ROLE_WEIGHT_MIN, role_weight))
     return merged
 
 
@@ -446,17 +589,21 @@ def build_candidate_pools(
     normal_max: int,
     *,
     exclude_repeat_zodiac: bool = False,
+    include_repeat_number: bool = False,
 ) -> dict[str, list[dict[str, int]]]:
-    """构造三类波动候选池；始终排除最新号本身。
+    """构造三类波动候选池。
 
-    ``exclude_repeat_zodiac=True`` 时额外排除最新号的全部同肖（重肖）号码；
-    默认 False：同肖号可以入选。
+    - ``include_repeat_number=False``（默认 / 旧行为）：排除最新号本身；
+      ``True``：**保留重号**（上期特码），由软降权把它排到同类之后并压低金额 ——
+      即「上期出过的号不避开，但降权」。
+    - ``exclude_repeat_zodiac=True``：排除最新号的全部同肖（重肖）号码；
+      默认 ``False``：同肖号可以入选（只标记、不排除）。
     """
     latest_group = zodiac_group(latest)
     pools: dict[str, list[dict[str, int]]] = {wave: [] for wave in WAVE_ORDER}
 
     for number in range(NUMBER_MIN, NUMBER_MAX + 1):
-        if number == latest:
+        if number == latest and not include_repeat_number:
             continue
         if exclude_repeat_zodiac and zodiac_group(number) == latest_group:
             continue
@@ -539,6 +686,233 @@ def compute_days_since_last(
     return result
 
 
+def compute_periods_since_last(
+    history_numbers: Sequence[int],
+) -> dict[int, int | None]:
+    """本池样本内各号距最近一次出现的**期数**（最新一期 = 0 期以前）。
+
+    ``history_numbers`` 约定最新在前。返回 ``1..49 → int | None``：
+    - 本池样本内从未出现 → ``None``
+    - 最近出现在下标 ``i`` → ``i``（即「i 期前出现过」）
+
+    与 ``compute_days_since_last`` 的分工：后者按**自然日**（有日期时），
+    本函数恒按**期数**，供「连续 N 期未出现」这类按期数判定的规则使用。
+    """
+    numbers = [int(n) for n in history_numbers]
+    result: dict[int, int | None] = {
+        n: None for n in range(NUMBER_MIN, NUMBER_MAX + 1)
+    }
+    for index, number in enumerate(numbers):
+        if NUMBER_MIN <= number <= NUMBER_MAX and result[number] is None:
+            result[number] = index
+    return result
+
+
+def soft_penalty_weight(
+    number: int,
+    *,
+    latest: int,
+    periods_since_last: int | None,
+    sample_size: int,
+    repeat_number_weight: float = DEFAULT_REPEAT_NUMBER_WEIGHT,
+    repeat_zodiac_weight: float = DEFAULT_REPEAT_ZODIAC_WEIGHT,
+    stale_periods: int = DEFAULT_STALE_PERIODS,
+    stale_weight: float = DEFAULT_STALE_WEIGHT,
+) -> tuple[float, list[str]]:
+    """三类**软降权**的相乘权重与命中原因（不排除、不归零）。
+
+    - 重号（与上期特码相同）→ ``repeat_number_weight``（默认 0.5）
+    - 同肖（与上期同肖，**不含重号本身**）→ ``repeat_zodiac_weight``（默认 0.8）
+    - 冷号（**最近 ``stale_periods`` 期内没出现过**）→ ``stale_weight``（默认 0.3）
+
+    重号与同肖互斥（重号必然同肖，按重号计）。权重范围 0..1，1.0 = 不降权。
+    返回 ``(权重, 原因列表)``，原因取值为 ``repeat_number`` / ``repeat_zodiac`` / ``stale``。
+
+    **冷号判定的样本门槛**：只有 ``sample_size >= stale_periods`` 时才可能判为冷号。
+    样本不足 60 期时无法证明「60 期未出现」，一律**不降权** —— 否则样本越短
+    越多号会被误判成从未出现，规则就失去了意义。
+    """
+    reasons: list[str] = []
+    weight = 1.0
+    if int(number) == int(latest):
+        weight *= float(repeat_number_weight)
+        reasons.append("repeat_number")
+    elif zodiac_group(int(number)) == zodiac_group(int(latest)):
+        weight *= float(repeat_zodiac_weight)
+        reasons.append("repeat_zodiac")
+    stale = int(sample_size) >= int(stale_periods) and (
+        periods_since_last is None or int(periods_since_last) >= int(stale_periods)
+    )
+    if stale:
+        weight *= float(stale_weight)
+        reasons.append("stale")
+    return weight, reasons
+
+
+def _quantile(sorted_values: Sequence[float], q: float) -> float:
+    """线性插值分位数（``sorted_values`` 必须已升序、非空）。"""
+    size = len(sorted_values)
+    if size == 0:
+        return 0.0
+    if size == 1:
+        return float(sorted_values[0])
+    position = max(0.0, min(1.0, float(q))) * (size - 1)
+    lower = int(math.floor(position))
+    upper = min(lower + 1, size - 1)
+    frac = position - lower
+    return float(sorted_values[lower]) * (1.0 - frac) + float(sorted_values[upper]) * frac
+
+
+def predict_wave_band(
+    history_numbers: Iterable[int],
+    *,
+    window: int = DEFAULT_LATTICE_WINDOW,
+    small_max: int = 10,
+    normal_max: int = 30,
+) -> dict[str, Any] | None:
+    """用最近 W 期相邻差值估一条「预测波动线」。
+
+    取最近 ``window`` 期（0 = 本池全部）相邻两期的差值绝对值，按分位数给出：
+    - ``center`` = 中位数（预测波动中心）
+    - ``low`` / ``high`` = P25 / P75（预测波动带，覆盖近窗约一半差值样本）
+
+    样本不足两期时返回 ``None``（无预测，调用方须按「无预测」处理，不得编造）。
+    """
+    series = [int(n) for n in history_numbers]
+    limit = int(window or 0)
+    if limit > 0:
+        series = series[:limit]
+    if len(series) < 2:
+        return None
+    diffs = sorted(abs(series[i] - series[i - 1]) for i in range(1, len(series)))
+    if not diffs:
+        return None
+    center = _quantile(diffs, 0.5)
+    low = _quantile(diffs, LATTICE_BAND_LOW_Q)
+    high = _quantile(diffs, LATTICE_BAND_HIGH_Q)
+    center_num = int(round(center))
+    wave = classify_wave(center_num, small_max, normal_max)
+    return {
+        "window": limit,
+        "used_window": len(series) - 1,
+        "samples": len(diffs),
+        "center": round(center, 2),
+        "center_number": center_num,
+        "low": round(low, 2),
+        "high": round(high, 2),
+        "wave_type": wave,
+        "wave_label": WAVE_LABELS[wave],
+        "small_max": int(small_max),
+        "normal_max": int(normal_max),
+        "rule": (
+            f"预测波动线取最近 {len(series) - 1} 对相邻差值的分布："
+            "中心=中位数、带宽=P25~P75；这是样本内经验分布，不是真实概率。"
+        ),
+    }
+
+
+def lattice_weight(diff: int, band: dict[str, Any] | None) -> float:
+    """号码点阵权重：差值落在预测波动带内 = 1.0，带外按距离衰减。
+
+    无预测（``band is None``）时恒为 1.0，保证「关掉点阵」与旧行为一致。
+    """
+    if not band:
+        return 1.0
+    low = float(band.get("low", 0.0))
+    high = float(band.get("high", 0.0))
+    value = float(diff)
+    if low <= value <= high:
+        return 1.0
+    distance = (low - value) if value < low else (value - high)
+    return 1.0 / (1.0 + max(0.0, distance) / LATTICE_DECAY_SCALE)
+
+
+def lattice_primary_wave(
+    band: dict[str, Any] | None,
+    *,
+    small_max: int = 10,
+    normal_max: int = 30,
+) -> str | None:
+    """预测波动带**主要落在哪一类波动桶**（带内差值最多的那类）。
+
+    取号时先从该桶（``ordered_pools`` 已按点阵权重排序）取满，带内优先才成立；
+    带为空 / 无预测时返回 ``None``（调用方回退旧的「小→常→大」轮取顺序）。
+    """
+    if not band:
+        return None
+    low = int(math.floor(float(band.get("low", 0.0))))
+    high = int(math.ceil(float(band.get("high", 0.0))))
+    counts: Counter[str] = Counter()
+    for diff in range(max(0, low), high + 1):
+        counts[classify_wave(diff, small_max, normal_max)] += 1
+    if not counts:
+        return None
+    # 并列时按 WAVE_ORDER 取靠前者（小波动 → 常规 → 大跳），保证可复现
+    return max(WAVE_ORDER, key=lambda wave: (counts.get(wave, 0), -WAVE_ORDER.index(wave)))
+
+
+def build_number_lattice(
+    latest: int,
+    band: dict[str, Any] | None,
+    *,
+    small_max: int = 10,
+    normal_max: int = 30,
+) -> list[dict[str, Any]]:
+    """1..49 号码点阵：每个号的差值所属波动、点阵权重、是否落在预测波动带内。"""
+    rows: list[dict[str, Any]] = []
+    for number in range(NUMBER_MIN, NUMBER_MAX + 1):
+        diff = abs(number - int(latest))
+        wave = classify_wave(diff, small_max, normal_max)
+        in_band = bool(band and float(band["low"]) <= diff <= float(band["high"]))
+        rows.append(
+            {
+                "number": number,
+                "diff": diff,
+                "wave_type": wave,
+                "wave_label": WAVE_LABELS[wave],
+                "lattice_weight": round(lattice_weight(diff, band), 4),
+                "in_band": in_band,
+                "is_latest": number == int(latest),
+            }
+        )
+    return rows
+
+
+def apply_soft_weights(
+    amounts: list[int],
+    weights: list[float],
+    *,
+    amount_unit: int = DEFAULT_AMOUNT_UNIT,
+    min_bet_amount: int = MIN_BET_AMOUNT,
+) -> tuple[list[int], int]:
+    """按软降权权重压低各注金额（只降不升；省下的预算**不补给**其它注）。
+
+    - ``target = 原金额 × 权重``，向下取整到 ``amount_unit`` 的整数倍；
+    - 结果不低于「每注最低金额」= ``max(min_bet_amount, amount_unit)``
+      （金额必须是单位倍数，故单位大于最低金额时以单位为准）；
+    - **只降不升**：被上游压到 0 的注（如避冷封顶）不会被抬回下限；
+    - 权重 ``>= 1.0`` 的注原样保留，因此三类权重全为 1.0 时严格 no-op。
+
+    返回 ``(新金额列表, 被压低的注数)``。
+    """
+    unit = max(1, int(amount_unit))
+    floor_amount = max(int(min_bet_amount), unit)
+    out: list[int] = []
+    reduced = 0
+    for index, base in enumerate(amounts):
+        original = int(base)
+        weight = float(weights[index]) if index < len(weights) else 1.0
+        if weight >= 1.0 or original <= 0:
+            out.append(original)
+            continue
+        value = _floor_to_unit(float(original) * weight, unit)
+        value = min(original, max(floor_amount, value))
+        if value != original:
+            reduced += 1
+        out.append(value)
+    return out, reduced
+
+
 def _band_sizes(n: int) -> tuple[int, int, int]:
     """把 n 个号码尽量均分成主推 / 次选 / 防守三段（余数优先补给主推）。"""
     if n <= 0:
@@ -587,11 +961,14 @@ def split_pool_into_role_bands(
     *,
     bias: str = TREND_BIAS_NEUTRAL,
     mid_target: float = 0.0,
+    lattice_scores: dict[int, float] | None = None,
+    penalties: dict[int, float] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """同一波动桶内按**该偏好**的近窗频次切三角色带。
 
     规则（前后端一致、可解释）：
-    1. 桶内先按偏好排序键（``_band_rank_prefix``，与 ``order_pool`` 同键）排序，
+    1. 桶内先按「号码点阵 → 软降权 → 偏好排序键」排序
+       （点阵与降权传入 ``None`` 时退化为只看偏好键，与改造前逐元素一致），
        再按「与最新号差值升序 → 号码升序」回落；
     2. 连续切成三段，尺寸 ``(n+2)//3, (n+1)//3, n//3``；
     3. **主推** = 该偏好最靠前的一段，**次选** = 中段，**防守** = 最靠后的一段。
@@ -607,15 +984,27 @@ def split_pool_into_role_bands(
     近窗 count=0 的号额外带 ``days_since_last``（样本内距上次出现自然日；
     从未出现为 null）。
     """
+    lattice_map = lattice_scores or {}
+    penalty_map = penalties or {}
+
+    def rank_key(item: dict[str, int]) -> tuple:
+        number = item["number"]
+        lead: tuple = ()
+        if lattice_scores is not None:
+            lead += (-float(lattice_map.get(number, 1.0)),)
+        if penalties is not None:
+            lead += (-float(penalty_map.get(number, 1.0)),)
+        return (*lead, *_band_rank_prefix(
+            number,
+            bias=bias,
+            trend_counts=trend_counts,
+            mid_target=mid_target,
+        ))
+
     ranked = sorted(
         pool,
         key=lambda item: (
-            *_band_rank_prefix(
-                item["number"],
-                bias=bias,
-                trend_counts=trend_counts,
-                mid_target=mid_target,
-            ),
+            *rank_key(item),
             item["diff"],
             item["number"],
         ),
@@ -676,6 +1065,8 @@ def build_trend_distributions(
     bias: str,
     days_since_last: dict[int, int | None] | None = None,
     mid_target: float = 0.0,
+    lattice_scores: dict[int, float] | None = None,
+    penalties: dict[int, float] | None = None,
 ) -> dict[str, Any]:
     """结构化「波动 × 角色」走势分布参考（供 UI 分块展示）。
 
@@ -690,6 +1081,8 @@ def build_trend_distributions(
             days_since_last,
             bias=bias,
             mid_target=mid_target,
+            lattice_scores=lattice_scores,
+            penalties=penalties,
         )
         waves[wave] = {
             "type": wave,
@@ -740,26 +1133,40 @@ def order_pool(
     avoid_cold_enabled: bool = False,
     avoid_cold_days: int = DEFAULT_AVOID_COLD_DAYS,
     days_since_last: dict[int, int | None] | None = None,
+    lattice_scores: dict[int, float] | None = None,
+    penalties: dict[int, float] | None = None,
 ) -> list[dict[str, int]]:
     """池内排序。
 
-    ``neutral``：先取全历史遗漏最久（出现少），再取差值最小 —— 旧行为。
-    非 ``neutral``：先按近窗频次偏好（热/冷/中频），再回落旧键。
+    排序键由前到后（越靠前越优先被取到）：
 
-    避冷加权（``avoid_cold_enabled``，与 ``trend_bias`` **互相独立**）：
-    开启时在排序键最前面加一档「冷号标记」，把 ``days_since_last`` 超过
-    ``avoid_cold_days``（含样本内从未出现 = ``None``）的号码整体排到队列**末尾**，
-    让非冷号优先被取到。冷号始终留在池内（不删除），因此某桶全是冷号时
-    仍能正常取号，不会少出号。关闭时（默认参数）排序与改造前逐元素一致。
+    1. **号码点阵**（``lattice_scores``）：落在预测波动带内的号（权重 1.0）排最前，
+       带外按距离衰减 —— 开启后「出号优先落在预测波动线上」。
+    2. **软降权**（``penalties``）：重号 / 同肖 / 冷号的权重越小越靠后
+       （不排除，只是排到同类之后）。
+    3. **避冷加权**（``avoid_cold_enabled``）：把 ``days_since_last`` 超过
+       ``avoid_cold_days``（含从未出现 = ``None``）的号整体排到队列末尾。
+    4. 走势偏好（``trend_bias``）：``neutral`` 时为全历史遗漏优先（旧行为）。
+    5. 回落键：``(出现次数, 差值, 号码)``。
+
+    点阵与降权传入 ``None`` 时不参与排序（严格保持旧行为）。
     """
     counts = trend_counts or Counter()
     bias = trend_bias if trend_bias in TREND_BIASES else TREND_BIAS_NEUTRAL
     cold_enabled = bool(avoid_cold_enabled)
     cold_limit = _clamp_avoid_cold_days(avoid_cold_days)
     days_map = days_since_last or {}
+    lattice_map = lattice_scores or {}
+    penalty_map = penalties or {}
 
     def sort_key(item: dict[str, int]) -> tuple:
         number = item["number"]
+        lattice_prefix: tuple = ()
+        if lattice_scores is not None:
+            lattice_prefix = (-float(lattice_map.get(number, 1.0)),)
+        penalty_prefix: tuple = ()
+        if penalties is not None:
+            penalty_prefix = (-float(penalty_map.get(number, 1.0)),)
         cold_prefix: tuple = ()
         if cold_enabled:
             cold_prefix = (
@@ -780,7 +1187,7 @@ def order_pool(
             item["diff"],
             item["number"],
         )
-        return (*cold_prefix, *prefix, *baseline)
+        return (*lattice_prefix, *penalty_prefix, *cold_prefix, *prefix, *baseline)
 
     return sorted(pool, key=sort_key)
 
@@ -966,6 +1373,104 @@ def _distribute_units_weighted(units: int, count: int) -> list[int]:
     return [primary] + _distribute_units_even(remaining, others)
 
 
+def role_amount_weights(cfg: dict[str, Any] | None) -> dict[str, float]:
+    """从配置取「角色金额配额」：主推 / 次选 / 防守（缺失 / 脏值回退默认 3:2:1）。"""
+    raw = cfg if isinstance(cfg, dict) else {}
+    weights: dict[str, float] = {}
+    for role, setting_key in ROLE_WEIGHT_SETTING_KEYS.items():
+        default = float(DEFAULT_SETTINGS[setting_key])
+        try:
+            value = float(raw.get(setting_key, default))
+        except (TypeError, ValueError):
+            value = default
+        weights[role] = min(ROLE_WEIGHT_MAX, max(ROLE_WEIGHT_MIN, value))
+    return weights
+
+
+def role_weights_are_uniform(weights: Mapping[str, float] | None) -> bool:
+    """三个角色权重是否完全相同；相同 = 退化回旧的「严格均分」。"""
+    if not weights:
+        return True
+    values = [float(weights.get(role, ROLE_WEIGHT_FALLBACK)) for role in ROLE_ORDER]
+    return all(value == values[0] for value in values)
+
+
+def _format_weight(value: float) -> str:
+    """角色权重展示：整数不显示小数点（3.0 → ``3``，2.5 → ``2.5``）。"""
+    return f"{float(value):g}"
+
+
+def distribute_units_by_role(
+    units: int, roles: Sequence[str], weights: Mapping[str, float] | None
+) -> list[int]:
+    """按角色配额把 ``units`` 个筹码分到各注（主推 / 次选 / 防守）。
+
+    流程：
+      1. 每注先保底 1 个单位（= 每注最低金额），预算覆盖不了的尾注不输出；
+      2. 余量按**角色**权重（不是按注数）分给三个角色分组 —— 默认 3:2:1，
+         因此防守组整体分到的余量最少（用户口径：防守的配额低一些）；
+      3. 组内再按注数均分。
+
+    权重全相同（或 ``None``）时直接走 ``_distribute_units_even``：保证
+    「1:1:1」与旧版均注**逐注完全一致**，不会因为分组顺序改变结果。
+
+    注意：预算刚好等于「每注最低金额 × 注数」时余量为 0，此时角色配额不产生差异。
+    """
+    roles = list(roles)
+    count = len(roles)
+    units = max(0, int(units))
+    if count <= 0 or units <= 0:
+        return []
+    note_count = min(count, units)
+    if weights is None or role_weights_are_uniform(weights):
+        return _distribute_units_even(units, note_count)
+
+    note_units = [1] * note_count
+    extra = units - note_count  # 保底之后可自由分配的余量
+    if extra <= 0:
+        return note_units
+
+    # 用到的角色（按首次出现顺序）及其成员下标
+    used_roles: list[str] = []
+    members: dict[str, list[int]] = {}
+    for index, role in enumerate(roles[:note_count]):
+        if role not in members:
+            members[role] = []
+            used_roles.append(role)
+        members[role].append(index)
+
+    group_weights: list[float] = []
+    for role in used_roles:
+        try:
+            value = float(weights.get(role, ROLE_WEIGHT_FALLBACK))
+        except (TypeError, ValueError):
+            value = ROLE_WEIGHT_FALLBACK
+        group_weights.append(max(ROLE_WEIGHT_MIN, value))
+
+    total_weight = sum(group_weights)
+    if total_weight <= 0:
+        shares = _distribute_units_even(extra, len(used_roles))
+    else:
+        quotas = [extra * weight / total_weight for weight in group_weights]
+        shares = [int(quota) for quota in quotas]  # 向下取整
+        leftover = extra - sum(shares)
+        # 最大余数法：余量补给小数部分最大的组，平手按角色出现顺序
+        order = sorted(
+            range(len(used_roles)),
+            key=lambda i: (-(quotas[i] - shares[i]), i),
+        )
+        for i in order[:leftover]:
+            shares[i] += 1
+
+    for role, share in zip(used_roles, shares):
+        group = members[role]
+        for index, part in zip(
+            group, _distribute_units_even(len(group) + share, len(group))
+        ):
+            note_units[index] = part
+    return note_units
+
+
 def allocate_amounts(
     mode: str,
     roles: list[str],
@@ -973,12 +1478,16 @@ def allocate_amounts(
     *,
     amount_unit: int = DEFAULT_AMOUNT_UNIT,
     seed: Any = None,
+    role_weights: Mapping[str, float] | None = None,
 ) -> list[int]:
     """按筹码模式把最大投注分配到各号上（统一以 ``amount_unit`` 为注码粒度）。
 
     流程：``units = total // amount_unit`` → 按模式分单位 → 每注金额 = 单位数 × unit。
     每注金额必为 unit 的正整数倍且 ≥ 1 个单位；最大投注不足覆盖全部注数时少输出注数
     （与 ``random_amounts`` 一致，不产出 0 元注）。
+
+    ``even`` 模式按 ``role_weights`` 做角色配额（主推 > 次选 > 防守；默认 3:2:1），
+    权重全相同即回到严格均分；``weighted`` 仍是旧的「主推约占 4/6」。
     """
     if not roles:
         return []
@@ -1000,7 +1509,7 @@ def allocate_amounts(
     if mode == MODE_WEIGHTED:
         parts = _distribute_units_weighted(units_total, count)
     else:
-        parts = _distribute_units_even(units_total, count)
+        parts = distribute_units_by_role(units_total, roles, role_weights)
     return [part * unit for part in parts]
 
 
@@ -1284,8 +1793,15 @@ def select_score_top_candidates(
     mid_target: float,
     days_since_last: dict[int, int | None] | None,
     weights: dict[str, float],
+    lattice_scores: dict[int, float] | None = None,
+    penalties: dict[int, float] | None = None,
 ) -> list[dict[str, Any]]:
-    """从三类波动池打分，取分数最高的 ``pick_count`` 个（稳定排序）。"""
+    """从三类波动池打分，取分数最高的 ``pick_count`` 个（稳定排序）。
+
+    ``lattice_scores`` / ``penalties`` 非空时按**乘数**作用于分数
+    （点阵带内 ×1.0、软降权重号 ×0.5 …），与 ``wave_round`` 路径的
+    「点阵优先 → 降权靠后」口径一致；为 ``None`` 时与改造前逐元素一致。
+    """
     scored: list[tuple[float, int, int, str, dict[str, int]]] = []
     for wave in WAVE_ORDER:
         for item in pools.get(wave) or []:
@@ -1301,6 +1817,10 @@ def select_score_top_candidates(
                 days_since_last=days_since_last,
                 weights=weights,
             )
+            if lattice_scores is not None:
+                points *= float(lattice_scores.get(number, 1.0))
+            if penalties is not None:
+                points *= float(penalties.get(number, 1.0))
             # 分数降序；平手按 diff、number 升序，保证可复现
             scored.append((points, -diff, -number, wave, item))
     scored.sort(reverse=True)
@@ -1413,6 +1933,65 @@ def recommend(
         history, trend_window
     )
     days_since_last = compute_days_since_last(history, dates_list)
+    # 三类软降权（重号 / 同肖 / 按期数冷号）：不排除，只降权（排序靠后 + 金额打折）
+    periods_since_last = compute_periods_since_last(history)
+    repeat_number_weight = float(cfg["repeat_number_weight"])
+    repeat_zodiac_weight = float(cfg["repeat_zodiac_weight"])
+    stale_periods = int(cfg["stale_periods"])
+    stale_weight = float(cfg["stale_weight"])
+
+    def soft_weight(number: int) -> tuple[float, list[str]]:
+        return soft_penalty_weight(
+            int(number),
+            latest=int(latest),
+            periods_since_last=periods_since_last.get(int(number)),
+            sample_size=len(history),
+            repeat_number_weight=repeat_number_weight,
+            repeat_zodiac_weight=repeat_zodiac_weight,
+            stale_periods=stale_periods,
+            stale_weight=stale_weight,
+        )
+
+    soft_weights: dict[int, float] = {}
+    soft_reasons: dict[int, list[str]] = {}
+    for number in range(NUMBER_MIN, NUMBER_MAX + 1):
+        value, why = soft_weight(number)
+        soft_weights[number] = round(value, 6)
+        soft_reasons[number] = why
+
+    # 预测波动线 + 号码点阵（开启后参与选号：带内优先）
+    lattice_enabled = bool(cfg["lattice_enabled"])
+    lattice_band = (
+        predict_wave_band(
+            history,
+            window=int(cfg["lattice_window"]),
+            small_max=cfg["small_max"],
+            normal_max=cfg["normal_max"],
+        )
+        if lattice_enabled
+        else None
+    )
+    lattice_rows = build_number_lattice(
+        latest,
+        lattice_band,
+        small_max=cfg["small_max"],
+        normal_max=cfg["normal_max"],
+    )
+    lattice_scores: dict[int, float] | None = (
+        {row["number"]: float(row["lattice_weight"]) for row in lattice_rows}
+        if lattice_enabled
+        else None
+    )
+    # 「预测波动桶」：点阵开启时先在它里面取满（带内优先），不足才向其余桶扩散
+    lattice_primary = (
+        lattice_primary_wave(
+            lattice_band,
+            small_max=cfg["small_max"],
+            normal_max=cfg["normal_max"],
+        )
+        if lattice_enabled
+        else None
+    )
     # 避冷加权（选号排后 + 金额封顶）总开关；与 trend_bias 完全独立，关闭 = 旧行为
     cold_enabled = bool(cfg["avoid_cold_enabled"])
     cold_days = int(cfg["avoid_cold_days"])
@@ -1437,6 +2016,8 @@ def recommend(
         cfg["small_max"],
         cfg["normal_max"],
         exclude_repeat_zodiac=bool(cfg["exclude_repeat_zodiac"]),
+        # 上期出过的号不避开（由软降权排后 + 压金额），所以候选池保留重号
+        include_repeat_number=bool(cfg["include_repeat_number"]),
     )
 
     # 上期波动类型 → 本期侧重顺序
@@ -1463,6 +2044,8 @@ def recommend(
         bias=trend_bias,
         days_since_last=days_since_last,
         mid_target=mid_target,
+        lattice_scores=lattice_scores,
+        penalties=soft_weights,
     )
     wave_bands = {
         wave: split_pool_into_role_bands(
@@ -1474,6 +2057,9 @@ def recommend(
             # mid→最接近中频段主推；neutral 不消费角色带（走 ordered_pools）
             bias=trend_bias,
             mid_target=mid_target,
+            # 点阵与软降权同键前缀：角色带与池内排序口径一致
+            lattice_scores=lattice_scores,
+            penalties=soft_weights,
         )
         for wave in WAVE_ORDER
     }
@@ -1489,6 +2075,9 @@ def recommend(
             avoid_cold_enabled=cold_enabled,
             avoid_cold_days=cold_days,
             days_since_last=days_since_last,
+            # 点阵（带内优先）在最前，软降权（重号/同肖/冷号）紧随其后
+            lattice_scores=lattice_scores,
+            penalties=soft_weights,
         )
         for w in WAVE_ORDER
     }
@@ -1546,6 +2135,8 @@ def recommend(
             mid_target=mid_target,
             days_since_last=days_since_last,
             weights=score_weights,
+            lattice_scores=lattice_scores,
+            penalties=soft_weights,
         ):
             wave = str(selected["wave_type"])
             _annex_pick(
@@ -1555,60 +2146,76 @@ def recommend(
             )
     else:
 
-        def _take_for_wave(wave: str) -> bool:
-            """从该波动桶取一个号。加权开启时优先走侧重角色对应的频次带。"""
+        def _take_one(wave: str, preferred_role: str | None = None) -> bool:
+            """从该波动桶取一个号（返回是否取到）。
+
+            ``trend_bias`` 关闭时直接取池内第一个（池已按「点阵 → 软降权 → 遗漏」排好）；
+            开启时优先走指定角色对应的频次带，带内无可取号才回退池首。
+            """
             if not ordered_pools[wave]:
                 return False
             if trend_bias == TREND_BIAS_NEUTRAL:
-                item = ordered_pools[wave][0]
-                _annex_pick(wave, item)
+                _annex_pick(wave, ordered_pools[wave][0])
                 return True
-            preferred = role_for_focus_rank(focus.index(wave))
+            role = (
+                preferred_role
+                if preferred_role
+                else role_for_focus_rank(focus.index(wave))
+            )
             band_item = take_from_role_band(
-                wave_bands[wave], preferred, used_numbers, is_cold=cold_predicate
+                wave_bands[wave], role, used_numbers, is_cold=cold_predicate
             )
             if band_item is None:
-                item = ordered_pools[wave][0]
-                _annex_pick(wave, item)
+                _annex_pick(wave, ordered_pools[wave][0])
                 return True
             _annex_pick(wave, band_item)
             return True
 
-        # 决策 1：候选选取固定按 WAVE_ORDER（小波动 → 常规波动 → 大跳）逐类取一个，
-        # 与侧重/回补顺序解耦；侧重顺序只用于角色分配，以及加权时的角色带映射。
-        for wave in WAVE_ORDER:
-            if len(picks) >= pick_count:
-                break
-            _take_for_wave(wave)
+        # 「预测波动桶」：点阵开启时先在该桶内取满（带内优先），不足才向其余桶扩散；
+        # 关闭点阵 / 无预测时为 None → 完全走旧的「小→常→大」轮取（旧行为）。
+        wave_pass_order = (
+            [lattice_primary]
+            + [wave for wave in WAVE_ORDER if wave != lattice_primary]
+            if lattice_primary
+            else list(WAVE_ORDER)
+        )
 
-        # 决策 2：某类无解导致不足注数时，从仍有候选的池中补齐（允许同类多取）
-        for wave in WAVE_ORDER:
-            if len(picks) >= pick_count:
-                break
-            while len(picks) < pick_count and ordered_pools[wave]:
-                # 补齐时按「即将落到的角色顺位」偏好对应频次带
-                preferred = assign_roles(pick_count)[len(picks)]
-                if trend_bias == TREND_BIAS_NEUTRAL:
-                    _annex_pick(wave, ordered_pools[wave][0])
-                else:
-                    band_item = take_from_role_band(
-                        wave_bands[wave], preferred, used_numbers, is_cold=cold_predicate
-                    )
-                    if band_item is None:
-                        _annex_pick(wave, ordered_pools[wave][0])
-                    else:
-                        _annex_pick(wave, band_item)
+        if lattice_primary is not None:
+            # 点阵路径：先在预测波动桶取满，再按 wave_pass_order 向其余波动桶扩散。
+            # 桶内已按点阵权重降序，因此带内号码先被取到。
+            for wave in wave_pass_order:
+                while len(picks) < pick_count:
+                    role = assign_roles(pick_count)[len(picks)]
+                    if not _take_one(wave, role):
+                        break
+        else:
+            # 决策 1：候选选取固定按 WAVE_ORDER（小波动 → 常规波动 → 大跳）逐类取一个，
+            # 与侧重/回补顺序解耦；侧重顺序只用于角色分配，以及加权时的角色带映射。
+            for wave in WAVE_ORDER:
+                if len(picks) >= pick_count:
+                    break
+                _take_one(wave)
+
+            # 决策 2：某类无解导致不足注数时，从仍有候选的池中补齐（允许同类多取）
+            for wave in WAVE_ORDER:
+                if len(picks) >= pick_count:
+                    break
+                while len(picks) < pick_count and ordered_pools[wave]:
+                    # 补齐时按「即将落到的角色顺位」偏好对应频次带
+                    _take_one(wave, assign_roles(pick_count)[len(picks)])
 
     # 角色按侧重顺序分配 —— 在侧重顺序中出现越靠前的波动类型越优先，
     # 依次获得 主推 / 次选 / 防守…（focus 恒含全部三类波动）。
     picks.sort(key=lambda pick: focus.index(pick["wave_type"]))
     roles = assign_roles(len(picks))
+    role_weights = role_amount_weights(cfg)
     amounts = allocate_amounts(
         mode,
         roles,
         total,
         amount_unit=cfg["amount_unit"],
         seed=seed_key,
+        role_weights=role_weights,
     )
 
     # 避冷加权：把「距上次出现超过阈值」的注金额压低（选号排后已在 order_pool /
@@ -1627,17 +2234,58 @@ def recommend(
         amounts, cold_reduced_count = apply_avoid_cold_amounts(
             amounts, cold_weights, amount_unit=cfg["amount_unit"]
         )
+    # 三类软降权：金额按权重打折（重号 0.5 / 同肖 0.8 / 冷号 0.3），
+    # 下限为「每注最低金额」5 元；省下的预算**不补给**其它注。
+    pick_soft_weights = [
+        float(soft_weights.get(int(pick["number"]), 1.0)) for pick in picks
+    ]
+    cold_staked_total = sum(int(amount) for amount in amounts)
+    # 软降权前的金额快照（用于逐注判断「金额是否真的被压低」，见 amount_reduced）
+    budget_before_soft = list(amounts)
+    amounts, soft_reduced_count = apply_soft_weights(
+        amounts,
+        pick_soft_weights,
+        amount_unit=cfg["amount_unit"],
+        min_bet_amount=MIN_BET_AMOUNT,
+    )
     staked_total = sum(int(amount) for amount in amounts)
 
     for index, (pick, role, amount) in enumerate(zip(picks, roles, amounts)):
         cold_weight = cold_weights[index] if index < len(cold_weights) else 1.0
+        number = int(pick["number"])
+        reasons = soft_reasons.get(number, [])
+        soft_weight_value = pick_soft_weights[index] if index < len(pick_soft_weights) else 1.0
+        periods = periods_since_last.get(number)
         pick["role"] = role
         pick["role_label"] = ROLE_LABELS[role]
         pick["amount"] = amount
         pick["wave_label"] = WAVE_LABELS[pick["wave_type"]]
-        pick["is_repeat_zodiac"] = zodiac_group(pick["number"]) == zodiac_group(latest)
+        # 三类软降权标记（用户要求：不排除，只在推荐结果里明确标出来）
+        pick["is_repeat_number"] = number == int(latest)
+        pick["is_repeat_zodiac"] = bool(
+            number != int(latest) and zodiac_group(number) == zodiac_group(latest)
+        )
+        pick["is_stale"] = "stale" in reasons
+        pick["periods_since_last"] = periods
+        pick["soft_weight"] = round(float(soft_weight_value), 4)
+        pick["soft_reasons"] = list(reasons)
+        # soft_penalized = 命中了哪条降权规则（与金额是否真的降下来无关）；
+        # amount_reduced = 这一注的金额**确实**被压低了（受每注最低金额下限保护时会是 False）
+        pick["soft_penalized"] = bool(soft_weight_value < 1.0)
+        pick["amount_reduced"] = bool(
+            amount < (budget_before_soft[index] if index < len(budget_before_soft) else amount)
+        )
+        # 号码点阵：该注落在预测波动带内的程度（开启点阵时才有意义）
+        pick["lattice_weight"] = round(
+            float(lattice_scores.get(number, 1.0)) if lattice_scores else 1.0, 4
+        )
+        pick["in_lattice_band"] = bool(
+            lattice_enabled
+            and lattice_band
+            and float(lattice_band["low"]) <= int(pick["diff"]) <= float(lattice_band["high"])
+        )
         # 避冷加权附加字段（只增不改）：距上次出现自然日 / 是否被压低 / 权重
-        pick["days_since_last"] = days_since_last.get(int(pick["number"]))
+        pick["days_since_last"] = days_since_last.get(number)
         pick["avoid_cold_penalized"] = bool(cold_enabled and cold_weight < 1.0)
         pick["avoid_cold_weight"] = round(float(cold_weight), 4)
 
@@ -1702,6 +2350,67 @@ def recommend(
             "避冷加权已关闭：距上次出现多久都不影响选号与金额（旧行为）。"
         )
 
+    # 三类软降权：如实说明口径（不排除、只降权），不做任何收益承诺
+    notes.append(
+        f"重号/同肖/冷号软降权已生效：上期特码 {latest} 本身（重号）金额与排序权重 ×"
+        f"{repeat_number_weight}；与上期同肖但不等于上期特码的号（同肖）×"
+        f"{repeat_zodiac_weight}；本池样本内连续 {stale_periods} 期以上未出现的号（冷号）×"
+        f"{stale_weight}。三类都不排除，只是排到同类之后并压低金额；"
+        f"若被选中会在号码上分别标注「重号」「同肖」「冷号」。"
+    )
+    if soft_reduced_count:
+        notes.append(
+            f"软降权金额打折：{soft_reduced_count} 注按权重压低了金额，"
+            f"下限为每注 {MIN_BET_AMOUNT} 元的金额下限；"
+            f"省下的 {budget_total - staked_total} 元不补给其它注。"
+        )
+
+    # 角色金额配额（均注模式）：说明主推/次选/防守的分配口径
+    if mode == MODE_EVEN and not role_weights_are_uniform(role_weights):
+        role_text = "、".join(
+            f"{ROLE_LABELS[role]} {_format_weight(role_weights[role])}"
+            for role in ROLE_ORDER
+        )
+        notes.append(
+            f"金额已按角色配额分配（{role_text}）：先给每注保底 {MIN_BET_AMOUNT} 元"
+            f"（1 个注码单位），剩余预算按角色分给主推/次选/防守三组，组内再均分 —— "
+            "因此防守组拿到的余量最少。这是样本内偏好，不是概率，也不承诺提高命中率。"
+        )
+        if sum(int(amount) for amount in amounts) <= MIN_BET_AMOUNT * len(amounts):
+            notes.append(
+                f"注意：本次预算 {total} 元刚好等于「每注最低 {MIN_BET_AMOUNT} 元 × "
+                f"{len(amounts)} 注」，没有余量可分配，角色配额未产生任何金额差异；"
+                "想拉开主推/防守的差距，请调高最大投注金额或减少注数。"
+            )
+    elif mode == MODE_EVEN:
+        notes.append(
+            "角色配额为 1:1:1（主推=次选=防守），金额按注数严格均分（旧行为）。"
+        )
+
+    # 预测波动线 + 号码点阵：说明口径（样本内经验分布，不是概率）
+    if lattice_enabled and lattice_band:
+        notes.append(
+            f"预测波动线已开启（最近 {lattice_band['used_window']} 对相邻差值）："
+            f"中心 {lattice_band['center']}（{lattice_band['wave_label']}）、"
+            f"带宽 {lattice_band['low']}~{lattice_band['high']}；"
+            "号码点阵按「与最新特码的差值落在这条线内的程度」铺权重，"
+            "选号先在预测波动桶"
+            f"（{WAVE_LABELS[lattice_primary] if lattice_primary else '无'}）内取满，"
+            "带内不够时才向带外扩散（不会因此少出号）。"
+            "这是样本内经验分布，不是真实概率，也不承诺提高命中率。"
+        )
+        notes.append(
+            "排序优先级：号码点阵（带内优先）> 三类软降权（重号/同肖/冷号）。"
+            "也就是说带外的新号排在带内的冷号之后 —— 若预测波动带内冷号偏多，"
+            "本期就会较多压在冷号上，金额按冷号权重打折。"
+        )
+    elif lattice_enabled:
+        notes.append(
+            "数据不足：样本不足两对相邻差值，本期无预测波动线，号码点阵不参与选号。"
+        )
+    else:
+        notes.append("预测波动线与号码点阵已关闭：选号不受波动带影响（旧行为）。")
+
     if pick_strategy == PICK_STRATEGY_SCORE_TOP:
         notes.append(
             "选号策略为打分 Top-N：在候选池内按侧重波段、中频接近度、遗漏与差值综合打分后取前 N 注；"
@@ -1709,7 +2418,8 @@ def recommend(
         )
     else:
         notes.append(
-            "选号策略为波动轮取：先按小/常/大跳各取一注，不足再按波动桶补齐（旧行为）。"
+            "选号策略为波动轮取：点阵开启时先在预测波动桶内取满再向其余桶扩散；"
+            "点阵关闭时为旧的「小/常/大跳各取一注，不足再按波动桶补齐」。"
         )
 
     # 派生展示值（deprecated）：均分后再向下对齐到 amount_unit
@@ -1749,7 +2459,57 @@ def recommend(
             "cap_amount": cfg["amount_unit"],
             "penalized_picks": cold_reduced_count,
             "budget_total": budget_total,
-            "reduced_total": budget_total - staked_total,
+            "reduced_total": budget_total - cold_staked_total,
+        },
+        # 三类软降权本次的生效摘要（不排除、只降权）
+        "soft_weights": {
+            "repeat_number_weight": repeat_number_weight,
+            "repeat_zodiac_weight": repeat_zodiac_weight,
+            "stale_periods": stale_periods,
+            "stale_weight": stale_weight,
+            "min_bet_amount": MIN_BET_AMOUNT,
+            "penalized_picks": soft_reduced_count,
+            "reduced_total": cold_staked_total - staked_total,
+            "repeat_number_picks": [
+                int(p["number"]) for p in picks if p.get("is_repeat_number")
+            ],
+            "repeat_zodiac_picks": [
+                int(p["number"]) for p in picks if p.get("is_repeat_zodiac")
+            ],
+            "stale_picks": [int(p["number"]) for p in picks if p.get("is_stale")],
+        },
+        # 角色金额配额（均注模式）：主推 / 次选 / 防守三组的权重与实际合计金额
+        "role_quota": {
+            "mode": mode,
+            "applied": bool(mode == MODE_EVEN and not role_weights_are_uniform(role_weights)),
+            "weights": {
+                role: round(float(role_weights[role]), 4) for role in ROLE_ORDER
+            },
+            "labels": {role: ROLE_LABELS[role] for role in ROLE_ORDER},
+            "totals": {
+                role: sum(
+                    int(amount)
+                    for pick, amount in zip(picks, amounts)
+                    if pick.get("role") == role
+                )
+                for role in ROLE_ORDER
+            },
+            "counts": {
+                role: sum(1 for pick in picks if pick.get("role") == role)
+                for role in ROLE_ORDER
+            },
+        },
+        # 预测波动线 + 号码点阵（点阵覆盖 1..49，供前端画点阵）
+        "lattice": {
+            "enabled": lattice_enabled,
+            "window": int(cfg["lattice_window"]),
+            "band": lattice_band,
+            # 本期主要取号区间所在波动桶（带内优先取号用）；无预测时为 null
+            "primary_wave": lattice_primary,
+            "primary_wave_label": (
+                WAVE_LABELS[lattice_primary] if lattice_primary else None
+            ),
+            "numbers": lattice_rows,
         },
         "focus_order": [{"type": w, "label": WAVE_LABELS[w]} for w in focus],
         "picks": picks,

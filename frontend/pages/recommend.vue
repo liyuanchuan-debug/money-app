@@ -2,12 +2,18 @@
 import type { DrawItem } from '~/composables/useApi'
 import {
   CHIP_MODE_OPTIONS,
+  MIN_BET_AMOUNT,
+  SOFT_REASON_LABELS,
+  TOTAL_AMOUNT_MAX,
   TREND_BIAS_OPTIONS,
   TREND_WINDOW_DEFAULT,
   TREND_WINDOW_OPTIONS,
   avoidColdDaysText,
   avoidColdWeightText,
+  periodsSinceLastText,
+  softWeightText,
   type ChipMode,
+  type Pick,
   type RecommendResult,
   type TrendBias,
   type TrendNumberStat,
@@ -40,7 +46,7 @@ const BET_COUNT_MAX = 10
 /** 临时预览用的筹码模式：初值仍来自设置页保存的默认值 */
 const mode = ref<ChipMode>('even')
 /** 临时预览：注数（默认跟设置 pick_count；本页切换不写库，经 bet_count 传给 recommend） */
-const betCount = ref(6)
+const betCount = ref(10)
 /**
  * 临时预览：走势加权（默认跟设置走；本页切换不写库）。
  * 设置页读取口径：没手动设置过就是「不加权」（neutral），所以这里默认也是 neutral。
@@ -242,6 +248,59 @@ function trendChipSub(item: TrendNumberStat): string {
   if ((item.count ?? 0) > 0) return `${item.count}次`
   if (item.days_since_last == null) return '未出'
   return `0·${item.days_since_last}天`
+}
+
+/* ---------------------------------------------------------------------- */
+/* 三类软降权徽章：重号 / 同肖 / 冷号（不排除号码，只降权 + 打标）           */
+/* ---------------------------------------------------------------------- */
+
+/** 徽章色调：英文码 → StatChip tone（重号=暖红、同肖=琥珀、冷号=冷色） */
+const SOFT_REASON_TONES: Record<string, 'bloom' | 'amber' | 'aqua'> = {
+  repeat_number: 'bloom',
+  repeat_zodiac: 'amber',
+  stale: 'aqua',
+}
+
+/**
+ * 本注命中的软降权标记。
+ * 口径由后端判定（repeat_number / repeat_zodiac / stale），这里只做展示过滤，
+ * 前端不重复判定，避免与后端口径打架。
+ */
+function pickSoftReasons(pick: Pick): string[] {
+  const reasons = pick.soft_reasons ?? []
+  return reasons.filter(reason => reason in SOFT_REASON_LABELS)
+}
+
+/** 三类软降权本次生效摘要（旧后端缺字段 → null，照实不展示） */
+const softSummary = computed(() => result.value?.soft_weights ?? null)
+
+/* ---------------------------------------------------------------------- */
+/* 预测波动线 · 1~49 号码点阵                                              */
+/* ---------------------------------------------------------------------- */
+
+/** 点阵块（仅展示；enabled=false 时只画不带内优先） */
+const lattice = computed(() => result.value?.lattice ?? null)
+/** 预测波动线：中心=中位数、带宽=P25~P75；样本不足 → null（不编造） */
+const latticeBand = computed(() => lattice.value?.band ?? null)
+/** 1~49 全号点阵（后端按号码升序返回，照原顺序渲染） */
+const latticeNumbers = computed(() => lattice.value?.numbers ?? [])
+/** 落在预测带内的号数（带内 / 合计分开计数，如实展示） */
+const inBandCount = computed(() => latticeNumbers.value.filter(cell => cell.in_band).length)
+/** 本期推荐号码集合（点阵上打标用；不参与任何选号判定） */
+const pickedNumbers = computed(
+  () => new Set((result.value?.picks ?? []).map(pick => pick.number)))
+/** 本期推荐里落在预测带内的注数 */
+const pickedInBandCount = computed(
+  () => (result.value?.picks ?? []).filter(pick => pick.in_lattice_band).length)
+
+/**
+ * 点阵单元格透明度：带内 lattice_weight=1.0 最实，带外按距离衰减变淡。
+ * 只影响观感，不改变任何口径。
+ */
+function latticeCellStyle(cell: { lattice_weight?: number }): Record<string, string> {
+  const weight = cell.lattice_weight ?? 1
+  const opacity = 0.4 + Math.max(0, Math.min(1, weight)) * 0.6
+  return { opacity: opacity.toFixed(2) }
 }
 
 /**
@@ -592,6 +651,9 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               <StatChip tone="aqua" size="sm">模式：{{ result.mode_label }}</StatChip>
               <StatChip tone="nebula" size="sm">最大投注金额 {{ result.total_amount }} 元</StatChip>
               <StatChip tone="neutral" size="sm">金额最小单位 {{ result.amount_unit }} 元</StatChip>
+              <StatChip tone="neutral" size="sm">
+                每注最低 {{ MIN_BET_AMOUNT }} 元 · 上限 {{ TOTAL_AMOUNT_MAX }} 元 · 最多 {{ BET_COUNT_MAX }} 注
+              </StatChip>
               <StatChip v-if="avoidColdActive" tone="amber" size="sm">
                 避冷加权后实投 {{ stakedTotal }} 元（省下 {{ result.avoid_cold?.reduced_total ?? 0 }} 元未再分配）
               </StatChip>
@@ -624,6 +686,29 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               class="text-xs leading-relaxed text-slate-500"
             >
               避冷加权已关闭：距上次出现多久都不影响选号与金额（可在设置页开启）。
+            </p>
+
+            <!-- 三类软降权（重号 / 同肖 / 冷号）：不排除号码，只降排序与金额，如实说明 -->
+            <p v-if="softSummary" class="text-xs leading-relaxed text-slate-500">
+              软降权已生效（<strong class="font-semibold text-slate-400">不排除任何号码</strong>，只降排序与金额）：
+              重号 ×{{ softSummary.repeat_number_weight }}、同肖 ×{{ softSummary.repeat_zodiac_weight }}、
+              冷号（{{ softSummary.stale_periods }} 期未出现）×{{ softSummary.stale_weight }}；
+              降权后每注最低仍为 {{ softSummary.min_bet_amount }} 元。
+              <template
+                v-if="softSummary.repeat_number_picks.length
+                  || softSummary.repeat_zodiac_picks.length
+                  || softSummary.stale_picks.length"
+              >
+                本次命中：重号 {{ softSummary.repeat_number_picks.length }} 注、
+                同肖 {{ softSummary.repeat_zodiac_picks.length }} 注、
+                冷号 {{ softSummary.stale_picks.length }} 注。
+              </template>
+              <template v-if="softSummary.penalized_picks > 0">
+                本次 {{ softSummary.penalized_picks }} 注被降权压低金额，合计少投
+                {{ softSummary.reduced_total }} 元（不补给其它注）。
+              </template>
+              <template v-else>本次命中的注金额未受影响。</template>
+              这是样本内偏好，不是概率，也不承诺提高命中率或收益。
             </p>
 
             <!-- 各注金额一览（随机分配下通常不等，如实列出） -->
@@ -774,6 +859,25 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   生肖 {{ pickZodiac(pick) || '—' }}
                 </StatChip>
 
+                <!-- 软降权标记：重号 / 同肖 / 冷号 + 是否落在预测波动带内（不排除，只打标） -->
+                <div
+                  v-if="pickSoftReasons(pick).length || pick.in_lattice_band"
+                  class="flex flex-wrap items-center justify-center gap-1.5"
+                >
+                  <StatChip
+                    v-for="reason in pickSoftReasons(pick)"
+                    :key="`${pick.number}-${reason}`"
+                    :tone="SOFT_REASON_TONES[reason] ?? 'neutral'"
+                    size="xs"
+                    dot
+                  >
+                    {{ SOFT_REASON_LABELS[reason] }}
+                  </StatChip>
+                  <StatChip v-if="pick.in_lattice_band" tone="aqua" size="xs" outline>
+                    预测带内
+                  </StatChip>
+                </div>
+
                 <div class="w-full space-y-1.5 text-sm">
                   <div class="flex items-center justify-between">
                     <span class="text-slate-500">差值</span>
@@ -801,6 +905,15 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                     </span>
                   </div>
                   <div class="flex items-center justify-between">
+                    <span class="text-slate-500">重号</span>
+                    <span
+                      class="text-xs font-medium"
+                      :class="pick.is_repeat_number ? 'text-bloom-300' : 'text-emerald-300'"
+                    >
+                      {{ pick.is_repeat_number ? '是' : '否' }}
+                    </span>
+                  </div>
+                  <div class="flex items-center justify-between">
                     <span class="text-slate-500">重肖</span>
                     <span
                       class="text-xs font-medium"
@@ -808,6 +921,24 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                     >
                       {{ pick.is_repeat_zodiac ? '是' : '否' }}
                     </span>
+                  </div>
+                  <div
+                    v-if="pick.is_stale"
+                    class="flex items-center justify-between"
+                  >
+                    <span class="text-slate-500">冷号</span>
+                    <StatChip tone="aqua" size="xs">
+                      {{ periodsSinceLastText(pick.periods_since_last) }}
+                    </StatChip>
+                  </div>
+                  <div
+                    v-if="pick.soft_penalized"
+                    class="flex items-center justify-between"
+                  >
+                    <span class="text-slate-500">降权</span>
+                    <StatChip tone="amber" size="xs">
+                      {{ softWeightText(pick.soft_weight) }}
+                    </StatChip>
                   </div>
                   <div
                     v-if="pick.avoid_cold_penalized"
@@ -872,8 +1003,94 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
           </div>
         </section>
 
+        <!-- 预测波动线 · 1~49 号码点阵：带内优先参与选号（口径：经验分布，非概率） -->
+        <MotionReveal v-if="lattice" :index="6">
+          <GlassPanel padding="lg" rounded="3xl" class="space-y-3">
+            <div class="flex flex-wrap items-start justify-between gap-2">
+              <div class="space-y-1">
+                <h2 class="text-lg font-medium text-white">预测波动线 · 号码点阵</h2>
+                <p class="text-xs leading-relaxed text-slate-500">
+                  按本池最近特码的相邻差值估一条波动线（中心 = 中位数、带宽 = P25~P75），
+                  1~49 全号点阵中落在带内的高亮、并优先参与选号。口径：样本内经验分布，非概率 / 非预测。
+                </p>
+              </div>
+              <StatChip :tone="lattice.enabled ? 'aqua' : 'neutral'" size="sm">
+                {{ lattice.enabled ? '已参与选号' : '仅展示 · 未参与选号' }}
+              </StatChip>
+            </div>
+
+            <template v-if="latticeBand">
+              <div class="flex flex-wrap items-center gap-2">
+                <StatChip tone="aqua" size="sm" dot>
+                  带内 {{ inBandCount }} / {{ latticeNumbers.length }} 号
+                </StatChip>
+                <StatChip :tone="waveTones[latticeBand.wave_type] ?? 'neutral'" size="sm">
+                  预测中心 |{{ latticeBand.center_number }}| · {{ latticeBand.wave_label }}
+                </StatChip>
+                <StatChip tone="neutral" size="sm">
+                  带宽 |{{ latticeBand.low }}| ~ |{{ latticeBand.high }}|
+                </StatChip>
+                <StatChip tone="neutral" size="sm">
+                  样本 {{ latticeBand.samples }} 对差值 · 近 {{ latticeBand.used_window }} 对
+                </StatChip>
+                <StatChip v-if="lattice.primary_wave_label" tone="amber" size="sm">
+                  优先 {{ lattice.primary_wave_label }}
+                </StatChip>
+                <StatChip v-if="result.picks.length" tone="bloom" size="sm">
+                  本次推荐落带内 {{ pickedInBandCount }} / {{ result.picks.length }} 注
+                </StatChip>
+              </div>
+
+              <div
+                class="grid grid-cols-7 gap-1.5 sm:gap-2"
+                role="list"
+                aria-label="1 到 49 号码点阵"
+              >
+                <div
+                  v-for="cell in latticeNumbers"
+                  :key="cell.number"
+                  role="listitem"
+                  class="relative flex flex-col items-center justify-center rounded-xl px-1 py-1.5 text-center ring-1"
+                  :class="cell.in_band
+                    ? 'bg-aqua-400/15 text-aqua-100 ring-aqua-300/50'
+                    : 'bg-white/[0.04] text-slate-300 ring-white/10'"
+                  :style="latticeCellStyle(cell)"
+                  :title="`${pad(cell.number)} · 差值 |${cell.diff}| · ${cell.wave_label}${cell.in_band ? ' · 预测带内' : ' · 预测带外'}`"
+                >
+                  <span class="num text-[13px] font-semibold tabular-nums">
+                    {{ pad(cell.number) }}
+                  </span>
+                  <span class="num text-[9px] tabular-nums opacity-70">|{{ cell.diff }}|</span>
+                  <!-- 右上角：本期推荐号码（不参与任何判定，只是打标） -->
+                  <span
+                    v-if="pickedNumbers.has(cell.number)"
+                    class="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-bloom-400 ring-2 ring-slate-950"
+                    aria-hidden="true"
+                  />
+                  <!-- 左上角：本池最新一期号码 -->
+                  <span
+                    v-if="cell.is_latest"
+                    class="absolute -left-1 -top-1 h-2 w-2 rounded-full bg-amber-300 ring-2 ring-slate-950"
+                    aria-hidden="true"
+                  />
+                </div>
+              </div>
+
+              <p class="text-[11px] leading-relaxed text-slate-500">
+                {{ latticeBand.rule }}
+                高亮 = 带内；右上红点 = 本期推荐；左上金点 = 本池最新一期号码。
+                带外号码不会被排除，只是排序靠后、金额可能被降权压低。
+              </p>
+            </template>
+
+            <p v-else class="text-xs leading-relaxed text-slate-500">
+              数据不足：本池不足两期，无法估算预测波动线（按「无预测」处理，不编造中心与带宽）。
+            </p>
+          </GlassPanel>
+        </MotionReveal>
+
         <!-- 走势分布参考：默认折叠，完整三档仍可展开查阅（与卡片内点阵互补） -->
-        <MotionReveal v-if="result.trend_distributions" :index="6">
+        <MotionReveal v-if="result.trend_distributions" :index="7">
           <GlassPanel padding="lg" rounded="3xl" class="space-y-3">
             <button
               type="button"
@@ -963,7 +1180,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
         </MotionReveal>
 
         <!-- 复制投注串 -->
-        <MotionReveal :index="7">
+        <MotionReveal :index="8">
           <GlassPanel padding="lg" rounded="3xl" class="space-y-3">
             <div class="flex flex-wrap items-center justify-between gap-2">
               <h2 class="text-lg font-medium text-white">投注串</h2>
@@ -996,7 +1213,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
         </MotionReveal>
 
         <!-- 说明 -->
-        <MotionReveal v-if="result.notes.length" :index="8">
+        <MotionReveal v-if="result.notes.length" :index="9">
           <GlassPanel variant="soft" padding="lg" rounded="3xl" class="space-y-1.5">
             <p v-for="note in result.notes" :key="note" class="text-xs leading-relaxed text-slate-400">
               · {{ note }}

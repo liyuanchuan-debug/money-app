@@ -666,9 +666,13 @@ def backtest_stats(
         realized_diff = abs(actual - latest)
         realized_wave = classify_wave(realized_diff, cfg["small_max"], cfg["normal_max"])
         prev_wave = outcome["prev_wave"]
-        # 候选池始终排除最新号本身；仅当「避开重肖」开启时再排除整组同肖。
+        # 候选池与推荐引擎同口径：默认**保留**上期特码本身（重号，只降权不排除）；
+        # ``include_repeat_number=False`` 时才回到旧的「排除最新号」；
+        # ``exclude_repeat_zodiac`` 开启时再排除整组同肖。
         # 实际特码落在池外时引擎不可能命中 —— 这构成命中率的理论上限。
-        pool = set(range(NUMBER_MIN, NUMBER_MAX + 1)) - {latest}
+        pool = set(range(NUMBER_MIN, NUMBER_MAX + 1))
+        if not cfg.get("include_repeat_number", True):
+            pool -= {latest}
         if cfg["exclude_repeat_zodiac"]:
             pool -= set(same_group_numbers(latest))
         available_sum += len(pool)

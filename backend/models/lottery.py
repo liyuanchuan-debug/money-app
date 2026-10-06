@@ -7,6 +7,8 @@ from services.lottery import (
     AMOUNT_UNIT_MIN,
     AVOID_COLD_DAYS_MAX,
     AVOID_COLD_DAYS_MIN,
+    LATTICE_WINDOW_MAX,
+    LATTICE_WINDOW_MIN,
     MODE_PATTERN,
     NUMBER_MAX,
     NUMBER_MIN,
@@ -15,6 +17,12 @@ from services.lottery import (
     PICK_COUNT_MAX,
     PICK_COUNT_MIN,
     PICK_STRATEGY_PATTERN,
+    ROLE_WEIGHT_MAX,
+    ROLE_WEIGHT_MIN,
+    SOFT_WEIGHT_MAX,
+    SOFT_WEIGHT_MIN,
+    STALE_PERIODS_MAX,
+    STALE_PERIODS_MIN,
     TOTAL_AMOUNT_MAX,
     TOTAL_AMOUNT_MIN,
     TREND_BIAS_PATTERN,
@@ -38,6 +46,21 @@ class SettingsOut(BaseModel):
     odds: float
     # 避开重肖：True=候选池排除最新同肖；默认 False
     exclude_repeat_zodiac: bool
+    # 上期出过的号（重号）是否保留在候选池：True=不避开、只降权（默认）
+    include_repeat_number: bool
+    # 三类软降权权重（0..1；1.0 = 不降权）
+    repeat_number_weight: float
+    repeat_zodiac_weight: float
+    # 冷号口径：样本内最近 N 期未出现过即降权
+    stale_periods: int
+    stale_weight: float
+    # 预测波动线 + 号码点阵（参与选号）
+    lattice_enabled: bool
+    lattice_window: int
+    # 角色金额配额（均注模式）：主推 : 次选 : 防守，默认 3:2:1
+    role_w_primary: float
+    role_w_secondary: float
+    role_w_defense: float
     # 近期走势加权：英文枚举 neutral|hot|cold|mid
     trend_bias: str
     # 近窗期数；0=全部样本
@@ -81,6 +104,62 @@ class SettingsPatch(BaseModel):
     mode: str | None = Field(default=None, pattern=MODE_PATTERN)
     exclude_repeat_zodiac: bool | None = Field(
         default=None, description="True=避开最新一期同肖；默认 False"
+    )
+    include_repeat_number: bool | None = Field(
+        default=None,
+        description="True=上期出过的号保留在候选池（只降权、不避开）；默认 True",
+    )
+    repeat_number_weight: float | None = Field(
+        default=None,
+        ge=SOFT_WEIGHT_MIN,
+        le=SOFT_WEIGHT_MAX,
+        description="重号（上期特码本身）降权系数，默认 0.5；1.0=不降权",
+    )
+    repeat_zodiac_weight: float | None = Field(
+        default=None,
+        ge=SOFT_WEIGHT_MIN,
+        le=SOFT_WEIGHT_MAX,
+        description="同肖（与上期同肖、非重号）降权系数，默认 0.8；1.0=不降权",
+    )
+    stale_periods: int | None = Field(
+        default=None,
+        ge=STALE_PERIODS_MIN,
+        le=STALE_PERIODS_MAX,
+        description="冷号口径：样本内最近 N 期未出现过即算冷号，默认 60",
+    )
+    stale_weight: float | None = Field(
+        default=None,
+        ge=SOFT_WEIGHT_MIN,
+        le=SOFT_WEIGHT_MAX,
+        description="冷号降权系数，默认 0.3；1.0=不降权",
+    )
+    lattice_enabled: bool | None = Field(
+        default=None,
+        description="True=启用预测波动线号码点阵（带内优先取号）；默认 True",
+    )
+    lattice_window: int | None = Field(
+        default=None,
+        ge=LATTICE_WINDOW_MIN,
+        le=LATTICE_WINDOW_MAX,
+        description="预测波动线的取样期数（0=本池全部），默认 30",
+    )
+    role_w_primary: float | None = Field(
+        default=None,
+        ge=ROLE_WEIGHT_MIN,
+        le=ROLE_WEIGHT_MAX,
+        description="均注模式下主推组的金额配额权重，默认 3",
+    )
+    role_w_secondary: float | None = Field(
+        default=None,
+        ge=ROLE_WEIGHT_MIN,
+        le=ROLE_WEIGHT_MAX,
+        description="均注模式下次选组的金额配额权重，默认 2",
+    )
+    role_w_defense: float | None = Field(
+        default=None,
+        ge=ROLE_WEIGHT_MIN,
+        le=ROLE_WEIGHT_MAX,
+        description="均注模式下防守组的金额配额权重，默认 1（配额最低）",
     )
     trend_bias: str | None = Field(default=None, pattern=TREND_BIAS_PATTERN)
     trend_window: int | None = Field(

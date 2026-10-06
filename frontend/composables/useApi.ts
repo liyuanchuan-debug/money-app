@@ -16,6 +16,29 @@ export interface LotterySettings {
   /** 避开重肖：true=候选池排除最新同肖；默认 false */
   exclude_repeat_zodiac: boolean
   /**
+   * 上期出过的号（重号）是否保留在候选池：true=不避开、只降权（默认）。
+   * false 才是旧的「排除上期特码本身」。
+   */
+  include_repeat_number: boolean
+  /** 重号（上期特码本身）降权系数：0..1，1.0=不降权；默认 0.5 */
+  repeat_number_weight: number
+  /** 同肖（与上期同肖、非重号）降权系数：默认 0.8 */
+  repeat_zodiac_weight: number
+  /** 冷号口径：样本内最近 N 期未出现过即算冷号；默认 60（按**期数**，不是自然日） */
+  stale_periods: number
+  /** 冷号降权系数：默认 0.3 */
+  stale_weight: number
+  /** 预测波动线 + 号码点阵：true=带内优先取号（默认 true） */
+  lattice_enabled: boolean
+  /** 预测波动线取样期数（0=本池全部）；默认 30 */
+  lattice_window: number
+  /** 均注模式角色配额：主推组权重；默认 3 */
+  role_w_primary: number
+  /** 均注模式角色配额：次选组权重；默认 2 */
+  role_w_secondary: number
+  /** 均注模式角色配额：防守组权重；默认 1（配额最低） */
+  role_w_defense: number
+  /**
    * 近期走势加权：neutral|hot|cold|mid。
    * 读取口径：没在设置页手动设置过就是 neutral（不加权），
    * 旧版本残留的 hot 也不会自动生效。
@@ -53,6 +76,17 @@ export interface LotterySettingsPatch {
   pick_count?: number
   odds?: number
   exclude_repeat_zodiac?: boolean
+  include_repeat_number?: boolean
+  repeat_number_weight?: number
+  repeat_zodiac_weight?: number
+  stale_periods?: number
+  stale_weight?: number
+  lattice_enabled?: boolean
+  lattice_window?: number
+  /** 均注模式角色配额：主推 : 次选 : 防守（默认 3:2:1，防守最低） */
+  role_w_primary?: number
+  role_w_secondary?: number
+  role_w_defense?: number
   trend_bias?: TrendBias
   trend_window?: number
   avoid_cold_enabled?: boolean
@@ -73,6 +107,22 @@ export interface Pick {
   role_label: string
   amount: number
   is_repeat_zodiac: boolean
+  /** 上期出过的号（重号）：不避开、只降权，命中时前端标「重号」 */
+  is_repeat_number?: boolean
+  /** 冷号：本池样本内最近 stale_periods 期没出现过（降权，不排除） */
+  is_stale?: boolean
+  /** 本池样本内距最近一次出现的**期数**（0=最新一期就是它；null=样本内从未出现） */
+  periods_since_last?: number | null
+  /** 三类软降权相乘后的权重（1.0=未降权） */
+  soft_weight?: number
+  /** 降权原因：repeat_number | repeat_zodiac | stale */
+  soft_reasons?: string[]
+  /** 该注是否被软降权压低金额 */
+  soft_penalized?: boolean
+  /** 号码点阵权重：1.0=落在预测波动带内；带外按距离衰减 */
+  lattice_weight?: number
+  /** 该注是否落在预测波动带内 */
+  in_lattice_band?: boolean
   /**
    * 号码 → 生肖的固定映射（英文码 + 汉字标签），随农历年（春节）轮转。
    * 与 `latest_zodiac` 指向同一组号码（农历年只决定这一组叫什么名字）。
@@ -159,6 +209,54 @@ export interface RecommendResult {
     /** 被避冷省下、未再分配的金额 */
     reduced_total: number
   }
+  /** 三类软降权（重号 / 同肖 / 冷号）本次生效摘要（只增不改） */
+  soft_weights?: {
+    repeat_number_weight: number
+    repeat_zodiac_weight: number
+    stale_periods: number
+    stale_weight: number
+    /** 每注最低金额（元） */
+    min_bet_amount: number
+    penalized_picks: number
+    /** 被软降权省下、未再分配的金额 */
+    reduced_total: number
+    repeat_number_picks: number[]
+    repeat_zodiac_picks: number[]
+    stale_picks: number[]
+  }
+  /** 预测波动线 + 号码点阵（参与选号：带内优先） */
+  lattice?: {
+    enabled: boolean
+    window: number
+    /** 预测波动线：中心=中位数、带宽=P25~P75；样本不足两对差值为 null */
+    band: {
+      window: number
+      used_window: number
+      samples: number
+      center: number
+      center_number: number
+      low: number
+      high: number
+      wave_type: 'small' | 'normal' | 'big'
+      wave_label: string
+      small_max: number
+      normal_max: number
+      rule: string
+    } | null
+    /** 带内取号的主要波动桶；无预测时为 null */
+    primary_wave?: 'small' | 'normal' | 'big' | null
+    primary_wave_label?: string | null
+    /** 1..49 号码点阵 */
+    numbers: Array<{
+      number: number
+      diff: number
+      wave_type: 'small' | 'normal' | 'big'
+      wave_label: string
+      lattice_weight: number
+      in_band: boolean
+      is_latest: boolean
+    }>
+  }
   focus_order: Array<{ type: string; label: string }>
   picks: Pick[]
   missing_waves: Array<{ type: string; label: string; note: string }>
@@ -216,23 +314,91 @@ export const CHIP_MODE_OPTIONS: ChipModeOption[] = [
 ]
 
 /**
- * 均注金额预览（与后端 ``_distribute_units_even`` 同源）：
- * 先把最大投注换成单位个数，再尽量均分；余数补给前几注。
+ * 均注金额预览（与后端 ``distribute_units_by_role`` 同源）：
+ * 1）每注保底 1 个单位（= 每注最低金额），预算覆盖不了的尾注不输出；
+ * 2）余量按**角色**权重分给 主推 / 次选 / 防守 三组，组内再均分。
+ *
+ * ``weights`` 缺省或三项相同 = 旧的严格均分（与 ``_distribute_units_even`` 一致）：
  * 例：total=50 / unit=5 / count=6 → ``[10, 10, 10, 10, 5, 5]``。
  */
 export function previewEvenAmounts(
   total: number,
   count: number,
   unit: number,
+  weights?: { primary: number, secondary: number, defense: number },
 ): number[] {
   const u = Math.max(1, Math.floor(Number(unit) || 1))
   const n = Math.max(1, Math.floor(Number(count) || 1))
   const unitsTotal = Math.floor(Math.max(0, Number(total) || 0) / u)
   if (unitsTotal <= 0) return []
   const noteCount = Math.min(n, unitsTotal)
-  const base = Math.floor(unitsTotal / noteCount)
-  const rem = unitsTotal % noteCount
-  return Array.from({ length: noteCount }, (_, i) => (base + (i < rem ? 1 : 0)) * u)
+
+  const w = weights ?? {
+    primary: ROLE_WEIGHT_PRIMARY_DEFAULT,
+    secondary: ROLE_WEIGHT_SECONDARY_DEFAULT,
+    defense: ROLE_WEIGHT_DEFENSE_DEFAULT,
+  }
+  const uniform = w.primary === w.secondary && w.secondary === w.defense
+  if (uniform) {
+    return evenUnits(unitsTotal, noteCount).map(part => part * u)
+  }
+
+  // 角色顺位与后端 assign_roles 一致：首位主推，其后「次选 → 防守」交替
+  const roles: string[] = Array.from({ length: noteCount }, (_, i) =>
+    i === 0 ? 'primary' : i % 2 === 1 ? 'secondary' : 'defense',
+  )
+  const groupOrder: string[] = []
+  const members: Record<string, number[]> = {}
+  roles.forEach((role, index) => {
+    if (!members[role]) {
+      members[role] = []
+      groupOrder.push(role)
+    }
+    members[role].push(index)
+  })
+
+  const extra = unitsTotal - noteCount
+  const groupWeights = groupOrder.map(
+    role => Math.max(0, (w as Record<string, number>)[role] ?? ROLE_WEIGHT_MIN),
+  )
+  const totalWeight = groupWeights.reduce((sum, value) => sum + value, 0)
+
+  let shares: number[]
+  if (totalWeight <= 0) {
+    shares = evenUnits(extra, groupOrder.length)
+  }
+  else {
+    const quotas = groupWeights.map(weight => (extra * weight) / totalWeight)
+    shares = quotas.map(quota => Math.floor(quota))
+    let leftover = extra - shares.reduce((sum, value) => sum + value, 0)
+    const order = quotas
+      .map((quota, i) => ({ i, frac: quota - Math.floor(quota) }))
+      .sort((a, b) => (b.frac - a.frac) || (a.i - b.i))
+    for (const { i } of order) {
+      if (leftover <= 0) break
+      shares[i] += 1
+      leftover -= 1
+    }
+  }
+
+  const noteUnits = Array.from({ length: noteCount }, () => 1)
+  groupOrder.forEach((role, groupIndex) => {
+    const group = members[role]
+    const parts = evenUnits(group.length + shares[groupIndex], group.length)
+    group.forEach((noteIndex, i) => {
+      noteUnits[noteIndex] = parts[i]
+    })
+  })
+  return noteUnits.map(part => part * u)
+}
+
+/** 把 ``units`` 个筹码尽量均分到 ``count`` 注；余数逐个补给前 rem 注（后端同源） */
+function evenUnits(units: number, count: number): number[] {
+  const noteCount = Math.min(Math.max(0, count), Math.max(0, units))
+  if (noteCount <= 0) return []
+  const base = Math.floor(units / noteCount)
+  const rem = units % noteCount
+  return Array.from({ length: noteCount }, (_, i) => base + (i < rem ? 1 : 0))
 }
 
 /** 走势加权取值表（设置页持久化；财富密码页可临时预览）；默认 neutral */
@@ -285,6 +451,98 @@ export function avoidColdWeightText(weight: number | null | undefined): string {
 export function avoidColdDaysText(days: number | null | undefined): string {
   if (days == null || !Number.isFinite(days)) return '样本内未出现'
   return `${Math.trunc(days)} 天前`
+}
+
+/* ---------------------------------------------------------------------- */
+/* 三类软降权（重号 / 同肖 / 按期数冷号，只降权不排除） + 预测波动线点阵      */
+/* ---------------------------------------------------------------------- */
+/**
+ * 与后端 ``services/lottery.py`` 的 ``soft_penalty_weight`` / ``predict_wave_band``
+ * 同源。这里是**展示用**取值表与常量，汉字段只用于文案，不参与落库判定。
+ * 口径：本池样本内偏好，不是概率，也不承诺提高命中率。
+ */
+export const SOFT_WEIGHT_MIN = 0
+export const SOFT_WEIGHT_MAX = 1
+/** 重号（上期特码本身）降权系数默认值 */
+export const REPEAT_NUMBER_WEIGHT_DEFAULT = 0.5
+/** 同肖（与上期同肖、非重号）降权系数默认值 */
+export const REPEAT_ZODIAC_WEIGHT_DEFAULT = 0.8
+/** 冷号口径：最近 N 期未出现过（按**期数**，不是自然日） */
+export const STALE_PERIODS_DEFAULT = 60
+export const STALE_PERIODS_MIN = 1
+export const STALE_PERIODS_MAX = 999
+/** 冷号降权系数默认值 */
+export const STALE_WEIGHT_DEFAULT = 0.3
+/** 每注最低金额（元）：所有模式下每一注的实际金额都不得低于它 */
+export const MIN_BET_AMOUNT = 5
+/** 最大投注金额上下限（元） */
+export const TOTAL_AMOUNT_MIN = 5
+export const TOTAL_AMOUNT_MAX = 100
+/** 金额最小单位（注码粒度）上下限与步长：按 5 元一档（与后端 AMOUNT_UNIT_* 对齐） */
+export const AMOUNT_UNIT_MIN = 5
+export const AMOUNT_UNIT_MAX = 10000
+export const AMOUNT_UNIT_STEP = 5
+
+/**
+ * 角色金额配额（均注模式）：主推 : 次选 : 防守。
+ * 先给每注保底 1 个注码单位（= 每注最低金额），余量按角色权重分给三组，组内再均分；
+ * 三项取相同值即回到「严格均分」。与后端 DEFAULT_ROLE_WEIGHT_* / ROLE_WEIGHT_SETTING_KEYS 对齐。
+ */
+export const ROLE_WEIGHT_PRIMARY_DEFAULT = 3
+export const ROLE_WEIGHT_SECONDARY_DEFAULT = 2
+export const ROLE_WEIGHT_DEFENSE_DEFAULT = 1
+export const ROLE_WEIGHT_MIN = 0
+export const ROLE_WEIGHT_MAX = 10
+/** 角色顺序（展示用；与后端 ROLE_ORDER 一致） */
+export const ROLE_ORDER = ['primary', 'secondary', 'defense'] as const
+/**
+ * 号码角色展示映射（value 英文码，label 汉字）。
+ * 命名带 ``PICK_`` 前缀：``useAuth.ts`` 已有同名的账号角色映射 `ROLE_LABELS`，
+ * Nuxt 自动导入会静默覆盖（后者生效），导致这里展示成「普通用户 / 管理员」。
+ */
+export const PICK_ROLE_LABELS: Record<string, string> = {
+  primary: '主推',
+  secondary: '次选',
+  defense: '防守',
+}
+/** 角色配额档位（设置页点选；1:1:1 = 严格均分） */
+export const ROLE_WEIGHT_PRESETS = [
+  { value: '3:2:1', label: '3 : 2 : 1', primary: 3, secondary: 2, defense: 1, note: '主推重、防守最低（默认）' },
+  { value: '2:1:1', label: '2 : 1 : 1', primary: 2, secondary: 1, defense: 1, note: '只加重主推' },
+  { value: '1:1:1', label: '1 : 1 : 1', primary: 1, secondary: 1, defense: 1, note: '严格均分（旧行为）' },
+] as const
+/** 预测波动线取样期数默认值 / 范围（0 = 本池全部） */
+export const LATTICE_WINDOW_DEFAULT = 30
+export const LATTICE_WINDOW_MIN = 0
+export const LATTICE_WINDOW_MAX = 500
+
+/** 权重档位（设置页点选；1.0 = 不降权） */
+export const SOFT_WEIGHT_OPTIONS = [
+  { value: 1, label: '不降权' },
+  { value: 0.8, label: '八折' },
+  { value: 0.5, label: '五折' },
+  { value: 0.3, label: '三折' },
+] as const
+
+/** 三类降权标记的展示文案（value 英文码，label 汉字） */
+export const SOFT_REASON_LABELS: Record<string, string> = {
+  repeat_number: '重号',
+  repeat_zodiac: '同肖',
+  stale: '冷号',
+}
+
+/** 软降权权重展示文案 */
+export function softWeightText(weight: number | null | undefined): string {
+  if (weight == null || !Number.isFinite(weight)) return '—'
+  if (weight >= 1) return '不降权'
+  return `权重 ${Math.round(weight * 100)}%`
+}
+
+/** 距上次出现的**期数**文案（null = 本池样本内从未出现） */
+export function periodsSinceLastText(periods: number | null | undefined): string {
+  if (periods == null || !Number.isFinite(periods)) return '样本内未出现'
+  if (periods <= 0) return '上期'
+  return `${Math.trunc(periods)} 期前`
 }
 
 /* ---------------------------------------------------------------------- */
