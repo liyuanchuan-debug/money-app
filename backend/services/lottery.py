@@ -1859,6 +1859,13 @@ def recommend(
 ) -> dict[str, Any]:
     """生成一期推荐。latest/previous 为号码本身，history_numbers 为历史开奖号序列。
 
+    **``history_numbers`` 必须「最新在前」**（``[最新一期, ..., 最早一期]``）：
+    内部多处按此约定取值 —— ``predict_wave_band`` 取 ``series[:window]``、
+    ``compute_periods_since_last`` / ``compute_days_since_last`` 取列表中**首次**
+    出现、``window_frequency`` 取 ``series[:limit]``、``resolve_zodiac_date`` 取
+    ``history_dates[0]``。传成时间正序会把「最近一次出现」算成「最早一次出现」。
+    ``latest`` 通常等于 ``history_numbers[0]``（「假设下一期」预览时则是假设号）。
+
     预算口径（单一真值）：``total_amount`` 是唯一预算来源，**所有模式**都从它取预算
     （旧 ``bet_unit`` 已降级为派生展示值）。金额按 ``amount_unit`` 注码粒度分配：
     默认 total=50 / unit=5 / picks=6 均注为 10/10/10/10/5/5，单挑为 50。

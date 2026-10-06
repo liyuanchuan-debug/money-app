@@ -26,6 +26,8 @@ from services.analytics import (
     trend_stats,
     zodiac_trend_stats,
 )
+import services.analytics as analytics
+from services.lottery import DEFAULT_SETTINGS, recommend
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 
@@ -449,6 +451,113 @@ def test_backtest_too_few_draws_is_insufficient():
     assert result["data_status"] == "INSUFFICIENT"
     assert result["data_status_label"] == "数据不足"
     assert any("数据不足" in note for note in result["notes"])
+
+
+# --------------------------------------------------------------------------- #
+# 6b. 回归：回测传入 recommend 的 history 必须是「最新在前」
+# --------------------------------------------------------------------------- #
+# 历史 bug（commit 2039786 引入）：backtest_stats 按 draw_date 升序走步，
+# 却直接把升序切片 specials[:index] 当 history 传给 recommend。
+# 而 services/lottery.py 全篇约定 history **最新在前**：
+#   - predict_wave_band → series[:window]（取最近 W 期）
+#   - compute_periods_since_last → result[n] = 首次出现的下标
+#   - compute_days_since_last  → ref = dates[0]
+#   - resolve_zodiac_date      → dates[0] 决定农历年
+#   - window_frequency         → series[:limit]
+# routers/lottery.py 也确实按「最新在前」传（见该文件 `# 最新在前` 注释）。
+# 后果：回测里「最近一次出现」被算成「最早一次出现」，冷号 / 重号 / 自然日 /
+# 波动线取样窗口整体反向 —— 回测等于在评估另一个策略。
+def test_backtest_passes_history_newest_first(monkeypatch):
+    """锁定契约：传给 recommend 的 history / history_dates 必须最新在前。"""
+    captured: list[dict] = []
+    real_recommend = analytics.recommend
+
+    def spy(**kwargs):
+        captured.append(kwargs)
+        return real_recommend(**kwargs)
+
+    monkeypatch.setattr(analytics, "recommend", spy)
+
+    specials = [10, 20, 19, 5, 30, 12, 41]
+    draws = _draws(specials)
+    backtest_stats(
+        draws, mode="even", pick_count=1, base_settings=dict(LEGACY_ENGINE_OFF)
+    )
+
+    assert captured, "回测必须调用 recommend"
+    # 走步从第 3 期（index=2）起，每期调用一次
+    assert len(captured) == len(specials) - 2
+    for offset, call in enumerate(captured):
+        index = 2 + offset
+        history = list(call["history_numbers"])
+        dates = list(call["history_dates"])
+        assert history == list(reversed(specials[:index])), (
+            f"第 {index + 1} 期 history 顺序错误（应为最新在前）：{history}"
+        )
+        assert dates == list(reversed([d["draw_date"] for d in draws[:index]]))
+        # 最新在前 → 首元素就是该期之前那一期，末元素才是样本内最早一期
+        assert history[0] == specials[index - 1]
+        assert history[-1] == specials[0]
+        assert dates == sorted(dates, reverse=True)
+        # 长度必须严格等于「该期之前」的期数（无未来函数）
+        assert len(history) == index
+
+
+def test_backtest_picks_match_live_newest_first_history():
+    """回测口径必须与线上 `POST /api/recommend` 同源：同一期 / 同一设置 /
+    同一「最新在前」历史 → 同一份号码。
+
+    这组参数对顺序高度敏感（大部分期数两种顺序会给出不同号码），
+    因此一旦顺序退回旧的「最旧在前」，本用例会大面积失败。
+    """
+    specials = [(((i * 37 + 11) % 49) + 1) for i in range(45)]
+    draws = _draws(specials)
+    settings = {
+        **DEFAULT_SETTINGS,
+        "mode": "even",
+        "pick_count": 3,
+        "lattice_window": 3,
+        "stale_periods": 5,
+        "stale_weight": 0.1,
+    }
+
+    result = backtest_stats(draws, base_settings=settings)
+    assert result["evaluated"] == len(specials) - 2
+
+    order_sensitive = 0
+    for row in result["results"]:
+        index = row["period"] - 1
+        prefix_dates = [d["draw_date"] for d in draws[:index]]
+
+        newest_first = recommend(
+            latest=specials[index - 1],
+            previous=specials[index - 2],
+            history_numbers=list(reversed(specials[:index])),
+            history_dates=list(reversed(prefix_dates)),
+            settings=settings,
+            mode="even",
+            period=row["period"],
+        )
+        oldest_first = recommend(
+            latest=specials[index - 1],
+            previous=specials[index - 2],
+            history_numbers=list(specials[:index]),
+            history_dates=list(prefix_dates),
+            settings=settings,
+            mode="even",
+            period=row["period"],
+        )
+        picks_new = [pick["number"] for pick in newest_first["picks"]]
+        picks_old = [pick["number"] for pick in oldest_first["picks"]]
+
+        assert row["predicted"] == picks_new, (
+            f"第 {row['period']} 期回测号码与线上口径（最新在前）不一致："
+            f"backtest={row['predicted']} live={picks_new}"
+        )
+        order_sensitive += picks_new != picks_old
+
+    # 保证本用例真的有能力捕获顺序 bug（否则断言形同虚设）
+    assert order_sensitive > len(result["results"]) // 2
 
 
 # --------------------------------------------------------------------------- #

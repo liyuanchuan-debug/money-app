@@ -116,12 +116,18 @@ async def post_recommend(
 
     - 未指定 ``number``：``latest`` = 最新一期特码，``previous`` = 上一期特码，
       ``history`` = 全部真实特码（最新在前）。
-      ``recommend()`` 只把 ``history_numbers`` 当频次/遗漏的计数器用（顺序无关），
-      并会剔除 ``latest`` 本身，所以「最新在前」与「时间正序」等价。
     - 指定 ``number``（前瞻观察：如果下一期开 N 会怎样）：把 N 当作**假设的
       最新一期**叠在真实序列之上，因此 ``previous`` = 当前最新一期特码
       （它才是 N 之前的一期），``history`` = ``[N, *真实特码]``。
       早期版本这里错误地读了几乎为空的 ``records``，等于用空序列算遗漏。
+
+    **顺序不是无关紧要的**（早期注释曾误称「顺序无关、最新在前与时间正序等价」，
+    正是这个误解让 ``analytics.backtest_stats`` 长期传升序切片）：
+    ``recommend()`` 内部有多处依赖「最新在前」——
+    ``predict_wave_band`` 取 ``series[:window]``（近窗）、
+    ``compute_periods_since_last`` / ``compute_days_since_last`` 取列表中**首次**
+    出现、``window_frequency`` 取 ``series[:limit]``、``resolve_zodiac_date`` 取
+    ``dates[0]`` 定农历年。传成时间正序会让「最近一次出现」变成「最早一次出现」。
     """
     payload = payload or RecommendRequest()
     store = await get_store()

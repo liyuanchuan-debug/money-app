@@ -650,8 +650,14 @@ def backtest_stats(
     for index in range(min_prior_draws, sample_size):
         latest = specials[index - 1]
         previous = specials[index - 2] if index - 2 >= 0 else None
-        history = specials[:index]  # 严格早于 index
-        history_dates = dates[:index]
+        # ``recommend()`` 的 history 契约是**最新在前**（见 services/lottery.py：
+        # ``predict_wave_band`` 取 ``series[:window]``、``compute_periods_since_last``
+        # 取列表里首次出现、``resolve_zodiac_date`` 取 ``[0]``；routers/lottery.py
+        # 也按「最新在前」传入）。本函数按 draw_date **升序**走步，所以这里必须翻转：
+        # 直接传 ``specials[:index]``（最旧在前）会把「最近一次出现」算成「最早一次出现」，
+        # 令冷号 / 重号 / 自然日 / 波动线取样窗口整体反向，回测就变成在评估另一个策略。
+        history = list(reversed(specials[:index]))  # 严格早于 index，最新在前
+        history_dates = list(reversed(dates[:index]))
         outcome = recommend(
             latest=latest,
             previous=previous,
