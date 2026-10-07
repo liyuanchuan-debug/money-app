@@ -21,9 +21,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from services.analytics import (
+    WALK_FORWARD_AXES,
     backtest_stats,
+    build_walk_forward_config_space,
     frequency_stats,
     trend_stats,
+    walk_forward_axes_size,
+    walk_forward_config_search,
+    walk_forward_eval_config,
+    walk_forward_split,
     zodiac_trend_stats,
 )
 import services.analytics as analytics
@@ -916,4 +922,196 @@ def test_backtest_single_includes_verdict_field(client):
     assert body["verdict"]["kind"] in ("insufficient", "noise", "beyond")
     assert "trend_bias" in body["settings"]
     assert "trend_window" in body["settings"]
+
+
+# --------------------------------------------------------------------------- #
+# 7. 通用 walk-forward 配置搜索（训练窗选参 / 验证窗打分）
+# --------------------------------------------------------------------------- #
+def test_walk_forward_axes_size_matches_declared_product():
+    """声明空间大小 = 笛卡尔积去重后（关掉的轴不翻倍）的真实组合数。"""
+    axes = WALK_FORWARD_AXES
+    # 必含轴（deliverable 里声明的旋钮）
+    for key in (
+        "pick_strategy",
+        "trend_bias",
+        "trend_window",
+        "lattice_enabled",
+        "lattice_window",
+        "repeat_number_weight",
+        "repeat_zodiac_weight",
+        "stale_periods",
+        "stale_weight",
+        "avoid_cold_enabled",
+        "avoid_cold_days",
+        "include_repeat_number",
+        "exclude_repeat_zodiac",
+        "score_w_focus",
+        "score_w_mid",
+        "score_w_omit",
+        "score_w_diff",
+    ):
+        assert key in axes and len(axes[key]) >= 2
+
+    # 独立复算：先把「关掉即失效」的轴折叠掉，再乘策略分支
+    other = 1
+    for key, values in axes.items():
+        if key in (
+            "lattice_enabled",
+            "lattice_window",
+            "avoid_cold_enabled",
+            "avoid_cold_days",
+            "pick_strategy",
+            "score_w_focus",
+            "score_w_mid",
+            "score_w_omit",
+            "score_w_diff",
+        ):
+            continue
+        other *= len(values)
+    lattice = 1 + (len(axes["lattice_enabled"]) - 1) * len(axes["lattice_window"])
+    cold = 1 + (len(axes["avoid_cold_enabled"]) - 1) * len(axes["avoid_cold_days"])
+    weights = 1
+    for key in ("score_w_focus", "score_w_mid", "score_w_omit", "score_w_diff"):
+        weights *= len(axes[key])
+    strategies = 1 + (len(axes["pick_strategy"]) - 1) * weights
+    assert walk_forward_axes_size() == other * lattice * cold * strategies
+    assert walk_forward_axes_size() == 1_726_272
+
+
+def test_walk_forward_split_windows_are_disjoint_and_ordered():
+    draws = _draws(list(range(1, 49)) * 3)  # 144 期
+    split = walk_forward_split(draws, train_ratio=0.7)
+    assert split["data_status"] == "OK"
+    assert split["eval_count"] == len(draws) - 2
+    assert split["train_eval"] == int((len(draws) - 2) * 0.7)
+    assert split["valid_eval"] == split["eval_count"] - split["train_eval"]
+    # 训练窗最后一期 < 验证窗第一期（严格不重叠）
+    assert split["train_last_period"] < split["valid_first_period"]
+    assert split["valid_first_period"] == (
+        split["train_last_period"] + 1
+    )
+    # 验证子序列保留 min_prior 期做前置历史
+    assert len(split["valid_draws"]) == split["valid_eval"] + 2
+
+
+def test_walk_forward_split_insufficient_when_too_short():
+    split = walk_forward_split(_draws([1, 2, 3, 4, 5]))
+    assert split["data_status"] == "INSUFFICIENT"
+    assert split["data_status_label"] == "数据不足"
+
+
+def test_build_config_space_is_seeded_and_canonical():
+    base = {"pick_count": 6, "mode": "even"}
+    first = build_walk_forward_config_space(sample_size=24, seed=7, base_settings=base)
+    second = build_walk_forward_config_space(sample_size=24, seed=7, base_settings=base)
+    third = build_walk_forward_config_space(sample_size=24, seed=8, base_settings=base)
+    assert first["evaluated_size"] == 24
+    assert [c["pick_strategy"] for c in first["configs"]] == [
+        c["pick_strategy"] for c in second["configs"]
+    ]
+    assert first["declared_size"] == 1_726_272
+    # 换 seed 应给出不同抽样（否则等于没抽样）
+    assert [repr(c) for c in first["configs"]] != [
+        repr(c) for c in third["configs"]
+    ]
+    # 不改变行为的规范化：wave_round 不读打分权重；点阵关闭时不读窗口
+    for cfg in first["configs"]:
+        if cfg["pick_strategy"] == "wave_round":
+            for key in (
+                "score_w_focus",
+                "score_w_mid",
+                "score_w_omit",
+                "score_w_diff",
+            ):
+                assert cfg[key] == DEFAULT_SETTINGS[key]
+        if not cfg["lattice_enabled"]:
+            assert cfg["lattice_window"] == DEFAULT_SETTINGS["lattice_window"]
+        # 非 neutral 偏好必须带显式标记，否则读取端会回退 neutral
+        assert cfg["trend_bias_explicit"] is True
+
+
+def test_walk_forward_eval_config_matches_direct_backtests():
+    draws = _draws(list(range(1, 49)) * 3)
+    split = walk_forward_split(draws, train_ratio=0.7)
+    config = {"pick_count": 4, "mode": "even", "lattice_enabled": False}
+    row = walk_forward_eval_config(
+        split["series"], config, split_index=split["split_index"]
+    )
+    train = backtest_stats(
+        split["train_draws"], base_settings=config, include_results=False
+    )
+    valid = backtest_stats(
+        split["valid_draws"], base_settings=config, include_results=False
+    )
+    assert row["train_hits"] == train["hits"]
+    assert row["train_evaluated"] == train["evaluated"]
+    assert row["valid_hits"] == valid["hits"]
+    assert row["valid_evaluated"] == valid["evaluated"]
+    assert row["valid_delta"] == pytest.approx(valid["hit_rate_minus_baseline"])
+
+
+def test_walk_forward_config_search_selects_on_train_not_validation():
+    """选参只允许用训练窗：selected 必须是训练窗 Δ 的 argmax，且验证字段来自验证窗。"""
+    draws = _draws(list(range(1, 49)) * 3)
+    space = build_walk_forward_config_space(
+        sample_size=12,
+        seed=3,
+        base_settings={"pick_count": 4, "mode": "even"},
+    )
+    result = walk_forward_config_search(draws, configs=space["configs"])
+    assert result["grid_size"] == 12
+    rows = result["rows"]
+    best_train = max(row["train_delta"] for row in rows)
+    assert result["selected"]["train_delta"] == pytest.approx(best_train)
+    assert result["selected"] is rows[0]
+    assert result["selected_valid_delta"] == result["selected"]["valid_delta"]
+    # 验证窗最大 Δ 只是事后对照，可能高于被选中者的验证 Δ
+    assert result["max_valid_delta"] == pytest.approx(
+        max(row["valid_delta"] for row in rows)
+    )
+    # 口径纪律：只能以否定 / 禁止的形式出现「优化 / 提高命中率」，不得正向宣称
+    joined = "".join(result["notes"])
+    assert "禁止" in joined
+    assert "已提高命中率" not in joined
+    assert "已优化命中率" not in joined.replace("说成「已优化命中率」", "")
+    assert "全市场" not in joined
+
+
+def test_walk_forward_config_search_insufficient_draws():
+    result = walk_forward_config_search(
+        _draws([1, 2, 3, 4, 5]),
+        configs=[{"pick_count": 2}],
+    )
+    assert result["data_status"] == "INSUFFICIENT"
+    assert result["data_status_label"] == "数据不足"
+    assert result["selected"] is None
+    assert result["rows"] == []
+    assert any("数据不足" in note for note in result["notes"])
+
+
+def test_tune_delta_score_weights_reuses_walk_forward_split(monkeypatch):
+    """存量打分权重调参器复用同一套 walk-forward 切分，避免两份口径漂移。"""
+    draws = _draws(list(range(1, 49)) * 2)  # 96 期
+    split = walk_forward_split(draws)
+    calls: list[tuple[int, str]] = []
+
+    def fake_backtest_stats(subset, **kwargs):
+        settings = kwargs.get("base_settings") or {}
+        calls.append((len(subset), settings.get("pick_strategy")))
+        return {
+            "evaluated": max(0, len(subset) - 2),
+            "hits": 0,
+            "hit_rate": 0.0,
+            "hit_rate_minus_baseline": 0.0,
+            "verdict": {"kind": "noise"},
+        }
+
+    monkeypatch.setattr(analytics, "backtest_stats", fake_backtest_stats)
+    result = analytics.tune_delta_score_weights(draws)
+    assert result["split_index"] == split["split_index"]
+    assert result["baseline_train"]["evaluated"] == split["train_eval"]
+    assert result["baseline_valid"]["evaluated"] == split["valid_eval"]
+    # 训练窗 = series[:split_index]；验证窗保留 min_prior 期前置
+    assert (split["split_index"], "wave_round") in calls
+    assert (split["sample_size"] - (split["split_index"] - 2), "wave_round") in calls
 

@@ -22,6 +22,7 @@ from typing import Any, Iterable, Sequence
 
 from services.lottery import (
     DEFAULT_AVOID_COLD_DAYS,
+    DEFAULT_LATTICE_WINDOW,
     DEFAULT_SETTINGS,
     DEFAULT_TREND_WINDOW,
     MODE_SINGLE,
@@ -30,6 +31,7 @@ from services.lottery import (
     PICK_STRATEGY_SCORE_TOP,
     PICK_STRATEGY_WAVE_ROUND,
     TREND_BIAS_COLD,
+    TREND_BIAS_EXPLICIT_KEY,
     TREND_BIAS_HOT,
     TREND_BIAS_LABELS,
     TREND_BIAS_MID,
@@ -740,8 +742,10 @@ def backtest_stats(
     notes = [
         f"回测只使用本池已导入的 {sample_size} 期数据，结果是样本内表现，"
         "不构成对未来命中能力的任何承诺。",
-        "每期预测严格只使用该期之前的数据（walk-forward），实现上通过"
-        " history = specials[:index] 与 latest = specials[index-1] 保证无未来函数。",
+        "每期预测严格只使用该期之前的数据（walk-forward）：history 取"
+        " list(reversed(specials[:index]))、latest 取 specials[index-1]，"
+        "保证无未来函数。注意 history 必须是「最新在前」——"
+        "直接传 specials[:index] 会把冷号 / 重号 / 波动线取样窗口整体反向。",
     ]
     if evaluated == 0:
         notes.append(
@@ -1101,13 +1105,15 @@ def tune_delta_score_weights(
     held = clamp_settings(base)
     held["trend_bias_explicit"] = True
 
-    ratio = min(0.9, max(0.5, float(train_ratio)))
-    # 可评估期从 min_prior_draws 起；按可评估长度切 train/valid
-    eval_start = max(1, int(min_prior_draws))
-    eval_count = max(0, sample_size - eval_start)
-    train_eval = int(eval_count * ratio)
+    # 复用通用 walk-forward 切分（与 walk_forward_config_search 同源，口径一致）
+    split = walk_forward_split(
+        draws, train_ratio=train_ratio, min_prior_draws=min_prior_draws
+    )
+    ratio = split["train_ratio"]
+    eval_count = split["eval_count"]
+    train_eval = split["train_eval"]
     # 至少留 20 期验证；训练至少 30 期可评估
-    if eval_count < 50 or train_eval < 30 or (eval_count - train_eval) < 20:
+    if split["data_status"] != DATA_STATUS_OK:
         notes = [
             f"数据不足：可评估 {eval_count} 期，无法做 train/valid 切分调参"
             f"（建议至少约 50 期可评估）。",
@@ -1126,12 +1132,10 @@ def tune_delta_score_weights(
         )
         return envelope
 
-    split_index = eval_start + train_eval  # series 下标：valid 从这里开始评估
-    train_draws = series[:split_index]
-    # valid 回测需要前置历史，所以仍喂全序列，但只统计 split 之后的命中
-    # 更干净：对 train / valid 各跑 backtest_stats 子序列
-    # train：series[:split_index]；valid：用 series 全量但自定义窗口较复杂
-    # 采用：train 子序列回测；valid = series[split_index - min_prior:] 以保留前置
+    split_index = split["split_index"]  # series 下标：valid 从这里开始评估
+    train_draws = split["train_draws"]
+    # valid 回测需要前置历史，所以保留 split 之前的 min_prior 期：
+    # 只有 split 之后的期计分，前置期只作历史。切分逻辑见 walk_forward_split。
 
     def _run(settings: dict[str, Any], subset: list[dict[str, Any]]) -> dict[str, Any]:
         return backtest_stats(
@@ -1146,7 +1150,7 @@ def tune_delta_score_weights(
         **held,
         "pick_strategy": PICK_STRATEGY_WAVE_ROUND,
     }
-    valid_subset = series[max(0, split_index - min_prior_draws) :]
+    valid_subset = split["valid_draws"]
     # 对齐：valid_subset 的前 min_prior 期只作历史，评估的是原 split 之后的期
     baseline_train = _run(baseline_settings, train_draws)
     baseline_valid = _run(baseline_settings, valid_subset)
@@ -1276,6 +1280,364 @@ def tune_delta_score_weights(
             "shortlist_size": len(shortlist),
             "grid_size": len(candidates),
             "notes": notes,
+        }
+    )
+    return envelope
+
+
+# --------------------------------------------------------------------------- #
+# 7. 通用 walk-forward 配置搜索（训练窗选参 / 验证窗打分）
+#
+# 与 ``tune_delta_score_weights`` 的关系：后者是「只调 4 个打分权重、固定
+# score_top、拿 wave_round 做基线」的窄版；本节把它推广成「任意设置键组合」的
+# 通用评估器。**只在训练窗选参数、只在验证窗打分**，参数绝不在被评分的窗口上选。
+#
+# 口径：本模块只做「评估」，不做多重比较校正。best-of-N 的零分布必须由调用方
+# 用置换 / 分块自助构造（见 ``scripts/tune_walk_forward.py``），否则把「扫得多
+# 所以冠军高」当成优势就是典型的数据挖掘。禁止把结果说成「已优化命中率」。
+# --------------------------------------------------------------------------- #
+WALK_FORWARD_DEFAULT_TRAIN_RATIO = 0.7
+
+# 声明式配置空间：每个键 → 候选取值。仅用于「样本内对照搜索」，不是推荐值。
+WALK_FORWARD_AXES: dict[str, tuple[Any, ...]] = {
+    "pick_strategy": (PICK_STRATEGY_WAVE_ROUND, PICK_STRATEGY_SCORE_TOP),
+    "trend_bias": (
+        TREND_BIAS_NEUTRAL,
+        TREND_BIAS_MID,
+        TREND_BIAS_HOT,
+        TREND_BIAS_COLD,
+    ),
+    "trend_window": (0, 20, 60),
+    "lattice_enabled": (False, True),
+    "lattice_window": (20, 60),
+    "repeat_number_weight": (0.0, 0.5, 1.0),
+    "repeat_zodiac_weight": (0.0, 0.5, 0.8, 1.0),
+    "stale_periods": (30, 60, 120),
+    "stale_weight": (0.0, 0.3, 0.7),
+    "avoid_cold_enabled": (False, True),
+    "avoid_cold_days": (30, 60),
+    "include_repeat_number": (True, False),
+    "exclude_repeat_zodiac": (True, False),
+    "score_w_focus": (0.0, 1.0, 2.0),
+    "score_w_mid": (0.0, 2.0, 3.0),
+    "score_w_omit": (-1.0, 0.0),
+    "score_w_diff": (0.0, 0.5),
+}
+
+
+def _canonical_config(overrides: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
+    """把一组轴取值规范化成可直接喂给 ``backtest_stats`` 的完整配置。
+
+    只做**不改变行为**的规范化：``wave_round`` 不读打分权重、点阵关闭时不读窗口、
+    避冷关闭时不读天数 —— 把它们钉回默认值，避免同一行为出现多个「不同配置」。
+    """
+    cfg = {**base, **overrides}
+    if cfg.get("pick_strategy") == PICK_STRATEGY_WAVE_ROUND:
+        for key in ("score_w_focus", "score_w_mid", "score_w_omit", "score_w_diff"):
+            cfg[key] = DEFAULT_SETTINGS[key]
+    if not cfg.get("lattice_enabled"):
+        cfg["lattice_window"] = DEFAULT_LATTICE_WINDOW
+    if not cfg.get("avoid_cold_enabled"):
+        cfg["avoid_cold_days"] = DEFAULT_AVOID_COLD_DAYS
+    # 非 neutral 的走势偏好必须带「显式设置」标记，否则读取端会回退 neutral
+    cfg[TREND_BIAS_EXPLICIT_KEY] = True
+    return clamp_settings(cfg)
+
+
+def walk_forward_axes_size() -> int:
+    """声明空间的组合数（笛卡尔积；已在语义上去重 —— 关掉的轴不再翻倍）。"""
+    product = 1
+    for values in WALK_FORWARD_AXES.values():
+        product *= len(values)
+    # lattice_enabled=False 只对应 1 个真实点（窗口被钉回默认），故 (2)=1+1
+    # avoid_cold_enabled=False 同理；上面按全积乘多了，这里换算回真实点数：
+    lattice_axis = WALK_FORWARD_AXES["lattice_enabled"]
+    window_axis = WALK_FORWARD_AXES["lattice_window"]
+    cold_axis = WALK_FORWARD_AXES["avoid_cold_enabled"]
+    cold_days_axis = WALK_FORWARD_AXES["avoid_cold_days"]
+    product = product // (len(lattice_axis) * len(window_axis))
+    product *= 1 + (len(lattice_axis) - 1) * len(window_axis)
+    product = product // (len(cold_axis) * len(cold_days_axis))
+    product *= 1 + (len(cold_axis) - 1) * len(cold_days_axis)
+    # score 权重只有 score_top 读；wave_round 分支权重被钉回默认 → 1 个点
+    weight_product = 1
+    for key in ("score_w_focus", "score_w_mid", "score_w_omit", "score_w_diff"):
+        weight_product *= len(WALK_FORWARD_AXES[key])
+    strategy_axis = WALK_FORWARD_AXES["pick_strategy"]
+    product = product // weight_product
+    product = product // len(strategy_axis)
+    product *= 1 + (len(strategy_axis) - 1) * weight_product
+    return product
+
+
+def build_walk_forward_config_space(
+    *,
+    sample_size: int,
+    seed: int = 20261007,
+    base_settings: dict[str, Any] | None = None,
+    anchors: Sequence[dict[str, Any]] = (),
+) -> dict[str, Any]:
+    """从声明空间里**均匀随机抽样** ``sample_size`` 组配置（含给定锚点）。
+
+    随机抽样而非全量枚举：声明空间约 170 万组，全枚举不可行；固定 seed 保证可复现。
+    返回 ``configs``（完整设置 dict 列表）与每组配置的轴取值。
+    """
+    import random as _random
+
+    base = clamp_settings({**DEFAULT_SETTINGS, **(base_settings or {})})
+    rng = _random.Random(seed)
+    axes = WALK_FORWARD_AXES
+    keys = list(axes.keys())
+
+    seen: set[tuple] = set()
+    configs: list[dict[str, Any]] = []
+    axis_values: list[dict[str, Any]] = []
+    anchor_count = 0
+
+    def _add(overrides: dict[str, Any], is_anchor: bool) -> bool:
+        nonlocal anchor_count
+        cfg = _canonical_config(overrides, base)
+        key = tuple(sorted((k, repr(cfg[k])) for k in axes))
+        if key in seen:
+            return False
+        seen.add(key)
+        configs.append(cfg)
+        axis_values.append({k: cfg[k] for k in keys})
+        if is_anchor:
+            anchor_count += 1
+        return True
+
+    for anchor in anchors:
+        _add(dict(anchor), True)
+    attempts = 0
+    target = max(0, int(sample_size))
+    while len(configs) < target and attempts < target * 200 + 1000:
+        attempts += 1
+        overrides = {key: rng.choice(axes[key]) for key in keys}
+        _add(overrides, False)
+
+    return {
+        "seed": seed,
+        "declared_size": walk_forward_axes_size(),
+        "evaluated_size": len(configs),
+        "anchor_count": anchor_count,
+        "axes": {key: list(values) for key, values in axes.items()},
+        "configs": configs,
+        "axis_values": axis_values,
+    }
+
+
+def walk_forward_split(
+    draws: Iterable[dict[str, Any]],
+    *,
+    train_ratio: float = WALK_FORWARD_DEFAULT_TRAIN_RATIO,
+    min_prior_draws: int = MIN_PRIOR_DRAWS,
+) -> dict[str, Any]:
+    """把升序序列切成「训练窗 / 验证窗」，返回下标与窗口元信息（纯函数）。
+
+    训练窗 = ``series[:split_index]``；验证窗评估从 ``split_index`` 起，
+    但回测需要前置历史，所以验证用 ``series[split_index - min_prior : ]``，
+    只有 ``split_index`` 之后的期计分。参数只在训练窗上选，验证窗只打分。
+    """
+    series = normalize_draws(draws)
+    sample_size = len(series)
+    ratio = min(0.9, max(0.5, float(train_ratio)))
+    eval_start = max(1, int(min_prior_draws))
+    eval_count = max(0, sample_size - eval_start)
+    train_eval = int(eval_count * ratio)
+    split_index = eval_start + train_eval
+    train_draws = series[:split_index]
+    valid_draws = series[max(0, split_index - min_prior_draws) :]
+    enough = eval_count >= 50 and train_eval >= 30 and (eval_count - train_eval) >= 20
+    return {
+        "series": series,
+        "sample_size": sample_size,
+        "train_ratio": ratio,
+        "min_prior_draws": int(min_prior_draws),
+        "eval_start": eval_start,
+        "eval_count": eval_count,
+        "train_eval": train_eval,
+        "valid_eval": eval_count - train_eval,
+        "split_index": split_index,
+        "train_draws": train_draws,
+        "valid_draws": valid_draws,
+        "data_status": DATA_STATUS_OK if enough else DATA_STATUS_INSUFFICIENT,
+        "data_status_label": DATA_STATUS_LABELS[
+            DATA_STATUS_OK if enough else DATA_STATUS_INSUFFICIENT
+        ],
+        "train_first_period": train_draws[0]["period"] if train_draws else None,
+        "train_last_period": train_draws[-1]["period"] if train_draws else None,
+        "valid_first_period": (
+            series[split_index]["period"] if split_index < sample_size else None
+        ),
+        "valid_last_period": series[-1]["period"] if series else None,
+        "valid_first_date": (
+            series[split_index]["draw_date"].isoformat()
+            if split_index < sample_size
+            else None
+        ),
+        "valid_last_date": series[-1]["draw_date"].isoformat() if series else None,
+    }
+
+
+def walk_forward_eval_config(
+    series: Sequence[dict[str, Any]],
+    config: dict[str, Any],
+    *,
+    split_index: int,
+    min_prior_draws: int = MIN_PRIOR_DRAWS,
+) -> dict[str, Any]:
+    """对单个配置同时跑训练窗 / 验证窗回测，返回两窗的命中与 Δ。
+
+    ``series`` 必须是 ``normalize_draws`` 后的升序序列。
+    """
+    train_draws = list(series[:split_index])
+    valid_draws = list(series[max(0, split_index - min_prior_draws) :])
+    train_out = backtest_stats(
+        train_draws,
+        base_settings=config,
+        min_prior_draws=min_prior_draws,
+        include_results=False,
+        include_wave_breakdown=False,
+    )
+    valid_out = backtest_stats(
+        valid_draws,
+        base_settings=config,
+        min_prior_draws=min_prior_draws,
+        include_results=False,
+        include_wave_breakdown=False,
+    )
+    return {
+        "train_hits": train_out.get("hits"),
+        "train_evaluated": train_out.get("evaluated"),
+        "train_hit_rate": train_out.get("hit_rate"),
+        "train_delta": train_out.get("hit_rate_minus_baseline"),
+        "valid_hits": valid_out.get("hits"),
+        "valid_evaluated": valid_out.get("evaluated"),
+        "valid_hit_rate": valid_out.get("hit_rate"),
+        "valid_delta": valid_out.get("hit_rate_minus_baseline"),
+        "valid_verdict": (valid_out.get("verdict") or {}).get("kind"),
+    }
+
+
+def walk_forward_config_search(
+    draws: Iterable[dict[str, Any]],
+    *,
+    configs: Sequence[dict[str, Any]],
+    base_settings: dict[str, Any] | None = None,
+    train_ratio: float = WALK_FORWARD_DEFAULT_TRAIN_RATIO,
+    min_prior_draws: int = MIN_PRIOR_DRAWS,
+    top_k: int = 10,
+) -> dict[str, Any]:
+    """对一组预设配置做 walk-forward 评估：训练窗选参、验证窗打分。
+
+    - 每行都给训练 / 验证两窗的命中率与相对随机 Δ（英文码 + 汉字 label）。
+    - ``selected`` = 训练窗 Δ 最高那组的**验证窗**表现 —— 这才是「上线尺子」。
+    - 返回 ``max_valid_delta``（全体配置验证窗 Δ 的最大值），供调用方与
+      best-of-N 零分布对齐；本函数**不做**多重比较校正。
+    - 禁止把 ``selected`` 的高训练 Δ 说成「已优化命中率」。
+    """
+    split = walk_forward_split(
+        draws, train_ratio=train_ratio, min_prior_draws=min_prior_draws
+    )
+    sample_size = split["sample_size"]
+    envelope: dict[str, Any] = {
+        **_envelope(sample_size),
+        "train_ratio": split["train_ratio"],
+        "split": {
+            key: split[key]
+            for key in (
+                "eval_start",
+                "eval_count",
+                "train_eval",
+                "valid_eval",
+                "split_index",
+                "train_first_period",
+                "train_last_period",
+                "valid_first_period",
+                "valid_last_period",
+                "valid_first_date",
+                "valid_last_date",
+                "data_status",
+                "data_status_label",
+            )
+        },
+        "grid_size": len(configs),
+    }
+    if split["data_status"] != DATA_STATUS_OK:
+        envelope.update(
+            {
+                "data_status": DATA_STATUS_INSUFFICIENT,
+                "data_status_label": DATA_STATUS_LABELS[DATA_STATUS_INSUFFICIENT],
+                "rows": [],
+                "selected": None,
+                "max_valid_delta": None,
+                "notes": [
+                    f"数据不足：可评估 {split['eval_count']} 期，无法做 train/valid 切分"
+                    "（建议至少约 50 期可评估）。",
+                    "本结果不构成对未来命中能力的任何承诺。",
+                ],
+            }
+        )
+        return envelope
+
+    series = split["series"]
+    split_index = split["split_index"]
+    rows: list[dict[str, Any]] = []
+    for config in configs:
+        outcome = walk_forward_eval_config(
+            series, config, split_index=split_index, min_prior_draws=min_prior_draws
+        )
+        rows.append({"config": config, **outcome})
+
+    ranked = sorted(rows, key=lambda r: (-(r.get("train_delta") or -9.0),))
+    selected = ranked[0] if ranked else None
+    valid_deltas = [r.get("valid_delta") for r in rows if r.get("valid_delta") is not None]
+    best_valid_row = max(
+        (r for r in rows if r.get("valid_delta") is not None),
+        key=lambda r: r["valid_delta"],
+        default=None,
+    )
+    improved = bool(
+        selected
+        and selected.get("valid_delta") is not None
+        and selected["valid_delta"] > 0
+    )
+    envelope.update(
+        {
+            "rows": ranked,
+            "ranked_by": "train_delta_desc",
+            "selected": selected,
+            "selected_valid_delta": (
+                selected.get("valid_delta") if selected else None
+            ),
+            "max_valid_delta": max(valid_deltas) if valid_deltas else None,
+            "best_valid_config": (
+                {"config": best_valid_row["config"], **best_valid_row}
+                if best_valid_row
+                else None
+            ),
+            "selected_beats_random": improved,
+            "top_k": [
+                {
+                    "config": row["config"],
+                    "train_delta": row.get("train_delta"),
+                    "valid_delta": row.get("valid_delta"),
+                }
+                for row in ranked[: max(1, int(top_k))]
+            ],
+            "notes": [
+                f"只对照本池已导入 {sample_size} 期的样本内表现；"
+                f"训练窗评估约 {split['train_eval']} 期（至 {split['train_last_period']} 期），"
+                f"验证窗评估约 {split['valid_eval']} 期"
+                f"（{split['valid_first_period']}…{split['valid_last_period']} 期），"
+                "严格 walk-forward、无未来函数。",
+                "参数只在训练窗上挑选，验证窗只用于打分；训练窗表现更好不算上线依据。",
+                f"本轮共对照 {len(rows)} 组配置；「训练窗 Δ 冠军」的验证窗 Δ "
+                f"必须与 best-of-{len(rows)} 的置换零分布比较后才能判定，"
+                "单看数字不构成优于随机的证据。",
+                "禁止把训练窗排名靠前说成「已优化命中率」或对未来命中的承诺。",
+            ],
         }
     )
     return envelope
