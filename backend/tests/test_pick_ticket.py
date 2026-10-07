@@ -34,6 +34,9 @@ from services.lottery import (
     MODE_RANDOM,
     MODE_SINGLE,
     MODE_WEIGHTED,
+    REASON_BUDGET_TOO_SMALL_FOR_ONE_UNIT,
+    STATUS_NO_TICKET,
+    STATUS_OK,
     clamp_settings,
     recommend,
     zodiac_group,
@@ -751,3 +754,60 @@ def test_production_paths_do_not_gain_a_pick_dependency():
         text = path.read_text(encoding="utf-8")
         assert "pick_ticket" not in text, f"{path.name} 依赖了出票核心"
         assert "pick_freeze" not in text, f"{path.name} 依赖了台账适配层"
+
+
+# --------------------------------------------------------------------------- #
+# 10. 预算不足 1 个注码单位：出票单明确 no_ticket，不编造金额
+# --------------------------------------------------------------------------- #
+def test_ticket_unfundable_budget_reports_no_ticket_without_inventing_stakes():
+    """50 元预算 + 100 元注码单位：出票单零注 no_ticket，逐字说明「本次不出票」。"""
+    ticket = _ticket(settings=_settings(total_amount=50, amount_unit=100))
+
+    assert ticket["status"] == STATUS_NO_TICKET
+    assert ticket["reason_code"] == REASON_BUDGET_TOO_SMALL_FOR_ONE_UNIT
+    assert "不足 1 个金额最小单位" in ticket["reason_message"]
+    # 不编造金额：没有 picks、没有 amounts、没有 staked
+    assert ticket["picks"] == []
+    assert ticket["amounts"] == []
+    assert ticket["budget"]["staked"] == 0
+    assert ticket["budget"]["requested"] == 50
+    assert ticket["budget"]["unspent"] == 50
+    assert ticket["budget"]["within_budget"] is True
+    assert "本次不出票" in ticket["ticket_text"]
+    # 正常配置的票据不受影响（状态仍是 ok、无原因码）
+    funded = _ticket()
+    assert funded["status"] == STATUS_OK
+    assert funded["reason_code"] is None
+    assert funded["picks"]
+
+
+def test_pick_ticket_endpoint_reports_no_ticket_when_budget_below_one_unit(
+    client: TestClient,
+):
+    """接口面：预算低于存储的注码单位 → 200 + no_ticket（不是 500，也不是空票伪装）。"""
+    _import_draws(client, _synthetic_draws())
+    before = client.get("/api/settings").json()
+    # 合法存储组合：100 元预算恰好 1 个 100 元注码单位
+    saved = client.put(
+        "/api/settings", json={"total_amount": 100, "amount_unit": 100}
+    )
+    assert saved.status_code == 200, saved.text
+    try:
+        response = client.post("/api/pick/ticket", json={"budget": 5})
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["status"] == STATUS_NO_TICKET
+        assert body["reason_code"] == REASON_BUDGET_TOO_SMALL_FOR_ONE_UNIT
+        assert body["picks"] == []
+        assert body["amounts"] == []
+        assert body["budget"]["staked"] == 0
+        assert body["budget"]["unspent"] == 5
+    finally:
+        # 还原存储设置，避免污染同进程后续用例
+        client.put(
+            "/api/settings",
+            json={
+                "total_amount": before["total_amount"],
+                "amount_unit": before["amount_unit"],
+            },
+        )

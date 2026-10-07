@@ -67,6 +67,8 @@ from services.lottery import (
     PICK_COUNT_MIN,
     ROLE_LABELS,
     ROLE_ORDER,
+    STATUS_NO_TICKET,
+    STATUS_OK,
     WAVE_LABELS,
     WAVE_ORDER,
     allocate_amounts,
@@ -85,9 +87,8 @@ from services.lottery import (
     effective_pick_count,
     lattice_primary_wave,
     order_pool,
+    plan_budget,
     predict_wave_band,
-    prepare_budget,
-    random_allocation,
     recent_number_frequency,
     recommend,
     resolve_zodiac_date,
@@ -539,21 +540,20 @@ def _allocate_ranking_rows(
 def _amount_plan(
     mode: str, total: int, pick_count: int, unit: int, seed_key_value: str
 ) -> dict[str, Any]:
-    """预算规范化（与 ``recommend()`` 同口径）：单位取整 + 不足以覆盖时降级注数。"""
-    if mode == MODE_RANDOM:
-        plan = random_allocation(total, pick_count, unit, seed_key_value or None)
-        return {
-            "mode": mode,
-            "allocated_total": int(plan["allocated_total"]),
-            "pick_count": len(plan["amounts"]),
-            "notes": list(plan["notes"]),
-        }
-    plan = prepare_budget(mode, total, pick_count, unit)
+    """预算规范化（与 ``recommend()`` **同一入口** ``plan_budget``）。
+
+    返回 ``allocated_total`` / ``pick_count`` / ``notes`` / ``reason_code`` /
+    ``reason_message``。``reason_code`` 非空 ⇔ 预算连 1 个注码单位都覆盖不了
+    （有效注数 0）：调用方必须按「零注」出票，不用 0 值或 ``max(1, ...)`` 冒充。
+    """
+    plan = plan_budget(mode, total, pick_count, unit, seed=seed_key_value or None)
     return {
         "mode": mode,
         "allocated_total": int(plan["allocated_total"]),
         "pick_count": int(plan["pick_count"]),
         "notes": list(plan["notes"]),
+        "reason_code": plan["reason_code"],
+        "reason_message": plan["reason_message"],
     }
 
 
@@ -785,6 +785,9 @@ def _format_ticket_text(ticket: Mapping[str, Any]) -> str:
         f"预算 {budget.get('requested')} 元 → 投注 {budget.get('staked')} 元"
         f"（{len(picks)} 注，最小单位 {budget.get('amount_unit')} 元）"
     )
+    if ticket.get("status") == STATUS_NO_TICKET:
+        reason = ticket.get("reason_message") or ticket.get("reason_code") or ""
+        lines.append(f"本次不出票：{reason}".rstrip("："))
     for pick in picks:
         flags = [
             SOFT_REASON_LABELS[reason]
@@ -900,6 +903,12 @@ def build_ticket(
         history_dates=dates,
     )
 
+    # 出票状态（英文枚举）：ok = 正常出票；no_ticket = 零注（预算不足 1 个注码单位）。
+    # 原因码与中文说明直接沿用生产引擎的结论，本层不另造口径。
+    status = str(engine.get("status") or STATUS_OK)
+    no_ticket_reason_code = engine.get("reason_code")
+    no_ticket_reason_message = engine.get("reason_message")
+
     ctx = _engine_context(cfg, latest, history, dates)
     focus, prev_wave = _focus_order(previous, latest, cfg)
 
@@ -980,6 +989,12 @@ def build_ticket(
         "ticket_version": TICKET_VERSION,
         "claim": CLAIM_NO_EDGE,
         "claim_label": CLAIM_LABELS[CLAIM_NO_EDGE],
+        # 出票状态（英文枚举）：ok | no_ticket（零注 = 预算不足 1 个注码单位）
+        "status": status,
+        # 机器可读原因码（ok 时 null）；no_ticket 时为 BUDGET_TOO_SMALL_FOR_ONE_UNIT
+        "reason_code": no_ticket_reason_code,
+        # 中文人读说明（ok 时 null）；前端可直接展示
+        "reason_message": no_ticket_reason_message,
         "scope": f"本池已导入 {len(series)} 期数据内",
         "data": {
             "data_status": DATA_STATUS_OK,

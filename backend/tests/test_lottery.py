@@ -38,6 +38,17 @@ from services.lottery import (
     MODES,
     PICK_COUNT_MAX,
     PICK_COUNT_MIN,
+    PICK_STRATEGIES,
+    PICK_STRATEGY_SCORE_TOP,
+    PICK_STRATEGY_WAVE_ROUND,
+    REASON_AMOUNT_UNIT_EXCEEDS_TOTAL_AMOUNT,
+    REASON_AMOUNT_UNIT_NOT_POSITIVE,
+    REASON_BUDGET_TOO_SMALL_FOR_ONE_UNIT,
+    REASON_PICK_COUNT_NOT_POSITIVE,
+    REASON_TOTAL_AMOUNT_NOT_POSITIVE,
+    STATUS_NO_TICKET,
+    STATUS_OK,
+    SettingsValidationError,
     ROLE_DEFENSE,
     ROLE_PRIMARY,
     ROLE_SECONDARY,
@@ -72,13 +83,17 @@ from services.lottery import (
     is_avoid_cold_number,
     lattice_primary_wave,
     lattice_weight,
+    merge_settings_patch,
     order_pool,
+    plan_budget,
     predict_wave_band,
     random_allocation,
     random_amounts,
     recommend,
     resolve_zodiac_date,
+    select_score_top_candidates,
     soft_penalty_weight,
+    validate_settings,
     with_derived_settings,
     zodiac_numbers,
 )
@@ -2655,3 +2670,226 @@ def test_recommend_equal_role_weights_note_says_legacy():
     assert [pick["amount"] for pick in result["picks"]] == expected
     assert sum(expected) == 100
     assert any("严格均分" in note for note in result["notes"])
+
+
+# --------------------------------------------------------------------------- #
+# 13. 预算不足 1 个注码单位：显式 no_ticket（零注），不崩溃、不编造金额
+#
+# 修复前的真实崩溃（在 HEAD 复现，逐字 traceback）：
+#     File ".../services/lottery.py", line 2525, in recommend
+#         "copy_text": build_copy_text(mode, picks),
+#     File ".../services/lottery.py", line 1703, in build_copy_text
+#         amount = int(pick["amount"])
+#     KeyError: 'amount'
+# 触发条件：prepare_budget 把有效注数降为 0，select_score_top_candidates 用
+# max(1, 0) 仍返回 1 注，allocate_amounts 返回空金额 → 「有号无金额」的注。
+# 现在三个阶段共用一个 `plan_budget()` 结论，注数为 0 就整体为零注。
+# --------------------------------------------------------------------------- #
+def test_score_top_unfundable_budget_returns_no_ticket_not_crash():
+    """复现用例：score_top + 50 元预算 + 100 元注码单位 → 明确零注，不再抛 KeyError。"""
+    result = recommend(
+        latest=1,
+        previous=2,
+        history_numbers=[1, 2, 3, 4, 5, 6],
+        settings={
+            "pick_strategy": PICK_STRATEGY_SCORE_TOP,
+            "total_amount": 50,
+            "amount_unit": 100,
+        },
+    )
+    assert result["status"] == STATUS_NO_TICKET
+    assert result["reason_code"] == REASON_BUDGET_TOO_SMALL_FOR_ONE_UNIT
+    assert result["reason_message"] is not None
+    assert "不足 1 个金额最小单位" in result["reason_message"]
+    # 零注：没有任何「编造金额」的占位注
+    assert result["picks"] == []
+    assert result["staked_total"] == 0
+    assert result["copy_text"] == ""
+    # 中文说明同时进 notes，读接口的人也能看到「本次不出票」
+    assert any("不足 1 个金额最小单位" in note for note in result["notes"])
+
+
+@pytest.mark.parametrize("strategy", PICK_STRATEGIES)
+@pytest.mark.parametrize("mode", MODES)
+def test_unfundable_budget_never_raises_and_never_invents_amounts(
+    strategy: str, mode: str
+):
+    """所有策略 × 所有分配模式：预算不够 1 个注码单位 ⇒ 零注 no_ticket。"""
+    result = recommend(
+        latest=10,
+        previous=9,
+        history_numbers=list(range(1, 21)),
+        settings={
+            "pick_strategy": strategy,
+            "total_amount": 50,
+            "amount_unit": 100,
+            "avoid_cold_enabled": False,
+        },
+        mode=mode,
+    )
+    assert result["status"] == STATUS_NO_TICKET
+    assert result["reason_code"] == REASON_BUDGET_TOO_SMALL_FOR_ONE_UNIT
+    assert result["picks"] == []
+    assert result["staked_total"] == 0
+    assert result["copy_text"] == ""
+
+
+def test_plan_budget_flags_unfundable_budget_with_reason_code():
+    """``plan_budget`` 是唯一预算入口：直接暴露 no_ticket 原因码。"""
+    plan = plan_budget(MODE_EVEN, 50, 10, 100)
+    assert plan["pick_count"] == 0
+    assert plan["allocated_total"] == 0
+    assert plan["reason_code"] == REASON_BUDGET_TOO_SMALL_FOR_ONE_UNIT
+    assert "不足 1 个金额最小单位" in plan["reason_message"]
+
+    funded = plan_budget(MODE_EVEN, 100, 10, 5)
+    assert funded["pick_count"] == 10
+    assert funded["allocated_total"] == 100
+    assert funded["reason_code"] is None
+    assert funded["reason_message"] is None
+
+
+def test_select_score_top_candidates_zero_count_is_empty_not_one():
+    """注数为 0 时选号必须返回空，不能再用旧的 ``max(1, ...)`` 硬凑 1 注。"""
+    pools = build_candidate_pools(10, 2, 6)
+    selected = select_score_top_candidates(
+        pools,
+        pick_count=0,
+        focus=[WAVE_SMALL, WAVE_NORMAL, WAVE_BIG],
+        trend_counts=Counter(),
+        mid_target=3.0,
+        days_since_last={},
+        weights={},
+    )
+    assert selected == []
+
+
+def test_build_copy_text_empty_picks_is_empty_string():
+    """空票复制串为空串；绝不为了「凑格式」编造金额。"""
+    assert build_copy_text(MODE_EVEN, []) == ""
+    assert build_copy_text(MODE_RANDOM, []) == ""
+
+
+@pytest.mark.parametrize("total", [5, 10, 25, 50, 100])
+@pytest.mark.parametrize("unit", [5, 10, 25, 100])
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("strategy", PICK_STRATEGIES)
+def test_picks_and_amounts_lengths_match_across_budget_sweep(
+    total: int, unit: int, mode: str, strategy: str
+):
+    """不变量扫描：picks > 0 时，金额条数必须与号码条数逐位相等，且每注 > 0。"""
+    result = recommend(
+        latest=10,
+        previous=9,
+        history_numbers=list(range(1, 21)),
+        settings={
+            "pick_strategy": strategy,
+            "total_amount": total,
+            "amount_unit": unit,
+            "pick_count": 10,
+            "avoid_cold_enabled": False,
+        },
+        mode=mode,
+    )
+    picks = result["picks"]
+    amounts = [pick["amount"] for pick in picks]
+    assert len(amounts) == len(picks)
+    assert all(amount > 0 for amount in amounts)
+    assert all(int(amount) % unit == 0 for amount in amounts)
+    if picks:
+        assert result["status"] == STATUS_OK
+        assert result["reason_code"] is None
+        assert result["staked_total"] == sum(amounts)
+    else:
+        assert result["status"] == STATUS_NO_TICKET
+        assert result["reason_code"] == REASON_BUDGET_TOO_SMALL_FOR_ONE_UNIT
+        assert result["staked_total"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# 14. 设置写入边界：budget / amount_unit / pick_count 必须自洽
+# --------------------------------------------------------------------------- #
+def test_validate_settings_rejects_amount_unit_above_total():
+    with pytest.raises(SettingsValidationError) as excinfo:
+        validate_settings({"total_amount": 50, "amount_unit": 100, "pick_count": 10})
+    assert excinfo.value.reason_code == REASON_AMOUNT_UNIT_EXCEEDS_TOTAL_AMOUNT
+    assert "50" in excinfo.value.message and "100" in excinfo.value.message
+
+
+@pytest.mark.parametrize(
+    ("cfg", "reason_code"),
+    [
+        (
+            {"total_amount": 0, "amount_unit": 5, "pick_count": 10},
+            REASON_TOTAL_AMOUNT_NOT_POSITIVE,
+        ),
+        (
+            {"total_amount": 50, "amount_unit": 0, "pick_count": 10},
+            REASON_AMOUNT_UNIT_NOT_POSITIVE,
+        ),
+        (
+            {"total_amount": 50, "amount_unit": 5, "pick_count": 0},
+            REASON_PICK_COUNT_NOT_POSITIVE,
+        ),
+    ],
+)
+def test_validate_settings_rejects_non_positive_fields(
+    cfg: dict, reason_code: str
+):
+    with pytest.raises(SettingsValidationError) as excinfo:
+        validate_settings(cfg)
+    assert excinfo.value.reason_code == reason_code
+
+
+def test_merge_settings_patch_rejects_unfundable_budget():
+    """设置写入的唯一汇合点：amount_unit > total_amount 直接拒绝（脏配置不落库）。"""
+    with pytest.raises(SettingsValidationError) as excinfo:
+        merge_settings_patch({"total_amount": 50}, {"amount_unit": 100})
+    assert excinfo.value.reason_code == REASON_AMOUNT_UNIT_EXCEEDS_TOTAL_AMOUNT
+
+
+def test_settings_api_rejects_amount_unit_above_total_amount():
+    """``PUT /api/settings`` 对不自洽预算组合返回 422，且读取设置保持原样。"""
+    from fastapi.testclient import TestClient
+
+    from main import app
+
+    with TestClient(app) as client:
+        before = client.get("/api/settings").json()
+        response = client.put(
+            "/api/settings", json={"total_amount": 50, "amount_unit": 100}
+        )
+        assert response.status_code == 422
+        assert REASON_AMOUNT_UNIT_EXCEEDS_TOTAL_AMOUNT in response.json()["detail"]
+        # 拒绝 == 没有落库：读回逐字段与提交前一致
+        assert client.get("/api/settings").json() == before
+
+
+def test_recommend_api_unfundable_override_returns_no_ticket():
+    """运行时路径：``POST /api/recommend`` 的临场覆盖也能触发 no_ticket，且不抛错。"""
+    from fastapi.testclient import TestClient
+
+    from main import app
+
+    draws = [
+        {
+            "period": 100 + index,
+            "draw_date": f"2026-03-{index + 1:02d}",
+            "special_number": ((index * 17) % 49) + 1,
+        }
+        for index in range(12)
+    ]
+    with TestClient(app) as client:
+        assert client.post("/api/import", json={"draws": draws}).status_code == 200
+        response = client.post(
+            "/api/recommend", json={"total_amount": 50, "amount_unit": 100}
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["status"] == STATUS_NO_TICKET
+        assert body["reason_code"] == REASON_BUDGET_TOO_SMALL_FOR_ONE_UNIT
+        assert body["picks"] == []
+        assert body["staked_total"] == 0
+        assert body["copy_text"] == ""
+        # 零注不进账本（不会产生 0 成本的对账快照）
+        assert "adopted_round" not in body

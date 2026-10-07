@@ -43,6 +43,7 @@ from services.lottery import (
     NUMBER_MAX,
     NUMBER_MIN,
     WAVE_LABELS,
+    SettingsValidationError,
     classify_wave,
     recommend,
     with_derived_settings,
@@ -98,12 +99,20 @@ async def get_settings(actor=Depends(require_actor)):
 
 @router.put("/settings", response_model=SettingsOut)
 async def update_settings(payload: SettingsPatch, actor=Depends(require_actor)):
-    """更新**当前用户自己的**配置，不影响其他用户与全局模板。"""
+    """更新**当前用户自己的**配置，不影响其他用户与全局模板。
+
+    预算 / 注码 / 注数不自洽（如 ``amount_unit > total_amount``）时返回 422，
+    ``detail`` 为 ``"<REASON_CODE>: <中文说明>"``；脏配置不会落库。
+    """
     store = await get_store()
     # SettingsPatch 未声明 big_min，model_dump() 不会带出该字段
-    return with_derived_settings(
-        await store.update_settings(payload.model_dump(), actor_user_id(actor))
-    )
+    try:
+        saved = await store.update_settings(
+            payload.model_dump(), actor_user_id(actor)
+        )
+    except SettingsValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return with_derived_settings(saved)
 
 
 @router.post("/recommend")
@@ -184,7 +193,9 @@ async def post_recommend(
 
     # 真实推荐（非「假设号码」预览）自动采用：按目标期 upsert 快照。
     # 目标期 = max(period)+1；开奖入库后按同 period 回填命中。
-    if payload.number is None and draws:
+    # 零注（预算不足 1 个注码单位 → status="no_ticket"）不采用：0 成本的空票
+    # 进账本只会污染对账，且 notes 已如实说明本次不出票。
+    if payload.number is None and draws and result.get("picks"):
         target_period = await store.suggest_next_period()
         user_id = actor_user_id(actor)
         # 匿名灰度期 actor_user_id 可能为 None → 落到全局模板 0

@@ -206,6 +206,102 @@ PICK_STRATEGY_LABELS = {
 }
 PICK_STRATEGY_PATTERN = "^(" + "|".join(PICK_STRATEGIES) + ")$"
 DEFAULT_PICK_STRATEGY = PICK_STRATEGY_WAVE_ROUND
+
+# --------------------------------------------------------------------------- #
+# 出票状态 / 机器可读原因码（一律英文枚举；汉字只出现在 *_message / notes）
+#
+# 预算连 **1 个注码单位** 都覆盖不了时（``total_amount // amount_unit == 0``），
+# 推荐**不抛异常**：返回零注的 ``status = "no_ticket"`` 结果，附 reason_code +
+# 中文 message。下游（``build_copy_text`` / API 层 / 出票单层）一律按「零注」
+# 处理，绝不编造金额把空票伪装成有效票。
+# --------------------------------------------------------------------------- #
+STATUS_OK = "ok"
+STATUS_NO_TICKET = "no_ticket"
+# 运行时：预算不足 1 个注码单位（可能来自存储设置 + 本次请求覆盖）
+REASON_BUDGET_TOO_SMALL_FOR_ONE_UNIT = "BUDGET_TOO_SMALL_FOR_ONE_UNIT"
+# 设置写入校验：金额最小单位 > 最大投注金额（写入边界直接拒绝，不落库）
+REASON_AMOUNT_UNIT_EXCEEDS_TOTAL_AMOUNT = "AMOUNT_UNIT_EXCEEDS_TOTAL_AMOUNT"
+REASON_TOTAL_AMOUNT_NOT_POSITIVE = "TOTAL_AMOUNT_NOT_POSITIVE"
+REASON_AMOUNT_UNIT_NOT_POSITIVE = "AMOUNT_UNIT_NOT_POSITIVE"
+REASON_PICK_COUNT_NOT_POSITIVE = "PICK_COUNT_NOT_POSITIVE"
+REASON_MESSAGES: dict[str, str] = {
+    REASON_BUDGET_TOO_SMALL_FOR_ONE_UNIT: (
+        "最大投注金额 {total} 元不足 1 个金额最小单位（{unit} 元），本次不出票："
+        "请调高最大投注金额，或调低金额最小单位。"
+    ),
+    REASON_AMOUNT_UNIT_EXCEEDS_TOTAL_AMOUNT: (
+        "金额最小单位 {unit} 元不能大于最大投注金额 {total} 元："
+        "预算连 1 注都覆盖不了，请调高最大投注金额或调低金额最小单位。"
+    ),
+    REASON_TOTAL_AMOUNT_NOT_POSITIVE: "最大投注金额必须大于 0 元（当前 {total} 元）。",
+    REASON_AMOUNT_UNIT_NOT_POSITIVE: "金额最小单位必须大于 0 元（当前 {unit} 元）。",
+    REASON_PICK_COUNT_NOT_POSITIVE: "注数必须大于 0（当前 {pick_count}）。",
+}
+
+
+def reason_message(reason_code: str | None, **values: Any) -> str | None:
+    """原因码 → 中文提示；无原因码 / 未知原因码返回 ``None``（不编造文案）。"""
+    if not reason_code:
+        return None
+    template = REASON_MESSAGES.get(reason_code)
+    if template is None:
+        return None
+    try:
+        return template.format(**values)
+    except (KeyError, IndexError):
+        return template
+
+
+class SettingsValidationError(ValueError):
+    """设置**写入**校验失败：``reason_code``（英文枚举）+ ``message``（中文）。
+
+    ``clamp_settings`` 的读取口径保持宽松（钳制 / 回退，永不抛错），只有
+    ``merge_settings_patch``（设置写入的唯一汇合点）会抛这个异常，因此脏配置
+    不可能落库，读侧也永远不会因为脏存量数据而崩。
+    """
+
+    def __init__(self, reason_code: str, **values: Any) -> None:
+        self.reason_code = reason_code
+        self.message = reason_message(reason_code, **values) or reason_code
+        super().__init__(f"{reason_code}: {self.message}")
+
+
+def _as_int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def validate_settings(cfg: Mapping[str, Any] | None) -> None:
+    """校验一组**生效配置**是否自洽；不合法抛 ``SettingsValidationError``。
+
+    规则（边界层，越早拒绝越好）：
+    - ``total_amount <= 0`` / ``amount_unit <= 0`` / ``pick_count <= 0``；
+    - ``amount_unit > total_amount`` —— 预算连 1 注都覆盖不了，必然出不了票。
+    """
+    raw: Mapping[str, Any] = cfg if isinstance(cfg, Mapping) else {}
+    total = _as_int_or_none(raw.get("total_amount"))
+    unit = _as_int_or_none(raw.get("amount_unit"))
+    count = _as_int_or_none(raw.get("pick_count"))
+    if total is None or total <= 0:
+        raise SettingsValidationError(
+            REASON_TOTAL_AMOUNT_NOT_POSITIVE, total=raw.get("total_amount")
+        )
+    if unit is None or unit <= 0:
+        raise SettingsValidationError(
+            REASON_AMOUNT_UNIT_NOT_POSITIVE, unit=raw.get("amount_unit")
+        )
+    if count is None or count <= 0:
+        raise SettingsValidationError(
+            REASON_PICK_COUNT_NOT_POSITIVE, pick_count=raw.get("pick_count")
+        )
+    if unit > total:
+        raise SettingsValidationError(
+            REASON_AMOUNT_UNIT_EXCEEDS_TOTAL_AMOUNT, unit=unit, total=total
+        )
+
+
 # 打分权重（只影响 score_top）：正号 = 该项越大越优先被扣分后排后（见 score_candidate）。
 # 默认接近「中频 + 侧重波段 + 近号差值」；walk-forward 调参可覆盖落库值。
 DEFAULT_SCORE_W_FOCUS = 1.0
@@ -529,7 +625,11 @@ def merge_settings_patch(
         merged[key] = value
         if key == "trend_bias":
             merged[TREND_BIAS_EXPLICIT_KEY] = True
-    return clamp_settings(merged)
+    validated = clamp_settings(merged)
+    # 写入边界：预算 / 注码 / 注数必须自洽（amount_unit > total_amount 直接拒绝）。
+    # 这里抛 SettingsValidationError，由 API 层转 4xx，脏配置永远不会落库。
+    validate_settings(validated)
+    return validated
 
 
 def derive_big_min(normal_max: int) -> int:
@@ -1672,6 +1772,51 @@ def prepare_budget(
     return {"allocated_total": floored, "pick_count": count, "notes": notes}
 
 
+def plan_budget(
+    mode: str,
+    total: int,
+    pick_count: int,
+    amount_unit: int,
+    *,
+    seed: Any = None,
+) -> dict[str, Any]:
+    """**唯一**的预算规范化入口：把「模式 → 可覆盖注数 / 可分配金额」统一算一次。
+
+    返回 ``allocated_total`` / ``pick_count`` / ``notes`` / ``reason_code`` /
+    ``reason_message``。它把 ``random`` 与其余模式归一到同一形状：
+
+    - ``random``：走 ``random_allocation``（隔板法 + 同样的降级说明）；
+    - 其余：走 ``prepare_budget``（取整 + 覆盖不了时降级注数）。
+
+    ``pick_count == 0`` ⇔ 预算连 1 个注码单位都覆盖不了：此时 ``reason_code`` 非空，
+    调用方必须返回零注的 ``no_ticket`` 结果 —— **不得**用 ``max(1, ...)`` 把注数
+    抬回 1，否则「计划注数 / 实际选号 / 分配金额」三处会重新打架。
+    """
+    if mode == MODE_RANDOM:
+        plan = random_allocation(total, pick_count, amount_unit, seed)
+        allocated_total = int(plan["allocated_total"])
+        count = len(plan["amounts"])
+        notes = list(plan["notes"])
+    else:
+        plan = prepare_budget(mode, total, pick_count, amount_unit)
+        allocated_total = int(plan["allocated_total"])
+        count = int(plan["pick_count"])
+        notes = list(plan["notes"])
+
+    reason_code: str | None = None
+    if count <= 0:
+        reason_code = REASON_BUDGET_TOO_SMALL_FOR_ONE_UNIT
+    return {
+        "allocated_total": allocated_total,
+        "pick_count": count,
+        "notes": notes,
+        "reason_code": reason_code,
+        "reason_message": reason_message(
+            reason_code, total=int(total), unit=int(amount_unit)
+        ),
+    }
+
+
 def format_number(number: Any) -> str:
     """把号码格式化为定宽两位数字串（1-49 → ``01``…``49``）。
 
@@ -1683,6 +1828,9 @@ def format_number(number: Any) -> str:
 
 def build_copy_text(mode: str, picks: list[dict[str, Any]]) -> str:
     """生成一键复制的竞猜投注串（金额文案必须跟各注实际金额一致）。
+
+    空 ``picks``（例如预算不足 1 个注码单位 → ``status = "no_ticket"``）返回空串，
+    绝不编造金额；非空时每一注都必须带 ``amount``（由 ``recommend`` 按构造保证）。
 
     格式（与分配模式无关）：
     - 单号独额：``号码：金额元；``
@@ -1798,10 +1946,17 @@ def select_score_top_candidates(
 ) -> list[dict[str, Any]]:
     """从三类波动池打分，取分数最高的 ``pick_count`` 个（稳定排序）。
 
+    ``pick_count <= 0`` 时返回空列表 —— **不**用 ``max(1, ...)`` 抬回 1 注：
+    注数为 0 只可能来自「预算连 1 个注码单位都覆盖不了」，此时上游要的是
+    零注的 ``no_ticket`` 结果，硬凑 1 注会让「计划注数 / 选号 / 金额」三处不一致。
+
     ``lattice_scores`` / ``penalties`` 非空时按**乘数**作用于分数
     （点阵带内 ×1.0、软降权重号 ×0.5 …），与 ``wave_round`` 路径的
     「点阵优先 → 降权靠后」口径一致；为 ``None`` 时与改造前逐元素一致。
     """
+    limit = max(0, int(pick_count))
+    if limit <= 0:
+        return []
     scored: list[tuple[float, int, int, str, dict[str, int]]] = []
     for wave in WAVE_ORDER:
         for item in pools.get(wave) or []:
@@ -1839,7 +1994,7 @@ def select_score_top_candidates(
                 "score": round(float(points), 6),
             }
         )
-        if len(selected) >= max(1, int(pick_count)):
+        if len(selected) >= limit:
             break
     return selected
 
@@ -1907,17 +2062,17 @@ def recommend(
         )
         if amount_seed not in (None, ""):
             seed_key = f"{seed_key}|explicit={amount_seed}"
-        plan = random_allocation(total, pick_count, unit, seed_key)
-        # 降级信息（不可满足 / 非整数倍）如实进入 notes，绝不静默
-        allocation_notes.extend(plan["notes"])
-        total = plan["allocated_total"]
-        pick_count = len(plan["amounts"])
-    else:
-        # even / weighted / single：同样先按单位规范化预算与可覆盖注数
-        plan = prepare_budget(mode, total, pick_count, unit)
-        allocation_notes.extend(plan["notes"])
-        total = plan["allocated_total"]
-        pick_count = plan["pick_count"]
+
+    # 预算规范化（唯一入口，random / 其余模式同口径）：可覆盖注数 / 可分配金额 /
+    # 降级说明 / 原因码。下面「选号、角色、金额」三处全部以这里的 ``pick_count``
+    # 为准 —— 预算不够 1 个注码单位时它是 0，三处就都描述 0 注，不会再打架。
+    budget_plan = plan_budget(mode, total, pick_count, unit, seed=seed_key)
+    # 降级信息（不可满足 / 非整数倍）如实进入 notes，绝不静默
+    allocation_notes.extend(budget_plan["notes"])
+    total = budget_plan["allocated_total"]
+    pick_count = budget_plan["pick_count"]
+    no_ticket_reason: str | None = budget_plan["reason_code"]
+    no_ticket_message: str | None = budget_plan["reason_message"]
 
     history = list(history_numbers)
     dates_list = list(history_dates) if history_dates is not None else None
@@ -2257,6 +2412,13 @@ def recommend(
     )
     staked_total = sum(int(amount) for amount in amounts)
 
+    # 内部一致性（按构造保证）：picks 数量 ≤ 计划注数 ≤ 可覆盖的注码单位数，
+    # 因此 ``allocate_amounts`` 必然返回与 picks 等长的金额列表。若这里不成立，
+    # 说明三处口径发生了漂移 —— 宁可显式失败，也不产出「有号无金额」的注。
+    assert len(amounts) == len(picks), (
+        f"预算/选号/金额口径漂移：picks={len(picks)} amounts={len(amounts)}"
+    )
+
     for index, (pick, role, amount) in enumerate(zip(picks, roles, amounts)):
         cold_weight = cold_weights[index] if index < len(cold_weights) else 1.0
         number = int(pick["number"])
@@ -2297,6 +2459,12 @@ def recommend(
         pick["avoid_cold_weight"] = round(float(cold_weight), 4)
 
     notes: list[str] = [*allocation_notes]
+    if no_ticket_reason is not None:
+        # 预算连 1 个注码单位都覆盖不了：明确说明「本次不出票」，不静默给空 picks
+        notes.append(
+            no_ticket_message
+            or "预算不足 1 个金额最小单位，本次不出票。"
+        )
     if previous is None:
         notes.append("历史不足两期，无法计算上期波动，本期按平均分散处理。")
     else:
@@ -2431,7 +2599,14 @@ def recommend(
 
     # 派生展示值（deprecated）：均分后再向下对齐到 amount_unit
     effective_notes = max(1, len(picks))
+    no_ticket = len(picks) == 0
     return {
+        # 出票状态（英文枚举）：ok = 正常出票；no_ticket = 零注（预算不足 1 个注码单位）
+        "status": STATUS_NO_TICKET if no_ticket else STATUS_OK,
+        # 机器可读原因码（无异常时 None）：BUDGET_TOO_SMALL_FOR_ONE_UNIT
+        "reason_code": no_ticket_reason,
+        # 中文人读说明（无异常时 None）；前端可直接展示
+        "reason_message": no_ticket_message,
         "latest": latest,
         "latest_zodiac": zodiac_numbers(latest),
         # 生肖汉字（只增不改）：与 latest_zodiac 指向同一组号码（农历年只决定组名），
