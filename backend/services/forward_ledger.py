@@ -21,6 +21,12 @@
 - **数据不足就说数据不足**：未开奖的期只报 ``pending``，绝不提前计分；
   引擎只输出 top-k，就明说 ``mean_rank`` / ``log_loss`` / ``brier`` 不适用
   （``null``），不拿 0 或编造的排序冒充。
+- **一个开奖周期只冻结一期**：同一份已开奖前缀只能产出一个预测，所以一次冻结
+  多期只会把**同一注重复登记**（线上引擎是确定性的，选号逐字相同）。这类行由
+  ``prediction_digest`` 结构性地识别，冻结时写死 ``independent=false`` 与
+  ``duplicate_of_period``；计分时被排除出**有效独立样本**
+  （``effective_independent_rows``）—— 二项检验 / 最小可检测 Δ / 判定只按
+  有效独立样本计算，绝不把「同一注下注 k 次」当成 k 条证据。
 - 统计只针对「本账本已冻结的 N 期」，不升格为任何全量 / 市场结论。
 """
 
@@ -32,7 +38,7 @@ import math
 import random
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
 from services import analytics as A
 from services.lottery import (
@@ -89,6 +95,26 @@ UNIFORM_BRIER = (1.0 / NUMBER_COUNT) * (1.0 - 1.0 / NUMBER_COUNT)  # (1/49)(1−
 # 默认计分显著性 / 功效（与 services.analytics 同一套口径）
 DEFAULT_ALPHA = 0.05
 DEFAULT_POWER = 0.8
+
+# --------------------------------------------------------------------------- #
+# 独立性与证据强度（全部为英文枚举：落盘 / 传输用，汉字只在展示文案里）
+# --------------------------------------------------------------------------- #
+# ``prediction_digest`` 的盐：语义 = hash(策略 + 选号 + 注码 + 产生它的配置)。
+# 同一策略下两条记录若摘要相同，就是**同一个预测**被登记了两次 —— 因为同一份
+# 已开奖前缀只能产出一个预测（线上引擎确定性），所以只有开奖后才有新信息。
+PREDICTION_DIGEST_SALT = "wave-money/forward-ledger/prediction/v1"
+
+# 证据状态：样本量不足时**不给** p 值 / 判定，而不是给一个凑数的 p 值
+EVIDENCE_STATUS_NO_SCORED_ROWS = "NO_SCORED_ROWS"  # 还没有已开奖的冻结期
+EVIDENCE_STATUS_SINGLE_ROW = "SINGLE_INDEPENDENT_ROW"  # 只有 1 条有效独立预测
+EVIDENCE_STATUS_OK = "OK"  # >= 2 条有效独立预测，可以算二项检验
+
+# 独立性标记的来源（派生字段，不落盘）
+DIGEST_SOURCE_STORED = "STORED"  # 记录里存了 prediction_digest（新记录）
+DIGEST_SOURCE_DERIVED = "DERIVED"  # 老记录没有该字段，按同一规则现算
+
+# 被排除出有效独立样本的原因（英文枚举）
+EXCLUDE_REASON_DUPLICATE = "DUPLICATE_PREDICTION"
 
 
 class LedgerError(Exception):
@@ -266,6 +292,115 @@ def compute_record_hash(record: Mapping[str, Any], prev_hash: str) -> str:
     payload = {key: value for key, value in record.items() if key != "record_hash"}
     payload["prev_hash"] = str(prev_hash)
     return sha256_hex(canonical_json(payload))
+
+
+def prediction_digest(
+    strategy: str,
+    picks: Sequence[int],
+    amounts: Sequence[int],
+    settings: Mapping[str, Any] | None,
+) -> str:
+    """一个预测的稳定摘要：**策略 + 选号 + 注码 + 产生它的配置**。
+
+    用途：让「同一注重复登记」可以被**结构性**检测（而不是靠肉眼看选号像不像）。
+    刻意**不含期号 / 开奖结果**：同一注在不同期登记必须得到同一个摘要 ——
+    这正是判重的前提；若把期号算进去，重复登记就永远检测不出来。
+    """
+    payload = {
+        "salt": PREDICTION_DIGEST_SALT,
+        "strategy": str(strategy),
+        "picks": [int(number) for number in picks],
+        "amounts": [int(value) for value in amounts],
+        "settings": dict(settings or {}),
+    }
+    return sha256_hex(canonical_json(payload))
+
+
+def entry_prediction_digest(
+    entry: Mapping[str, Any], settings: Mapping[str, Any] | None
+) -> str:
+    """按策略条目现算 ``prediction_digest``（老记录没有该字段时用它补齐）。"""
+    return prediction_digest(
+        str(entry["strategy"]),
+        entry.get("picks") or [],
+        entry.get("amounts") or [],
+        settings or {},
+    )
+
+
+def independence_report(ledger: Mapping[str, Any]) -> dict[str, Any]:
+    """按账本顺序推导「每条记录 × 每个策略」的独立性标记（纯函数，不改账本）。
+
+    规则（同一策略内比较）：
+
+    - ``prediction_digest`` 首次出现 → ``independent=True`` / ``duplicate_of_period=None``；
+    - 再次出现 → ``independent=False`` / ``duplicate_of_period`` = 首次出现的期号。
+
+    向后兼容：记录里**存了** ``prediction_digest`` 就用存的（新冻结的记录），
+    没存就按完全相同的规则**现算**（``digest_source=DERIVED``）。因此历史记录
+    一个字都不用改，哈希链与链根自然保持不变。
+    """
+    seen: dict[str, dict[str, int]] = {}
+    by_period: dict[int, dict[str, dict[str, Any]]] = {}
+    for record in ledger.get("records") or []:
+        period = int(record["period"])
+        settings = record.get("settings") or {}
+        entries: dict[str, dict[str, Any]] = {}
+        for entry in record.get("strategies") or []:
+            sid = str(entry["strategy"])
+            stored = entry.get("prediction_digest")
+            digest = str(stored) if stored else entry_prediction_digest(entry, settings)
+            first = seen.setdefault(sid, {}).get(digest)
+            if first is None:
+                seen[sid][digest] = period
+                independent = True
+                duplicate_of_period: int | None = None
+            else:
+                independent = False
+                duplicate_of_period = int(first)
+            entries[sid] = {
+                "strategy": sid,
+                "period": period,
+                "prediction_digest": digest,
+                "independent": independent,
+                "duplicate_of_period": duplicate_of_period,
+                "digest_source": DIGEST_SOURCE_STORED if stored else DIGEST_SOURCE_DERIVED,
+            }
+        by_period[period] = entries
+    return {"by_period": by_period, "first_seen": seen}
+
+
+def select_effective_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[Mapping[str, Any]], list[dict[str, Any]]]:
+    """把已计分行拆成「有效独立样本」与「被排除的重复登记」两部分。
+
+    去重口径：``prediction_digest`` 在**已计分行内**首次出现的那条保留，
+    其余逐字相同者排除（``reason`` = ``DUPLICATE_PREDICTION``），并记下它重复的是哪一期。
+    没有摘要字段的行用一个按期号唯一的键兜底，等价于「视为独立」（不静默丢数据）。
+    """
+    kept: list[Mapping[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    seen: dict[str, int] = {}
+    for row in rows:
+        digest = str(row.get("prediction_digest") or f"PERIOD:{row.get('period')}")
+        first = seen.get(digest)
+        if first is None:
+            seen[digest] = int(row["period"])
+            kept.append(row)
+        else:
+            excluded.append(
+                {
+                    "period": int(row["period"]),
+                    "strategy": str(row.get("strategy")),
+                    "actual": row.get("actual"),
+                    "hit": bool(row.get("hit")),
+                    "prediction_digest": digest,
+                    "duplicate_of_period": int(first),
+                    "reason": EXCLUDE_REASON_DUPLICATE,
+                }
+            )
+    return kept, excluded
 
 
 # --------------------------------------------------------------------------- #
@@ -460,8 +595,15 @@ def build_record(
     include_fit_demo: bool = True,
     prev_hash: str = GENESIS_HASH,
     frozen_at: str | None = None,
+    seen_predictions: MutableMapping[str, dict[str, int]] | None = None,
 ) -> dict[str, Any]:
-    """构造一条冻结记录（不改账本）。目标期必须晚于全部已开奖期。"""
+    """构造一条冻结记录（不改账本）。目标期必须晚于全部已开奖期。
+
+    ``seen_predictions``：``{策略 id: {prediction_digest: 首次出现的期号}}`` 的
+    活映射（由 :func:`freeze_periods` 从已有账本播种并逐条更新）。传入时本函数会
+    为每个策略条目写死 ``prediction_digest`` / ``independent`` / ``duplicate_of_period``；
+    不传则视为「此前没有任何记录」（单条构造，全部算独立预测）。
+    """
     target = int(period)
     available = sorted(
         (
@@ -486,6 +628,28 @@ def build_record(
     entries = _strategy_entries(
         available, cfg, target, int(pick_count), bool(include_fit_demo)
     )
+    # 结构性判重：同一策略下 prediction_digest 首次出现 = 独立预测，重复出现 = 同一注重复登记
+    seen = seen_predictions if seen_predictions is not None else {}
+    duplicates: list[dict[str, Any]] = []
+    for entry in entries:
+        sid = str(entry["strategy"])
+        digest = prediction_digest(sid, entry["picks"], entry["amounts"], cfg)
+        first = seen.setdefault(sid, {}).get(digest)
+        entry["prediction_digest"] = digest
+        if first is None:
+            seen[sid][digest] = target
+            entry["independent"] = True
+            entry["duplicate_of_period"] = None
+        else:
+            entry["independent"] = False
+            entry["duplicate_of_period"] = int(first)
+            duplicates.append(
+                {
+                    "strategy": sid,
+                    "prediction_digest": digest,
+                    "duplicate_of_period": int(first),
+                }
+            )
     available_length = len(available)
     strategy_ids = [str(entry["strategy"]) for entry in entries]
     record: dict[str, Any] = {
@@ -509,6 +673,11 @@ def build_record(
             "冻结后不可改写；任何事后改动都会被 hash 链与 data_digest 查出。",
         ],
     }
+    if duplicates:
+        record["notes"].append(
+            f"本记录含 {len(duplicates)} 条重复预测（同一策略下与更早期次逐字相同的选号）："
+            "已标记 independent=false / duplicate_of_period，计分时不计入有效独立样本。"
+        )
     record["record_hash"] = compute_record_hash(record, record["prev_hash"])
     return record
 
@@ -529,6 +698,12 @@ def freeze_periods(
 
     - 目标期已开奖 → :class:`LookAheadError`（禁止事后补冻）；
     - 目标期已有记录 → :class:`ImmutabilityError`（append-only）。
+
+    一次传入多期**不会**报错，但会逐期与更早的预测比对：与更早期次**逐字相同**
+    的选号会被标记 ``independent=false`` / ``duplicate_of_period``（见
+    :func:`prediction_digest`）—— 因为同一份已开奖前缀只能产出一个预测，
+    重复登记只是在把同一注下注 k 次，不增加有效独立样本。调用方（CLI）必须
+    把这件事**大声**告诉用户；规范做法是一个开奖周期只冻结一期。
     """
     if not draws:
         raise LedgerError("开奖数据为空，无法冻结")
@@ -555,6 +730,12 @@ def freeze_periods(
     count = int(pick_count) if pick_count is not None else int(cfg["pick_count"])
     records = list(ledger.get("records") or [])
     prev_hash = str(records[-1]["record_hash"]) if records else GENESIS_HASH
+    # 从已有账本播种「已出现过的预测」：新记录才能被判出「同一注重复登记」。
+    # 老记录没有 prediction_digest 字段 → 现算（不改历史记录，链不受影响）。
+    seen_predictions = {
+        sid: dict(digests)
+        for sid, digests in independence_report(ledger)["first_seen"].items()
+    }
     for target in targets:
         record = build_record(
             period=target,
@@ -564,18 +745,38 @@ def freeze_periods(
             include_fit_demo=include_fit_demo,
             prev_hash=prev_hash,
             frozen_at=frozen_at,
+            seen_predictions=seen_predictions,
         )
         records.append(record)
         prev_hash = str(record["record_hash"])
     return {**dict(ledger), "version": LEDGER_VERSION, "records": records}
 
 
-def next_undrawn_periods(draws: Sequence[Mapping[str, Any]], count: int) -> list[int]:
-    """最新已开奖期之后的 ``count`` 个期号（按连续期号推进）。"""
+def next_undrawn_periods(
+    draws: Sequence[Mapping[str, Any]],
+    count: int,
+    *,
+    skip_periods: Iterable[int] = (),
+) -> list[int]:
+    """最新已开奖期之后、且**尚未冻结**的 ``count`` 个期号（按连续期号推进）。
+
+    ``skip_periods``（CLI 传账本里已有的期号）会被跳过。必须这样做，否则
+    「每期开奖后再冻结下一期」的规范流程会在下一次调用时撞上「已冻结但还没开奖的
+    281 期」而直接报错 —— 那会把用户逼回「一次冻结多期」的老路。
+    想显式重冻某个已存在的期号请用 ``--period``（仍然会被 append-only 拒绝）。
+    """
     if not draws:
         raise LedgerError("开奖数据为空")
     latest = max(int(draw["period"]) for draw in draws)
-    return [latest + step for step in range(1, max(1, int(count)) + 1)]
+    skip = {int(value) for value in skip_periods}
+    wanted = max(1, int(count))
+    periods: list[int] = []
+    candidate = latest
+    while len(periods) < wanted:
+        candidate += 1
+        if candidate not in skip:
+            periods.append(candidate)
+    return periods
 
 
 # --------------------------------------------------------------------------- #
@@ -594,6 +795,8 @@ def verify_ledger(
     records = list(ledger.get("records") or [])
     expected_prev = GENESIS_HASH
     details: list[dict[str, Any]] = []
+    # 按账本顺序推导的独立性标记（老记录按同一规则现算）—— 用来核对存了标记的记录
+    derived_flags = independence_report(ledger)["by_period"]
     for index, record in enumerate(records):
         record_problems: list[str] = []
         period = int(record.get("period", -1))
@@ -629,6 +832,28 @@ def verify_ledger(
                     record_problems.append(
                         f"策略 {entry.get('strategy')} 的 available_length 与记录不一致"
                     )
+            # 预测摘要 / 独立性标记：只核对**存了** 这些字段的记录（新格式）；
+            # 历史记录没有这些字段 → 跳过（向后兼容，不改写历史）
+            flags = derived_flags.get(period, {})
+            for entry in record["strategies"]:
+                sid = str(entry.get("strategy"))
+                stored_digest = entry.get("prediction_digest")
+                if stored_digest:
+                    recomputed_digest = entry_prediction_digest(entry, record.get("settings"))
+                    if str(stored_digest) != recomputed_digest:
+                        record_problems.append(
+                            f"策略 {sid} 的 prediction_digest 与选号 / 注码 / 配置不一致"
+                            "（预测摘要被改写）"
+                        )
+                    flag = flags.get(sid) or {}
+                    if "independent" in entry and (
+                        bool(entry["independent"]) != bool(flag.get("independent"))
+                        or entry.get("duplicate_of_period") != flag.get("duplicate_of_period")
+                    ):
+                        record_problems.append(
+                            f"策略 {sid} 的 independent / duplicate_of_period 与按账本"
+                            "顺序推导的结果不一致（独立性标记被改写）"
+                        )
         except (KeyError, TypeError, ValueError) as exc:
             record_problems.append(f"重算失败：{exc!r}")
 
@@ -733,45 +958,95 @@ def summarize_entries(
     rows: Sequence[Mapping[str, Any]],
     pending: int,
     *,
+    frozen_rows: int | None = None,
     alpha: float = DEFAULT_ALPHA,
     power: float = DEFAULT_POWER,
 ) -> dict[str, Any]:
-    """把一个策略的逐期明细汇成指标块（含均匀参考、二项检验、样本量需求）。"""
-    evaluated = len(rows)
-    hits = sum(1 for row in rows if row["hit"])
-    hit_rate = (hits / evaluated) if evaluated else None
-    baseline = _strategy_baseline(rows) if rows else None
-    ranks = [float(row["rank"]) for row in rows if row["rank"] is not None]
-    losses = [float(row["log_loss"]) for row in rows if row["log_loss"] is not None]
-    briers = [float(row["brier"]) for row in rows if row["brier"] is not None]
+    """把一个策略的逐期明细汇成指标块（含均匀参考、二项检验、样本量需求）。
+
+    样本量口径（关键）：
+
+    - ``scored_rows`` = 已计分的**行数**（含重复登记）—— 只用于展示；
+    - ``effective_independent_rows`` = 已计分行里 ``prediction_digest`` 去重后的条数
+      —— **二项检验 / 命中率 delta / 最小可检测 Δ / 判定全部按它算**；
+    - 重复登记的行按 ``DUPLICATE_PREDICTION`` 排除，逐条列在 ``excluded_duplicates``
+      里（可见、有理由，绝不静默折叠进统计）；
+    - 有效独立样本 < 2 时**不给** p 值 / 判定（``evidence_status`` 说明原因），
+      宁可说数据不足，也不给一个用错样本量算出来的 p 值。
+
+    注意：``total_spend`` / ``total_return`` / ``net_pnl`` 记的是**全部已计分行**的
+    真实收支（重复登记也是真金白银下注）；去重口径的收支另记在 ``independent_*``。
+    """
+    scored_rows = len(rows)
+    effective_rows, excluded = select_effective_rows(rows)
+    effective = len(effective_rows)
+    hits = sum(1 for row in effective_rows if row["hit"])
+    hit_rate = (hits / effective) if effective else None
+    baseline = _strategy_baseline(effective_rows) if effective_rows else None
+    ranks = [float(row["rank"]) for row in effective_rows if row["rank"] is not None]
+    losses = [float(row["log_loss"]) for row in effective_rows if row["log_loss"] is not None]
+    briers = [float(row["brier"]) for row in effective_rows if row["brier"] is not None]
     total_spend = float(sum(int(row["spend"]) for row in rows))
     total_return = float(sum(float(row["return"]) for row in rows))
+    independent_spend = float(sum(int(row["spend"]) for row in effective_rows))
+    independent_return = float(sum(float(row["return"]) for row in effective_rows))
+
+    if not scored_rows:
+        evidence_status = EVIDENCE_STATUS_NO_SCORED_ROWS
+    elif effective < 2:
+        evidence_status = EVIDENCE_STATUS_SINGLE_ROW
+    else:
+        evidence_status = EVIDENCE_STATUS_OK
 
     p_greater: float | None = None
     p_two_sided: float | None = None
     power_block: dict[str, Any] | None = None
     verdict: dict[str, Any] | None = None
-    if evaluated and baseline is not None:
-        p_greater = A.binomial_tail_p(hits, evaluated, baseline, alternative="greater")
-        p_two_sided = A.binomial_tail_p(hits, evaluated, baseline, alternative="two-sided")
+    if effective >= 2 and baseline is not None:
+        p_greater = A.binomial_tail_p(hits, effective, baseline, alternative="greater")
+        p_two_sided = A.binomial_tail_p(hits, effective, baseline, alternative="two-sided")
         power_block = A.minimum_detectable_delta(
-            evaluated, baseline, alpha=alpha, power=power
+            effective, baseline, alpha=alpha, power=power
         )
         difference = (hit_rate - baseline) if hit_rate is not None else None
-        standard_error = (
-            math.sqrt(baseline * (1.0 - baseline) / evaluated) if evaluated else None
-        )
+        standard_error = math.sqrt(baseline * (1.0 - baseline) / effective)
         verdict = A.backtest_verdict_payload(
-            evaluated=evaluated,
+            evaluated=effective,
             hit_rate=hit_rate,
             baseline=baseline,
             difference=difference,
             standard_error=standard_error,
         )
 
+    notes: list[str] = []
+    if excluded:
+        notes.append(
+            f"有效独立样本 {effective} 条（已计分 {scored_rows} 条）：另 {len(excluded)} 条"
+            "与更早的预测逐字相同，按 DUPLICATE_PREDICTION 排除，不计入二项检验 / "
+            "最小可检测 delta —— 同一注重复登记不增加统计功效，"
+            f"把已计分的 {scored_rows} 当成样本量会高估证据。"
+        )
+    if evidence_status == EVIDENCE_STATUS_SINGLE_ROW:
+        notes.append(
+            "只有 1 条有效独立预测：只报观测值（命中率 / 排名 / 收支），"
+            "不给 p 值、不给判定 —— 单条观测无法区分随机与优势。"
+        )
+    elif evidence_status == EVIDENCE_STATUS_NO_SCORED_ROWS:
+        notes.append("尚无已开奖的冻结期：全部记 pending，不给 p 值、不给判定。")
+
     return {
-        "evaluated": evaluated,
+        # --- 样本量三件套（frozen_rows 含待开奖；inference 用 effective_independent_rows）---
+        "frozen_rows": int(
+            frozen_rows if frozen_rows is not None else scored_rows + int(pending)
+        ),
+        "scored_rows": scored_rows,
+        "effective_independent_rows": effective,
+        "inference_sample_size": effective,
+        # 兼容字段：evaluated = 已计分行数（**不是**推断样本量）
+        "evaluated": scored_rows,
         "pending": int(pending),
+        "excluded_duplicates": excluded,
+        "evidence_status": evidence_status,
         "hits": hits,
         "hit_rate": hit_rate,
         "mean_rank": _mean(ranks),
@@ -780,6 +1055,9 @@ def summarize_entries(
         "total_spend": total_spend,
         "total_return": total_return,
         "net_pnl": total_return - total_spend,
+        "independent_spend": independent_spend,
+        "independent_return": independent_return,
+        "independent_net_pnl": independent_return - independent_spend,
         "baseline_hit_rate": baseline,
         "uniform_reference": {
             "hit_rate": (baseline if baseline is not None else None),
@@ -787,6 +1065,27 @@ def summarize_entries(
             "log_loss": UNIFORM_LOG_LOSS,
             "brier": UNIFORM_BRIER,
         },
+        # 去重口径 vs 全行口径：两套都给出，避免「把重复当证据」
+        "all_rows": {
+            "scored_rows": scored_rows,
+            "hits": sum(1 for row in rows if row["hit"]),
+            "hit_rate": (sum(1 for row in rows if row["hit"]) / scored_rows)
+            if scored_rows
+            else None,
+            "mean_rank": _mean(
+                [float(row["rank"]) for row in rows if row["rank"] is not None]
+            ),
+            "log_loss": _mean(
+                [float(row["log_loss"]) for row in rows if row["log_loss"] is not None]
+            ),
+            "brier": _mean(
+                [float(row["brier"]) for row in rows if row["brier"] is not None]
+            ),
+            "total_spend": total_spend,
+            "total_return": total_return,
+            "net_pnl": total_return - total_spend,
+        },
+        "notes": notes,
         "binomial_p_greater": p_greater,
         "binomial_p_two_sided": p_two_sided,
         "power": power_block,
@@ -802,21 +1101,31 @@ def score_ledger(
     alpha: float = DEFAULT_ALPHA,
     power: float = DEFAULT_POWER,
 ) -> dict[str, Any]:
-    """对**已开奖**的冻结记录计分；未开奖的期一律记 ``pending``，绝不提前计分。"""
+    """对**已开奖**的冻结记录计分；未开奖的期一律记 ``pending``，绝不提前计分。
+
+    每个策略块都会给出 ``frozen_rows`` / ``scored_rows`` / ``effective_independent_rows``
+    三个样本量：**推断（二项检验 / delta / 判定）只用 effective_independent_rows**，
+    重复登记的预测逐条列在 ``excluded_duplicates``。
+    """
     drawn = {int(draw["period"]): int(draw["special_number"]) for draw in draws}
     records = list(ledger.get("records") or [])
+    # 独立性标记：新记录用冻结时写死的，历史记录按同一规则现算（不改历史）
+    flags_by_period = independence_report(ledger)["by_period"]
     buckets: dict[str, list[dict[str, Any]]] = {}
     pending: dict[str, int] = {}
+    frozen: dict[str, int] = {}
     scored_periods: list[int] = []
     pending_periods: list[int] = []
 
     for record in records:
         period = int(record["period"])
         actual = drawn.get(period)
+        flags = flags_by_period.get(period, {})
         for entry in record["strategies"]:
             sid = str(entry["strategy"])
             buckets.setdefault(sid, [])
             pending.setdefault(sid, 0)
+            frozen[sid] = frozen.get(sid, 0) + 1
         if actual is None:
             pending_periods.append(period)
             for entry in record["strategies"]:
@@ -824,17 +1133,34 @@ def score_ledger(
             continue
         scored_periods.append(period)
         for entry in record["strategies"]:
+            sid = str(entry["strategy"])
             row = score_entry(entry, actual)
             row["period"] = period
             row["actual"] = actual
-            buckets[str(entry["strategy"])].append(row)
+            flag = flags.get(sid) or {}
+            row["prediction_digest"] = str(
+                flag.get("prediction_digest")
+                or entry_prediction_digest(entry, record.get("settings"))
+            )
+            row["independent"] = bool(flag.get("independent", True))
+            row["duplicate_of_period"] = flag.get("duplicate_of_period")
+            row["digest_source"] = str(flag.get("digest_source", DIGEST_SOURCE_DERIVED))
+            buckets[sid].append(row)
 
     strategies: dict[str, Any] = {}
     for sid, rows in buckets.items():
-        block = summarize_entries(rows, pending.get(sid, 0), alpha=alpha, power=power)
+        block = summarize_entries(
+            rows,
+            pending.get(sid, 0),
+            frozen_rows=frozen.get(sid, len(rows) + pending.get(sid, 0)),
+            alpha=alpha,
+            power=power,
+        )
         block["label"] = STRATEGY_LABELS.get(sid, sid)
         strategies[sid] = block
 
+    all_flags = [flag for entries in flags_by_period.values() for flag in entries.values()]
+    independent_frozen = sum(1 for flag in all_flags if flag["independent"])
     return {
         "scope": f"本账本已冻结 {len(records)} 期",
         "records": len(records),
@@ -842,6 +1168,13 @@ def score_ledger(
         "pending_periods": sorted(pending_periods),
         "drawn_periods": sorted(drawn),
         "strategies": strategies,
+        # 账本级样本量：冻结条目（策略×期）里有几条是独立预测、几条是重复登记
+        "frozen_rows_total": len(all_flags),
+        "independent_rows_frozen": independent_frozen,
+        "duplicate_rows_frozen": len(all_flags) - independent_frozen,
+        "effective_independent_rows_total": sum(
+            block["effective_independent_rows"] for block in strategies.values()
+        ),
         "data_status": A.DATA_STATUS_OK if records else A.DATA_STATUS_INSUFFICIENT,
         "data_status_label": (
             A.DATA_STATUS_LABELS[A.DATA_STATUS_OK]
@@ -852,6 +1185,9 @@ def score_ledger(
             "只对已开奖的冻结期计分；未开奖的期记为 pending，绝不用「还没发生」的结果计分。",
             "均匀参考：命中 k/49、平均排名 25.0、log-loss ln 49、Brier (1/49)(1−1/49)；"
             "k 取该策略自己的注数。",
+            "样本量口径：二项检验 / 命中率 delta / 最小可检测 delta / 判定只按"
+            " effective_independent_rows（prediction_digest 去重后的有效独立样本）计算；"
+            "重复登记的行按 DUPLICATE_PREDICTION 排除并逐条列出。",
             "统计只针对本账本已冻结的期，不升格为任何全量 / 市场结论。",
         ],
     }
@@ -869,6 +1205,20 @@ def status_payload(
         "integrity_ok": verification["ok"],
         "chain_root": verification["chain_root"],
         "integrity_problems": verification["problems"],
+        # 真实样本量：raw（冻结条目）vs 有效独立（去重后）—— 让用户随时看到真数字
+        "frozen_rows_by_strategy": {
+            sid: block["frozen_rows"] for sid, block in scoring["strategies"].items()
+        },
+        "scored_rows_by_strategy": {
+            sid: block["scored_rows"] for sid, block in scoring["strategies"].items()
+        },
+        "effective_independent_rows_by_strategy": {
+            sid: block["effective_independent_rows"]
+            for sid, block in scoring["strategies"].items()
+        },
+        "excluded_duplicates_total": sum(
+            len(block["excluded_duplicates"]) for block in scoring["strategies"].values()
+        ),
         "verdict": primary.get("verdict"),
         "minimum_detectable_delta": (primary.get("power") or {}).get(
             "minimum_detectable_delta"
