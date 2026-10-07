@@ -142,7 +142,7 @@ const ticketMode = ref<ChipMode>('even')
 const ticketRepeatNumber = ref(true)
 const ticketExcludeZodiac = ref(false)
 const ticketStale = ref(true)
-const ticketLattice = ref(true)
+const ticketLattice = ref(false)
 /** 冷号开关开启时用的降权系数（沿用设置页的值，不在这里另造数字） */
 const ticketStaleWeight = ref(STALE_WEIGHT_DEFAULT)
 
@@ -163,7 +163,7 @@ if (settings.value) {
   if (stored.mode) ticketMode.value = stored.mode as ChipMode
   ticketRepeatNumber.value = stored.include_repeat_number !== false
   ticketExcludeZodiac.value = stored.exclude_repeat_zodiac === true
-  ticketLattice.value = stored.lattice_enabled !== false
+  ticketLattice.value = stored.lattice_enabled === true
   if (typeof stored.stale_weight === 'number') {
     ticketStaleWeight.value = stored.stale_weight
   }
@@ -367,6 +367,30 @@ const avoidColdActive = computed(() =>
 /** 实际分配到各注的合计（避冷加权压低后可能 < 最大投注金额） */
 const stakedTotal = computed(() =>
   result.value?.staked_total ?? result.value?.total_amount ?? 0)
+
+/**
+ * 零注（预算连 1 个注码单位都覆盖不了）：后端返回 `status = 'no_ticket'` +
+ * 英文原因码 + 中文说明，此时 `picks` 为空。
+ *
+ * **不能把空列表当成「正常但没选到号」**：必须把原因显示出来。
+ * 老后端不返回该字段 → 按 `ok` 处理（保持原行为）。
+ */
+const NO_TICKET_FALLBACK_REASON = '预算不足以购买 1 注，请提高总金额或降低每注金额。'
+
+const noTicket = computed(() => result.value?.status === 'no_ticket')
+
+const noTicketReason = computed(() => {
+  if (result.value?.status !== 'no_ticket') return ''
+  return result.value.reason_message?.trim() || NO_TICKET_FALLBACK_REASON
+})
+
+/** 出票单的零注原因（同一口径；零注时不会产生任何金额，也不会冻结到台账） */
+const ticketNoTicket = computed(() => ticket.value?.status === 'no_ticket')
+
+const ticketNoTicketReason = computed(() => {
+  if (ticket.value?.status !== 'no_ticket') return ''
+  return ticket.value.reason_message?.trim() || NO_TICKET_FALLBACK_REASON
+})
 
 const waveTabs = [
   { type: 'small' as const, label: '小波动' },
@@ -1057,7 +1081,17 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
             </p>
           </MotionReveal>
 
-          <div class="grid gap-4 sm:grid-cols-3">
+          <!-- 零注：预算连 1 个注码单位都覆盖不了 → 说明本次不出票，不静默给空列表 -->
+          <MotionReveal v-if="noTicket" :index="5">
+            <p
+              class="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-200"
+              role="status"
+            >
+              <strong class="font-semibold">本次不出票</strong>：{{ noTicketReason }}
+            </p>
+          </MotionReveal>
+
+          <div v-if="!noTicket" class="grid gap-4 sm:grid-cols-3">
             <MotionReveal
               v-for="(pick, index) in result.picks"
               :key="pick.number"
@@ -1638,6 +1672,15 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 <StatChip tone="neutral" size="sm">{{ ticket.selection_label }}</StatChip>
                 <StatChip tone="neutral" size="sm">票号 {{ ticket.ticket_id.slice(0, 12) }}…</StatChip>
               </div>
+
+              <!-- 零注：预算连 1 个注码单位都覆盖不了 → 说明本次不出票（票面文本里也有一条） -->
+              <p
+                v-if="ticketNoTicket"
+                class="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-200"
+                role="status"
+              >
+                <strong class="font-semibold">本次不出票</strong>：{{ ticketNoTicketReason }}
+              </p>
 
               <!-- 逐注：号码 / 金额 / 标记 -->
               <div class="space-y-2">

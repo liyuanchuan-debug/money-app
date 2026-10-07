@@ -28,7 +28,7 @@ export interface LotterySettings {
   stale_periods: number
   /** 冷号降权系数：默认 0.3 */
   stale_weight: number
-  /** 预测波动线 + 号码点阵：true=带内优先取号（默认 true） */
+  /** 预测波动线 + 号码点阵：true=带内优先取号（默认 false） */
   lattice_enabled: boolean
   /** 预测波动线取样期数（0=本池全部）；默认 30 */
   lattice_window: number
@@ -173,7 +173,24 @@ export interface TrendDistributions {
   waves: Record<string, TrendWaveRoles>
 }
 
+/** 角色配额的三个分组（与后端 ``ROLE_ORDER`` 一致：主推 / 次选 / 防守） */
+type RoleQuotaKey = 'primary' | 'secondary' | 'defense'
+
 export interface RecommendResult {
+  /**
+   * 出票状态（英文枚举）：
+   * - `ok` = 正常出票；
+   * - `no_ticket` = **零注**：预算连 1 个注码单位都覆盖不了（例如最大投注金额 50 元、
+   *   金额最小单位 100 元），此时后端不再抛 500，而是如实返回零注 + 原因，
+   *   `picks` 为空、`staked_total` 为 0。
+   *
+   * 老后端不返回该字段（视为 `ok`）。展示时请配合 `reason_message`，不要自己重算预算口径。
+   */
+  status?: 'ok' | 'no_ticket'
+  /** `no_ticket` 时的机器可读原因码（英文枚举，如 `BUDGET_TOO_SMALL_FOR_ONE_UNIT`）；正常出票为 `null` */
+  reason_code?: string | null
+  /** `no_ticket` 时的中文说明（正常出票为 `null`），可直接展示给用户 */
+  reason_message?: string | null
   latest: number
   latest_zodiac: number[]
   /**
@@ -190,6 +207,27 @@ export interface RecommendResult {
   settings: LotterySettings
   mode: string
   mode_label: string
+  /** 选号策略（英文枚举 `wave_round` | `score_top`）；只增不改，老后端可能缺该字段 */
+  pick_strategy?: string
+  /** `pick_strategy` 的中文名（如「波动轮取（旧）」） */
+  pick_strategy_label?: string
+  /**
+   * 角色配额（主推 / 次选 / 防守）本次的资金分配摘要。
+   * `applied=false` 表示本次预算没有余量可分配（刚好等于「每注最低 × 注数」），
+   * 三组金额不会有差异 —— 这是如实披露，不是分配失败。
+   */
+  role_quota?: {
+    mode: string
+    applied: boolean
+    /** 三个分组的权重 */
+    weights: Record<RoleQuotaKey, number>
+    /** 三个分组的中文名 */
+    labels: Record<RoleQuotaKey, string>
+    /** 三个分组实际分到的金额合计 */
+    totals: Record<RoleQuotaKey, number>
+    /** 三个分组实际拿到的注数 */
+    counts: Record<RoleQuotaKey, number>
+  }
   /** 派生展示（deprecated）：均分后向下对齐到 amount_unit */
   bet_unit: number
   total_amount: number
@@ -403,6 +441,19 @@ export interface PickTicket {
   /** 恒为 'NO_EDGE' */
   claim: string
   claim_label: string
+  /**
+   * 出票状态（英文枚举）：
+   * - `ok` = 正常出票；
+   * - `no_ticket` = **零注**：预算连 1 个注码单位都覆盖不了，本次不出票
+   *   （`picks` 为空、`budget.staked = 0`）。后端不再抛 500，而是如实返回原因。
+   *
+   * 老后端不返回该字段（视为 `ok`）。
+   */
+  status?: 'ok' | 'no_ticket'
+  /** `no_ticket` 时的机器可读原因码（英文枚举，如 `BUDGET_TOO_SMALL_FOR_ONE_UNIT`）；正常出票为 `null` */
+  reason_code?: string | null
+  /** `no_ticket` 时的中文说明（正常出票为 `null`），可直接展示给用户 */
+  reason_message?: string | null
   scope: string
   data: {
     data_status: string

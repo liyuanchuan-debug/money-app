@@ -912,6 +912,9 @@ def test_trend_distributions_split_three_role_bands():
             "trend_window": 30,
             "small_max": 10,
             "normal_max": 30,
+            # 本用例校准在点阵开启时的频次分段上；点阵默认已改为关闭（2026-10-07），
+            # 这里显式钉住 ON，避免依赖可变的全局默认（点阵另有专门用例覆盖）。
+            "lattice_enabled": True,
         },
     )
     dist = result["trend_distributions"]
@@ -2179,7 +2182,9 @@ def test_soft_weight_settings_are_clamped():
     assert DEFAULT_SETTINGS["repeat_zodiac_weight"] == DEFAULT_REPEAT_ZODIAC_WEIGHT
     assert DEFAULT_SETTINGS["stale_periods"] == DEFAULT_STALE_PERIODS
     assert DEFAULT_SETTINGS["stale_weight"] == DEFAULT_STALE_WEIGHT
-    assert DEFAULT_SETTINGS["lattice_enabled"] is True
+    # 点阵默认关闭（2026-10-07 用户偏好：点阵把 10 注押进单一波动桶 → 双峰下注，
+    # 约 51.4% 的期数被结构性判负；EV 与开关无关，只改下注形状）。
+    assert DEFAULT_SETTINGS["lattice_enabled"] is False
     assert DEFAULT_SETTINGS["lattice_window"] == DEFAULT_LATTICE_WINDOW
 
     # 权重钳到 0..1
@@ -2197,7 +2202,8 @@ def test_soft_weight_settings_are_clamped():
     assert clamp_settings({"include_repeat_number": "false"})[
         "include_repeat_number"
     ] is False
-    assert clamp_settings({"lattice_enabled": None})["lattice_enabled"] is True
+    # None 回退到代码默认；默认已改为关闭（2026-10-07 用户偏好）
+    assert clamp_settings({"lattice_enabled": None})["lattice_enabled"] is False
     assert clamp_settings({"lattice_window": -3})["lattice_window"] == 0
 
 

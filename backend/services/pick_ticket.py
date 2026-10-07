@@ -820,6 +820,8 @@ def _format_ticket_text(ticket: Mapping[str, Any]) -> str:
         f"小 {coverage.get('big_small', {}).get('small')}；"
         f"奇 {coverage.get('odd_even', {}).get('odd')} · "
         f"偶 {coverage.get('odd_even', {}).get('even')}"
+        f"（{coverage.get('covered_count')}/{coverage.get('total_numbers')} 只表示"
+        f"引擎按名次选出的不同号个数，非摊开覆盖全部 {coverage.get('total_numbers')} 号）"
     )
     hit_rate = honest.get("baseline_hit_rate")
     hit_text = f"{hit_rate * 100:.2f}%" if hit_rate is not None else "n/a"

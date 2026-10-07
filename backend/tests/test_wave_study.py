@@ -736,9 +736,11 @@ def test_lattice_toggle_changes_the_number_in_both_configs() -> None:
     """点阵是**硬门控**：两种配置下开 / 关都不是同一个号码集合，也都不 inert。"""
     draws = _real_draws_for_backtest()
     assert _backtest(draws, lattice_enabled=False)["hits"] == 56  # 线上配置：关掉反而更高
+    # 审计快照原先靠代码默认继承 lattice_enabled=True；默认已改为 False（2026-10-07），
+    # 为保留「ON vs OFF 同配置对照」，这里对 on 显式钉住 True（off 仍显式 False）。
     on = A.backtest_stats(
         draws,
-        base_settings=WS.audit_config(),
+        base_settings={**WS.audit_config(), "lattice_enabled": True},
         include_results=False,
         include_wave_breakdown=False,
     )

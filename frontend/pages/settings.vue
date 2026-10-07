@@ -95,8 +95,8 @@ const form = reactive({
   repeat_zodiac_weight: REPEAT_ZODIAC_WEIGHT_DEFAULT,
   stale_periods: STALE_PERIODS_DEFAULT,
   stale_weight: STALE_WEIGHT_DEFAULT,
-  // 预测波动线 + 号码点阵（参与选号：带内优先）
-  lattice_enabled: true,
+  // 预测波动线 + 号码点阵（参与选号：带内优先）；默认关闭（2026-10-07 用户偏好）
+  lattice_enabled: false,
   lattice_window: LATTICE_WINDOW_DEFAULT,
   // 角色金额配额（均注模式）：主推 : 次选 : 防守 = 3:2:1（防守最低）
   role_w_primary: ROLE_WEIGHT_PRIMARY_DEFAULT,
@@ -216,7 +216,7 @@ async function load() {
     form.stale_weight = typeof settings.stale_weight === 'number'
       ? settings.stale_weight
       : STALE_WEIGHT_DEFAULT
-    form.lattice_enabled = settings.lattice_enabled !== false
+    form.lattice_enabled = settings.lattice_enabled === true
     form.lattice_window = typeof settings.lattice_window === 'number'
       ? settings.lattice_window
       : LATTICE_WINDOW_DEFAULT
@@ -392,7 +392,7 @@ async function save() {
     form.stale_weight = typeof settings.stale_weight === 'number'
       ? settings.stale_weight
       : STALE_WEIGHT_DEFAULT
-    form.lattice_enabled = settings.lattice_enabled !== false
+    form.lattice_enabled = settings.lattice_enabled === true
     form.lattice_window = typeof settings.lattice_window === 'number'
       ? settings.lattice_window
       : LATTICE_WINDOW_DEFAULT
@@ -547,7 +547,7 @@ const readonlyInputClass
                   :class="inputClass"
                 >
                 <p class="text-xs text-slate-500">
-                  均注 / 侧重 / 随机分配模式下的默认注数（1-10，默认 6）；单挑模式恒为 1 注。
+                  均注 / 侧重 / 随机分配模式下的默认注数（1-10，默认 10）；单挑模式恒为 1 注。
                 </p>
               </div>
 

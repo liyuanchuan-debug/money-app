@@ -367,7 +367,9 @@ def test_audit_is_read_only_against_memory_store_and_restores_settings():
             )["hits"]
         )
 
-        await store.update_settings({"lattice_enabled": False})
+        # 默认已改为 lattice_enabled=False（2026-10-07）；为证明「改动确实生效」，
+        # 这里把开关拨到**非默认**的 True（否则改一个等于没改的值，断言失去意义）。
+        await store.update_settings({"lattice_enabled": True})
         toggled_hits = int(
             backtest_stats(
                 draws,
@@ -397,7 +399,7 @@ def test_audit_is_read_only_against_memory_store_and_restores_settings():
     # 备份票据：改动确实生效过（否则「还原」没有意义）
     toggled_hits = extra["toggled"]
     assert toggled_hits != baseline_hits or _hits(
-        walk_forward(series, {**original, "lattice_enabled": False})
+        walk_forward(series, {**original, "lattice_enabled": True})
     ) != _hits(walk_forward(series, original))
 
 
