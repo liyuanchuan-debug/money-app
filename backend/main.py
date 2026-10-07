@@ -15,6 +15,7 @@ from routers import (
     auth_router,
     draws_router,
     lottery_router,
+    pick_router,
     stats_router,
     zodiac_router,
 )
@@ -114,6 +115,7 @@ app.include_router(api_router)
 app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(lottery_router)
+app.include_router(pick_router)
 app.include_router(draws_router)
 app.include_router(zodiac_router)
 app.include_router(stats_router)

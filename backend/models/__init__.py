@@ -17,6 +17,11 @@ from .lottery import (
     SettingsOut,
     SettingsPatch,
 )
+from .pick_ticket import (
+    PickTicketFreezeRequest,
+    PickTicketRequest,
+    PickTicketSimulateRequest,
+)
 
 __all__ = [
     "AuthConfigOut",
@@ -25,6 +30,9 @@ __all__ = [
     "LoginIn",
     "LoginOut",
     "MeOut",
+    "PickTicketFreezeRequest",
+    "PickTicketRequest",
+    "PickTicketSimulateRequest",
     "RecommendRequest",
     "RegisterIn",
     "RegisterOut",

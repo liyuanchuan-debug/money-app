@@ -4,6 +4,7 @@ import {
   CHIP_MODE_OPTIONS,
   MIN_BET_AMOUNT,
   SOFT_REASON_LABELS,
+  STALE_WEIGHT_DEFAULT,
   TOTAL_AMOUNT_MAX,
   TREND_BIAS_OPTIONS,
   TREND_WINDOW_DEFAULT,
@@ -13,7 +14,11 @@ import {
   periodsSinceLastText,
   softWeightText,
   type ChipMode,
+  type FreezeResult,
+  type LedgerStatus,
   type Pick,
+  type PickTicket,
+  type PickTicketPayload,
   type RecommendResult,
   type TrendBias,
   type TrendNumberStat,
@@ -104,6 +109,231 @@ if (settings.value?.trend_bias) {
 if (typeof settings.value?.trend_window === 'number') {
   trendWindow.value = settings.value.trend_window
 }
+
+/* ---------------------------------------------------------------------- */
+/* 出票单（选号工具）的状态                                              */
+/*                                                                        */
+/* 五件事：① 花费控制 ② 号码卫生 ③ 覆盖透明 ④ 留痕复现 ⑤ 诚实披露。      */
+/* 它**不**改变中奖概率，也**不**改变期望值 —— 页面文案必须与此一致。      */
+/* ---------------------------------------------------------------------- */
+
+/** 预算档位（元）：与后端 TOTAL_AMOUNT_MIN / MAX 和注码粒度（5 元）对齐 */
+const TICKET_BUDGET_MIN = 5
+const TICKET_BUDGET_STEP = 5
+/** 「换一批」的起始批号必须 ≥ 1：批号 0 等于「不给种子」= 生产引擎既定名次 */
+const TICKET_SEED_START = 1
+
+const ticket = ref<PickTicket | null>(null)
+const ticketPending = ref(false)
+const ticketError = ref('')
+/** null = 生产引擎既定名次；≥1 = 在引擎候选排序里滑动的窗口（「换一批」） */
+const ticketSeed = ref<number | null>(null)
+const ticketCopied = ref(false)
+const ticketCopyError = ref('')
+const ticketHit = useHitPulse()
+const ticketCopyHit = useHitPulse()
+
+/** 出票形状（初值取设置页保存的口径，本页改动不写库） */
+const ticketBudget = ref(50)
+const ticketPickCount = ref(10)
+const ticketMode = ref<ChipMode>('even')
+
+/** 号码卫生开关（初值 = 设置页口径；本页改动只作用于这次出票） */
+const ticketRepeatNumber = ref(true)
+const ticketExcludeZodiac = ref(false)
+const ticketStale = ref(true)
+const ticketLattice = ref(true)
+/** 冷号开关开启时用的降权系数（沿用设置页的值，不在这里另造数字） */
+const ticketStaleWeight = ref(STALE_WEIGHT_DEFAULT)
+
+/** 前瞻验证账本（开奖前冻结、开奖后诚实计分）—— 可选能力 */
+const ledger = ref<LedgerStatus | null>(null)
+const freezePending = ref(false)
+const freezeNotice = ref('')
+const freezeError = ref('')
+
+if (settings.value) {
+  const stored = settings.value
+  if (typeof stored.total_amount === 'number') {
+    ticketBudget.value = clampTicketBudget(stored.total_amount)
+  }
+  if (typeof stored.pick_count === 'number') {
+    ticketPickCount.value = clampTicketCount(stored.pick_count)
+  }
+  if (stored.mode) ticketMode.value = stored.mode as ChipMode
+  ticketRepeatNumber.value = stored.include_repeat_number !== false
+  ticketExcludeZodiac.value = stored.exclude_repeat_zodiac === true
+  ticketLattice.value = stored.lattice_enabled !== false
+  if (typeof stored.stale_weight === 'number') {
+    ticketStaleWeight.value = stored.stale_weight
+  }
+  ticketStale.value = ticketStaleWeight.value < 1
+}
+
+function clampTicketBudget(value: unknown): number {
+  const n = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(n)) return TICKET_BUDGET_MIN
+  const stepped = Math.round(Math.round(n / TICKET_BUDGET_STEP) * TICKET_BUDGET_STEP)
+  return Math.min(TOTAL_AMOUNT_MAX, Math.max(TICKET_BUDGET_MIN, stepped))
+}
+
+function nudgeTicketBudget(delta: number) {
+  ticketBudget.value = clampTicketBudget(ticketBudget.value + delta)
+}
+
+function onTicketBudgetInput(event: Event) {
+  const raw = (event.target as HTMLInputElement).value
+  ticketBudget.value = clampTicketBudget(raw === '' ? TICKET_BUDGET_MIN : raw)
+}
+
+function clampTicketCount(value: unknown): number {
+  const n = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(n)) return BET_COUNT_MIN
+  return Math.min(BET_COUNT_MAX, Math.max(BET_COUNT_MIN, Math.round(n)))
+}
+
+function nudgeTicketCount(delta: number) {
+  ticketPickCount.value = clampTicketCount(ticketPickCount.value + delta)
+}
+
+function onTicketCountInput(event: Event) {
+  const raw = (event.target as HTMLInputElement).value
+  ticketPickCount.value = clampTicketCount(raw === '' ? BET_COUNT_MIN : raw)
+}
+
+/** 出票请求体：开关恒为显式值（所见即所得，不依赖后端存储设置的隐式默认） */
+function ticketPayload(seed: number | null): PickTicketPayload {
+  return {
+    budget: ticketBudget.value,
+    pick_count: ticketPickCount.value,
+    mode: ticketMode.value,
+    ...(seed === null ? {} : { seed }),
+    include_repeat_number: ticketRepeatNumber.value,
+    exclude_repeat_zodiac: ticketExcludeZodiac.value,
+    stale_weight: ticketStale.value ? ticketStaleWeight.value : 1,
+    lattice_enabled: ticketLattice.value,
+  }
+}
+
+async function requestTicket(seed: number | null) {
+  if (ticketPending.value) return
+  ticketPending.value = true
+  ticketError.value = ''
+  freezeNotice.value = ''
+  freezeError.value = ''
+  ticketCopied.value = false
+  ticketCopyError.value = ''
+  try {
+    ticket.value = await api.pickTicket(ticketPayload(seed))
+    ticketSeed.value = seed
+    ticketHit.fire()
+  } catch (err: any) {
+    ticket.value = null
+    ticketError.value = err?.data?.detail || err?.message || '生成出票单失败'
+  } finally {
+    ticketPending.value = false
+  }
+}
+
+/** 生成：不给种子 = 生产引擎的既定名次（同一期重算结果完全一致） */
+async function generateTicket() {
+  await requestTicket(null)
+}
+
+/** 换一批：换一个批号，在引擎自己的候选排序里滑动窗口；期望值与上面那一张完全相同 */
+async function reshuffleTicket() {
+  const next = (ticketSeed.value ?? TICKET_SEED_START - 1) + 1
+  await requestTicket(Math.max(TICKET_SEED_START, next))
+}
+
+/** 纯文本票据（可直接粘贴）；UTF-8 无 BOM */
+function downloadText(text: string, filename: string) {
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  link.click()
+  URL.revokeObjectURL(url)
+}
+
+async function copyTicket() {
+  if (!ticket.value?.ticket_text) return
+  try {
+    await navigator.clipboard.writeText(ticket.value.ticket_text)
+    ticketCopied.value = true
+    ticketCopyError.value = ''
+    ticketCopyHit.fire()
+    setTimeout(() => (ticketCopied.value = false), 2000)
+  } catch {
+    ticketCopied.value = false
+    ticketCopyError.value = '复制失败，请手动选中下方文本'
+  }
+}
+
+/** 导出：文本 + JSON 各一份；文件名含目标期与内容摘要，便于事后对账 */
+function exportTicket() {
+  const value = ticket.value
+  if (!value) return
+  const stem = `ticket_${value.data.target_period}_${value.ticket_id}`
+  downloadText(value.ticket_text, `${stem}.txt`)
+  downloadJson(value, `${stem}.json`)
+}
+
+/** 读账本状态（可选能力：模块不在时后端返回 available=false，页面照常可用） */
+async function refreshLedger() {
+  try {
+    ledger.value = await api.pickLedger()
+  } catch {
+    ledger.value = null
+  }
+}
+
+/** 冻结到台账：开奖前冻结、冻结后不可改写；失败一律如实报出，不假装成功 */
+async function freezeTicket() {
+  const value = ticket.value
+  if (!value || freezePending.value) return
+  freezePending.value = true
+  freezeNotice.value = ''
+  freezeError.value = ''
+  try {
+    const result: FreezeResult = await api.pickFreeze(value)
+    freezeNotice.value = `已冻结第 ${result.period} 期（账本共 ${result.records_total} 条 · ${result.record_hash.slice(0, 12)}…）`
+    await refreshLedger()
+  } catch (err: any) {
+    const status = err?.status ?? err?.response?.status
+    const detail = err?.data?.detail || err?.message || '冻结失败'
+    freezeError.value = status === 501 ? `台账暂不可用：${detail}` : detail
+  } finally {
+    freezePending.value = false
+  }
+}
+
+onMounted(refreshLedger)
+
+/** 出票单里的软降权标记（与推荐卡片共用同一份展示映射，避免两处口径漂移） */
+function ticketSoftReasons(row: { soft_reasons?: string[] }): string[] {
+  return (row.soft_reasons ?? []).filter(reason => reason in SOFT_REASON_LABELS)
+}
+
+/** 百分比文案（null 照实写「—」，不编造） */
+function pct(value: number | null | undefined, digits = 2): string {
+  if (value == null || !Number.isFinite(value)) return '—'
+  return `${(value * 100).toFixed(digits)}%`
+}
+
+/** 金额文案（保留两位：期望值这类小数不该被四舍五入成整数） */
+function yuan(value: number | null | undefined, digits = 2): string {
+  if (value == null || !Number.isFinite(value)) return '—'
+  return value.toFixed(digits)
+}
+
+/** 账本是否可用（不可用时「冻结到台账」按钮降级为不可点 + 显示原因） */
+const freezeAvailable = computed(() => ledger.value?.available === true)
+const freezeUnavailableReason = computed(
+  () => ledger.value?.reason || '前瞻验证账本模块当前未接入',
+)
+
 
 const sampleSize = computed(() => normalizeDraws(rawDraws.value).length)
 const scope = computed(() => scopeLabel(sampleSize.value))
@@ -1212,8 +1442,390 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
           </GlassPanel>
         </MotionReveal>
 
+        <!-- 出票单（选号工具）：花费控制 · 号码卫生 · 覆盖透明 · 留痕复现 · 诚实披露 -->
+        <MotionReveal :index="9">
+          <GlassPanel variant="strong" padding="lg" rounded="3xl" class="space-y-4">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <h2 class="text-lg font-medium text-white">出票单</h2>
+              <StatChip tone="aqua" size="sm" dot>生成 · 换一批 · 复制 · 导出</StatChip>
+            </div>
+
+            <p class="text-xs leading-relaxed text-slate-500">
+              把上面这份候选号码落成一张可直接拿去用的票：预算精确拆到每一注、每注不低于
+              {{ MIN_BET_AMOUNT }} 元、被降权省下的钱如实列成「未投」而<strong class="font-semibold text-slate-400">不补给</strong>其它注。
+              它只管<b class="font-semibold text-slate-400">纪律、号码卫生、覆盖透明和留痕</b>，
+              不改变中奖概率，也不改变期望值。
+            </p>
+
+            <!-- 预算 / 注数 -->
+            <div class="grid gap-4 sm:grid-cols-2">
+              <div class="space-y-2">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <label id="ticket-budget-label" class="text-sm font-medium text-slate-200">预算（元）</label>
+                  <StatChip tone="neutral" size="sm">{{ TICKET_BUDGET_MIN }}–{{ TOTAL_AMOUNT_MAX }} · {{ TICKET_BUDGET_STEP }} 元一档</StatChip>
+                </div>
+                <div class="flex flex-wrap items-center gap-2" role="group" aria-labelledby="ticket-budget-label">
+                  <GlassButton
+                    variant="glass"
+                    class="min-h-[44px] min-w-[44px] px-0 text-lg"
+                    :disabled="ticketPending || ticketBudget <= TICKET_BUDGET_MIN"
+                    aria-label="减少预算"
+                    @click="nudgeTicketBudget(-TICKET_BUDGET_STEP)"
+                  >
+                    −
+                  </GlassButton>
+                  <input
+                    :value="ticketBudget"
+                    type="number"
+                    :min="TICKET_BUDGET_MIN"
+                    :max="TOTAL_AMOUNT_MAX"
+                    :step="TICKET_BUDGET_STEP"
+                    inputmode="numeric"
+                    class="num h-11 w-24 rounded-xl border border-white/15 bg-white/5 px-3 text-center text-base text-slate-100 outline-none focus:border-aqua-400/50"
+                    :disabled="ticketPending"
+                    aria-labelledby="ticket-budget-label"
+                    @change="onTicketBudgetInput"
+                  >
+                  <GlassButton
+                    variant="glass"
+                    class="min-h-[44px] min-w-[44px] px-0 text-lg"
+                    :disabled="ticketPending || ticketBudget >= TOTAL_AMOUNT_MAX"
+                    aria-label="增加预算"
+                    @click="nudgeTicketBudget(TICKET_BUDGET_STEP)"
+                  >
+                    +
+                  </GlassButton>
+                </div>
+              </div>
+
+              <div class="space-y-2">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <label id="ticket-count-label" class="text-sm font-medium text-slate-200">注数</label>
+                  <StatChip tone="neutral" size="sm">{{ BET_COUNT_MIN }}–{{ BET_COUNT_MAX }}</StatChip>
+                </div>
+                <div class="flex flex-wrap items-center gap-2" role="group" aria-labelledby="ticket-count-label">
+                  <GlassButton
+                    variant="glass"
+                    class="min-h-[44px] min-w-[44px] px-0 text-lg"
+                    :disabled="ticketPending || ticketPickCount <= BET_COUNT_MIN"
+                    aria-label="减少注数"
+                    @click="nudgeTicketCount(-1)"
+                  >
+                    −
+                  </GlassButton>
+                  <input
+                    :value="ticketPickCount"
+                    type="number"
+                    :min="BET_COUNT_MIN"
+                    :max="BET_COUNT_MAX"
+                    inputmode="numeric"
+                    class="num h-11 w-24 rounded-xl border border-white/15 bg-white/5 px-3 text-center text-base text-slate-100 outline-none focus:border-aqua-400/50"
+                    :disabled="ticketPending"
+                    aria-labelledby="ticket-count-label"
+                    @change="onTicketCountInput"
+                  >
+                  <GlassButton
+                    variant="glass"
+                    class="min-h-[44px] min-w-[44px] px-0 text-lg"
+                    :disabled="ticketPending || ticketPickCount >= BET_COUNT_MAX"
+                    aria-label="增加注数"
+                    @click="nudgeTicketCount(1)"
+                  >
+                    +
+                  </GlassButton>
+                </div>
+              </div>
+            </div>
+
+            <!-- 筹码模式（出票用，不写默认值） -->
+            <div class="space-y-2">
+              <p class="text-sm font-medium text-slate-200">筹码模式</p>
+              <div class="flex flex-wrap gap-2">
+                <GlassButton
+                  v-for="option in chipModes"
+                  :key="`ticket-mode-${option.value}`"
+                  :variant="ticketMode === option.value ? 'primary' : 'glass'"
+                  class="min-h-[44px] px-4 text-base"
+                  :disabled="ticketPending"
+                  @click="ticketMode = option.value"
+                >
+                  {{ option.label }}
+                </GlassButton>
+              </div>
+            </div>
+
+            <!-- 号码卫生开关：沿用设置页口径，仅本次出票生效 -->
+            <div class="space-y-2">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <p class="text-sm font-medium text-slate-200">号码卫生</p>
+                <StatChip tone="neutral" size="sm">只影响排序与注码分配</StatChip>
+              </div>
+              <div class="flex flex-wrap gap-2">
+                <GlassButton
+                  :variant="ticketRepeatNumber ? 'primary' : 'glass'"
+                  class="min-h-[40px] px-3 text-sm"
+                  :disabled="ticketPending"
+                  @click="ticketRepeatNumber = !ticketRepeatNumber"
+                >
+                  {{ ticketRepeatNumber ? '✓ ' : '' }}重号保留（只降权）
+                </GlassButton>
+                <GlassButton
+                  :variant="ticketExcludeZodiac ? 'primary' : 'glass'"
+                  class="min-h-[40px] px-3 text-sm"
+                  :disabled="ticketPending"
+                  @click="ticketExcludeZodiac = !ticketExcludeZodiac"
+                >
+                  {{ ticketExcludeZodiac ? '✓ ' : '' }}避开上期同肖
+                </GlassButton>
+                <GlassButton
+                  :variant="ticketStale ? 'primary' : 'glass'"
+                  class="min-h-[40px] px-3 text-sm"
+                  :disabled="ticketPending"
+                  @click="ticketStale = !ticketStale"
+                >
+                  {{ ticketStale ? '✓ ' : '' }}冷号降权
+                </GlassButton>
+                <GlassButton
+                  :variant="ticketLattice ? 'primary' : 'glass'"
+                  class="min-h-[40px] px-3 text-sm"
+                  :disabled="ticketPending"
+                  @click="ticketLattice = !ticketLattice"
+                >
+                  {{ ticketLattice ? '✓ ' : '' }}预测波动带优先
+                </GlassButton>
+              </div>
+            </div>
+
+            <!-- 行动 -->
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-center">
+              <GlassButton
+                variant="primary"
+                size="lg"
+                block
+                :loading="ticketPending"
+                :disabled="ticketPending"
+                @click="generateTicket"
+              >
+                {{ ticket ? '重新生成出票单' : '生成出票单' }}
+              </GlassButton>
+              <GlassButton
+                variant="glass"
+                size="lg"
+                block
+                class="shrink-0 sm:w-auto"
+                :disabled="ticketPending || !ticket"
+                @click="reshuffleTicket"
+              >
+                换一批
+              </GlassButton>
+              <PulseRing :trigger="ticketHit.key" tone="aqua" :rings="2" />
+            </div>
+
+            <p v-if="ticketError" class="glass-panel rounded-2xl border border-bloom-400/40 px-4 py-3 text-sm text-bloom-200" role="alert">
+              {{ ticketError }}
+            </p>
+
+            <template v-if="ticket">
+              <!-- 口径与期号 -->
+              <div class="flex flex-wrap items-center gap-2">
+                <StatChip tone="aqua" size="sm" dot>目标第 {{ ticket.data.target_period }} 期</StatChip>
+                <StatChip tone="neutral" size="sm">
+                  上期 #{{ pad(ticket.data.latest_number) }}
+                  {{ ticket.data.previous_number === null ? '' : `· 前一期 #${pad(ticket.data.previous_number)}` }}
+                </StatChip>
+                <StatChip tone="neutral" size="sm">{{ ticket.scope }}</StatChip>
+                <StatChip tone="nebula" size="sm">{{ ticket.mode_label }}</StatChip>
+                <StatChip tone="neutral" size="sm">{{ ticket.selection_label }}</StatChip>
+                <StatChip tone="neutral" size="sm">票号 {{ ticket.ticket_id.slice(0, 12) }}…</StatChip>
+              </div>
+
+              <!-- 逐注：号码 / 金额 / 标记 -->
+              <div class="space-y-2">
+                <div class="flex flex-wrap items-baseline justify-between gap-2">
+                  <p class="text-sm font-medium text-slate-200">
+                    {{ ticket.picks.length }} 注 · 合计 {{ ticket.budget.staked }} 元
+                  </p>
+                  <p class="text-xs text-slate-500">
+                    预算 {{ ticket.budget.requested }} 元
+                    <template v-if="ticket.budget.unspent > 0">
+                      · 未投 {{ ticket.budget.unspent }} 元（降权省下，不补给其它注）
+                    </template>
+                  </p>
+                </div>
+                <p class="text-[11px] leading-relaxed text-slate-500">
+                  角色（主推 / 次选 / 防守）、波动、带内、冷号都只是既有设置里的打标口径：
+                  只影响筹码分配与号码卫生偏好，<span class="text-slate-400">不代表哪一注更可能开出</span>。
+                </p>
+                <div class="grid gap-2 sm:grid-cols-2">
+                  <div
+                    v-for="row in ticket.picks"
+                    :key="`ticket-pick-${row.number}`"
+                    class="flex flex-wrap items-center gap-2 rounded-xl bg-white/5 px-3 py-2"
+                  >
+                    <span class="num text-base font-semibold text-white">{{ pad(row.number) }}</span>
+                    <span class="num text-sm text-slate-200">{{ row.amount }} 元</span>
+                    <StatChip :tone="roleTones[row.role ?? ''] ?? 'neutral'" size="xs">
+                      {{ row.role_label }}
+                    </StatChip>
+                    <StatChip v-if="row.zodiac_label" tone="nebula" size="xs">
+                      {{ row.zodiac_label }}
+                    </StatChip>
+                    <StatChip :tone="waveTones[row.wave_type ?? ''] ?? 'neutral'" size="xs">
+                      {{ row.wave_label }}
+                    </StatChip>
+                    <StatChip
+                      v-for="reason in ticketSoftReasons(row)"
+                      :key="`ticket-${row.number}-${reason}`"
+                      :tone="SOFT_REASON_TONES[reason] ?? 'neutral'"
+                      size="xs"
+                      dot
+                    >
+                      {{ SOFT_REASON_LABELS[reason] }}
+                    </StatChip>
+                    <StatChip v-if="row.in_lattice_band" tone="aqua" size="xs" outline>
+                      预测带内
+                    </StatChip>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 覆盖报告 -->
+              <div class="space-y-2 border-t border-white/5 pt-3">
+                <div class="flex flex-wrap items-baseline justify-between gap-2">
+                  <p class="text-sm font-medium text-slate-200">覆盖报告</p>
+                  <p class="text-xs text-slate-500">
+                    覆盖 {{ ticket.coverage.covered_count }}/{{ ticket.coverage.total_numbers }} 号 ·
+                    候选池 {{ ticket.coverage.candidate_pool_size }} 个
+                  </p>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                  <StatChip tone="neutral" size="sm">
+                    大 {{ ticket.coverage.big_small.big }}（≥{{ ticket.coverage.big_small.big_min }}）
+                  </StatChip>
+                  <StatChip tone="neutral" size="sm">小 {{ ticket.coverage.big_small.small }}</StatChip>
+                  <StatChip tone="neutral" size="sm">奇 {{ ticket.coverage.odd_even.odd }}</StatChip>
+                  <StatChip tone="neutral" size="sm">偶 {{ ticket.coverage.odd_even.even }}</StatChip>
+                  <StatChip tone="neutral" size="sm">
+                    尾数
+                    {{ ticket.coverage.tail_digit.filter(item => item.count > 0).map(item => `${item.digit}×${item.count}`).join('、') || '—' }}
+                  </StatChip>
+                </div>
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <span class="text-xs text-slate-500">生肖分布</span>
+                  <StatChip
+                    v-for="item in ticket.coverage.zodiac.filter(row => row.count > 0)"
+                    :key="`ticket-zodiac-${item.group}`"
+                    tone="nebula"
+                    size="xs"
+                  >
+                    {{ item.label || item.code || `第${item.group + 1}组` }} ×{{ item.count }}
+                  </StatChip>
+                </div>
+                <p class="text-[11px] leading-relaxed text-slate-500">
+                  {{ ticket.coverage.candidate_pool_note }}
+                  未覆盖的 {{ ticket.coverage.uncovered_count }} 个号本期不投 —— 覆盖范围是这只票的取舍，不是命中概率。
+                </p>
+              </div>
+
+              <!-- 诚实页脚：期望值 / 随机基线 / 结果分布 / 历史最久连续未中 -->
+              <div class="space-y-2 rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <p class="text-sm font-medium text-slate-200">诚实提示</p>
+                  <StatChip tone="amber" size="sm">{{ ticket.claim }} · {{ ticket.claim_label }}</StatChip>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                  <StatChip tone="bloom" size="sm">
+                    每 100 元期望 {{ yuan(ticket.honest.ev_per_100) }} 元
+                  </StatChip>
+                  <StatChip tone="bloom" size="sm">
+                    本票期望亏损 {{ yuan(ticket.honest.expected_loss_for_this_ticket) }} 元
+                  </StatChip>
+                  <StatChip tone="neutral" size="sm">
+                    命中概率 {{ pct(ticket.honest.baseline_hit_rate) }}（= {{ ticket.picks.length }}/49，不因选号改变）
+                  </StatChip>
+                  <StatChip tone="neutral" size="sm">
+                    不中 {{ pct(ticket.honest.hit_distribution.p_zero_hits) }} · 至少中一次
+                    {{ pct(ticket.honest.hit_distribution.p_at_least_one_hit) }}
+                  </StatChip>
+                </div>
+                <p class="text-[11px] leading-relaxed text-slate-500">
+                  {{ ticket.honest.ev_note }} {{ ticket.honest.baseline_note }}
+                </p>
+                <p class="text-[11px] leading-relaxed text-slate-500">
+                  本池样本内走步回测：{{ ticket.honest.in_sample.evaluated }} 期命中
+                  {{ ticket.honest.in_sample.hits }} 期（{{ pct(ticket.honest.in_sample.hit_rate) }}）vs 随机
+                  {{ pct(ticket.honest.in_sample.random_baseline_hit_rate) }}；判定
+                  {{ ticket.honest.in_sample.verdict }}（{{ ticket.honest.in_sample.verdict_label }}）。
+                  历史最久连续未中：{{ ticket.honest.in_sample.max_dry_streak_periods }} 期。
+                  {{ ticket.honest.in_sample.note }}
+                </p>
+              </div>
+
+              <!-- 复制 / 导出 / 冻结 -->
+              <div class="flex flex-col gap-3 sm:flex-row sm:items-center">
+                <GlassButton
+                  variant="primary"
+                  size="lg"
+                  block
+                  class="min-h-[48px]"
+                  @click="copyTicket"
+                >
+                  {{ ticketCopied ? '已复制 ✓' : '复制出票单' }}
+                </GlassButton>
+                <PulseRing :trigger="ticketCopyHit.key" tone="aqua" :rings="2" />
+                <GlassButton
+                  variant="glass"
+                  size="lg"
+                  class="min-h-[48px] w-full shrink-0 sm:w-auto"
+                  @click="exportTicket"
+                >
+                  导出 TXT / JSON
+                </GlassButton>
+                <GlassButton
+                  variant="glass"
+                  size="lg"
+                  class="min-h-[48px] w-full shrink-0 sm:w-auto"
+                  :loading="freezePending"
+                  :disabled="freezePending || !freezeAvailable"
+                  :title="freezeAvailable ? '开奖前冻结，开奖后按同期号诚实计分' : freezeUnavailableReason"
+                  @click="freezeTicket"
+                >
+                  冻结到台账
+                </GlassButton>
+              </div>
+
+              <p v-if="ticketCopyError" class="text-center text-xs text-bloom-300" role="alert">
+                {{ ticketCopyError }}
+              </p>
+              <p v-else-if="ticketCopied" class="text-center text-xs text-emerald-300" role="status">
+                已复制到剪贴板
+              </p>
+              <p v-if="freezeNotice" class="text-center text-xs text-emerald-300" role="status">
+                {{ freezeNotice }}
+              </p>
+              <p v-if="freezeError" class="text-center text-xs text-bloom-300" role="alert">
+                {{ freezeError }}
+              </p>
+              <p v-if="!freezeAvailable" class="text-center text-[11px] leading-relaxed text-slate-500">
+                台账暂不可用（{{ freezeUnavailableReason }}）：出票、复制、导出都不受影响；
+                冻结也可以直接用 CLI 跑
+                <code class="font-mono text-slate-400">scripts/forward_validate.py</code>。
+              </p>
+              <p v-else class="text-center text-[11px] leading-relaxed text-slate-500">
+                台账已冻结 {{ ledger?.records ?? 0 }} 期、待开奖 {{ ledger?.pending_periods?.length ?? 0 }} 期；
+                冻结只做诚实对账，不改变中奖概率与期望值。
+              </p>
+
+              <details class="rounded-2xl bg-white/5 px-4 py-3">
+                <summary class="cursor-pointer text-xs text-slate-400">查看纯文本出票单</summary>
+                <pre class="mt-2 overflow-x-auto whitespace-pre font-mono text-xs leading-relaxed text-slate-300">{{ ticket.ticket_text }}</pre>
+              </details>
+            </template>
+          </GlassPanel>
+        </MotionReveal>
+
         <!-- 说明 -->
-        <MotionReveal v-if="result.notes.length" :index="9">
+        <MotionReveal v-if="result.notes.length" :index="10">
           <GlassPanel variant="soft" padding="lg" rounded="3xl" class="space-y-1.5">
             <p v-for="note in result.notes" :key="note" class="text-xs leading-relaxed text-slate-400">
               · {{ note }}

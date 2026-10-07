@@ -283,6 +283,230 @@ export interface RecommendResult {
 }
 
 /**
+ * 出票单（选号工具）—— 字段与后端 ``services/pick_ticket.py`` 的 ``ROW_FIELDS`` 一一对应。
+ *
+ * **这一层交付什么**：纪律与花费控制、号码卫生标记、覆盖透明、留痕复现、
+ * 以及诚实的风险披露。它**不**交付「更容易中奖」：``claim`` 恒为 ``NO_EDGE``，
+ * 任何地方都不许把这些号码包装成预测结果。
+ */
+export interface TicketPick {
+  number: number
+  /** 该注实际投注金额（元）：恒为 amount_unit 的正整数倍且 ≥ 每注最低金额 */
+  amount: number
+  /** 英文枚举 primary | secondary | defense */
+  role: 'primary' | 'secondary' | 'defense' | null
+  role_label: string | null
+  /** 英文枚举 small | normal | big */
+  wave_type: 'small' | 'normal' | 'big' | null
+  wave_label: string | null
+  /** |本期号 − 上期号| */
+  diff: number | null
+  zodiac: string | null
+  zodiac_label: string | null
+  trend_count: number
+  days_since_last: number | null
+  periods_since_last: number | null
+  is_repeat_number: boolean
+  is_repeat_zodiac: boolean
+  is_stale: boolean
+  /** 三类软降权相乘后的权重（1.0 = 未降权） */
+  soft_weight: number
+  /** 英文枚举 repeat_number | repeat_zodiac | stale */
+  soft_reasons: string[]
+  soft_penalized: boolean
+  /** 这一注的金额是否**确实**被压低（受每注最低金额保护时会是 false） */
+  amount_reduced: boolean
+  lattice_weight: number
+  in_lattice_band: boolean
+  avoid_cold_penalized: boolean
+  avoid_cold_weight: number
+}
+
+/** 出票单预算块：`staked + unspent === requested`，省下的钱**不补给**其它注 */
+export interface TicketBudget {
+  requested: number
+  staked: number
+  unspent: number
+  currency: string
+  /** 注码粒度（元） */
+  amount_unit: number
+  min_bet_amount: number
+  per_pick_min_respected: boolean
+  within_budget: boolean
+  note: string
+}
+
+/** 覆盖报告：本票覆盖了 49 个号里的哪些、分布在哪些桶 */
+export interface TicketCoverage {
+  numbers: number[]
+  covered_count: number
+  total_numbers: number
+  uncovered_count: number
+  candidate_pool_size: number
+  candidate_pool_numbers: number[]
+  excluded_numbers: number[]
+  picks_within_candidate_pool: number[]
+  candidate_pool_note: string
+  zodiac: Array<{ group: number; code: string | null; label: string | null; count: number }>
+  big_small: { big_min: number; big: number; small: number }
+  odd_even: { odd: number; even: number }
+  tail_digit: Array<{ digit: number; count: number }>
+}
+
+/** 样本内走步回测摘要（只描述本池已导入的样本，不升格为任何全量结论） */
+export interface TicketInSample {
+  data_status: string
+  hits: number
+  evaluated: number
+  hit_rate: number | null
+  random_baseline_hit_rate: number | null
+  p_value: number | null
+  /** 英文枚举 ok | noise | insufficient … */
+  verdict: string
+  verdict_label: string
+  verdict_text: string
+  within_noise: boolean
+  power: Record<string, unknown> | null
+  max_dry_streak_periods: number
+  max_dry_streak_end_period: number | null
+  note: string
+}
+
+/** 诚实页脚：真实期望值 + 随机基线 + 本票结果分布（这一块是**功能**，不是免责声明） */
+export interface TicketHonest {
+  /** 机器可读标记，恒为 'NO_EDGE'：任何下游层都不得把它当预测包装 */
+  claim: string
+  claim_label: string
+  odds: number
+  odds_note: string
+  /** 每投注 100 元的期望盈亏（本游戏 = −4.0816） */
+  ev_per_100: number
+  ev_note: string
+  expected_return: number
+  expected_loss_for_this_ticket: number
+  stake_total: number
+  /** 随机基线 = 注数 / 49 */
+  baseline_hit_rate: number | null
+  baseline_note: string
+  hit_distribution: {
+    kind: string
+    p_zero_hits: number | null
+    p_at_least_one_hit: number | null
+    note: string
+  }
+  in_sample: TicketInSample
+}
+
+/** 一张完整的出票单（`POST /api/pick/ticket` 返回体） */
+export interface PickTicket {
+  ticket_version: number
+  /** 恒为 'NO_EDGE' */
+  claim: string
+  claim_label: string
+  scope: string
+  data: {
+    data_status: string
+    draws_used: number
+    latest_number: number
+    latest_period: number | null
+    latest_draw_date: string
+    previous_number: number | null
+    target_period: number
+    target_period_note: string
+  }
+  /** 英文枚举 engine_picks | engine_ranking */
+  selection: string
+  selection_label: string
+  seed: {
+    value: number | string | null
+    key: string
+    batch: number
+    reproducible: boolean
+    note: string
+  }
+  mode: string
+  mode_label: string
+  settings: Record<string, unknown> & { odds: number; amount_unit: number }
+  focus_order: Array<{ type: string; label: string }>
+  prev_wave: { number: number; diff: number; type: string; label: string } | null
+  picks: TicketPick[]
+  amounts: number[]
+  budget: TicketBudget
+  coverage: TicketCoverage
+  honest: TicketHonest
+  notes: string[]
+  ranking_size?: number
+  /** 内容摘要（sha256 前 32 位）：同 seed + 同数据 + 同设置 ⇒ 同一个 id */
+  ticket_id: string
+  /** 可直接粘贴到任何地方的纯文本出票单 */
+  ticket_text: string
+}
+
+/** `POST /api/pick/ticket` 请求体：出票形状 + 号码卫生开关（都不落库） */
+export interface PickTicketPayload {
+  budget?: number
+  pick_count?: number
+  mode?: ChipMode
+  seed?: number | string
+  include_repeat_number?: boolean
+  exclude_repeat_zodiac?: boolean
+  stale_weight?: number
+  lattice_enabled?: boolean
+}
+
+/** `POST /api/pick/simulate` 返回体：等概率假设下的结果分布与期望亏损 */
+export interface TicketSimulation {
+  claim: string
+  periods: number
+  orders: number
+  stake_total: number
+  odds: number
+  hit_rate_per_period: number | null
+  p_at_least_one_hit_period: number
+  p_no_hit_in_periods: number
+  hit_periods_mean: number
+  hit_periods_sd: number
+  expected_staked: number
+  expected_profit: number
+  expected_loss: number
+  profit_sd: number
+  profit_p05: number
+  profit_p95: number
+  p_profit_positive_normal_approx: number | null
+  per_pick: Array<{ number: number; amount: number; profit_if_hit: number }>
+  net_positive_picks: number
+  note: string
+}
+
+/** 前瞻验证账本状态（账本模块不可用时 `available=false` + `reason`） */
+export interface LedgerStatus {
+  available: boolean
+  reason?: string | null
+  ledger_path?: string | null
+  records?: number
+  scored_periods?: number[]
+  pending_periods?: number[]
+  integrity_ok?: boolean
+  chain_root?: string
+  verdict?: unknown
+  note?: string
+}
+
+/** `POST /api/pick/freeze` 回执（append-only 冻结，冻结后不可改写） */
+export interface FreezeResult {
+  ok: boolean
+  period: number
+  record_hash: string
+  prev_hash: string
+  available_length: number
+  period_index: number
+  strategies: string[]
+  records_total: number
+  ledger_path: string
+  note: string
+}
+
+/**
  * 筹码模式。取值必须与后端 ``services/lottery.py`` 的 ``MODE_EVEN`` /
  * ``MODE_WEIGHTED`` / ``MODE_SINGLE`` / ``MODE_RANDOM`` 一致
  * （``PUT /api/settings`` 与 ``POST /api/recommend`` 都按 `^(even|weighted|single|random)$` 校验）。
@@ -813,6 +1037,41 @@ export function useApi() {
       apiFetch<RecommendResult>('/api/recommend', {
         method: 'POST',
         body: options,
+      }),
+
+    /* ---------------- 出票单（选号工具） ---------------- */
+
+    /**
+     * 生成一张出票单。**不是预测接口**：它做的是花费控制、号码卫生、覆盖透明与留痕。
+     *
+     * 同 ``seed`` + 同数据 + 同设置 ⇒ 后端逐字节复现同一张票；
+     * 不传 ``seed`` = 采用生产引擎的既定名次，传了 = 在引擎候选排序里滑动一个窗口
+     * （前端「换一批」）。两者期望值完全相同。
+     */
+    pickTicket: (payload: PickTicketPayload = {}) =>
+      apiFetch<PickTicket>('/api/pick/ticket', {
+        method: 'POST',
+        body: payload,
+      }),
+
+    /** 按一张票据的形状给出诚实的结果分布与期望亏损（等概率假设，不是历史预测） */
+    pickSimulate: (ticket: PickTicket, periods = 208) =>
+      apiFetch<TicketSimulation>('/api/pick/simulate', {
+        method: 'POST',
+        body: { ticket, periods },
+      }),
+
+    /** 前瞻验证账本的进度 / 完整性 / 当前判定；账本模块缺失时 available=false */
+    pickLedger: () => apiFetch<LedgerStatus>('/api/pick/ledger'),
+
+    /**
+     * 把出票单冻结进前瞻验证账本（开奖前冻结、开奖后诚实计分）。
+     * 账本不可用时后端返回 501（调用方按「暂不可用」降级，出票流程不受影响）。
+     */
+    pickFreeze: (ticket: PickTicket, includeFitDemo = false) =>
+      apiFetch<FreezeResult>('/api/pick/freeze', {
+        method: 'POST',
+        body: { ticket, include_fit_demo: includeFitDemo },
       }),
 
     // 开奖总表（整期批量导入，落库只保留特码）
