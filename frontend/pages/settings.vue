@@ -75,15 +75,16 @@ function isTrendBias(value: unknown): value is TrendBias {
 }
 
 const form = reactive({
-  small_max: 15,
-  normal_max: 20,
+  // 与后端 services/lottery.py 的 DEFAULT_SETTINGS 对齐（10 / 30 / neutral / 不避重肖）
+  small_max: 10,
+  normal_max: 30,
   pick_count: 10,
   total_amount: 50,
   amount_unit: 5,
   odds: 47,
   mode: 'even' as ChipMode,
   exclude_repeat_zodiac: false,
-  trend_bias: 'mid' as TrendBias,
+  trend_bias: 'neutral' as TrendBias,
   trend_window: TREND_WINDOW_DEFAULT,
   // 避冷加权（自然日口径）：已被「按**期数**的软降权」取代，默认关闭
   avoid_cold_enabled: false,
