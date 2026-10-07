@@ -69,16 +69,35 @@ DEFAULT_SETTINGS_SNAPSHOT_PATH = BACKEND_ROOT / "forward_ledger" / "production_s
 STRATEGY_PRODUCTION = "PRODUCTION_ENGINE"
 STRATEGY_UNIFORM = "UNIFORM"
 STRATEGY_FIT_DEMO = "FIT_ONLY_MARKOV_1"
+# 波动法预登记主变体（= services.wave_study.PRIMARY_VARIANT_ID，``engine_component|w30|neutral``）：
+# 样本内评估窗 180 期命中 48 次（26.67%），网格冠军 51 次（28.33%），均未通过合法显著性。
+# 把它放进前瞻账本，就是为了看这条 26.67% 会向 20.41% 的随机基线回归，还是稳住。
+STRATEGY_WAVE = "WAVE_PREREGISTERED"
 STRATEGY_LABELS: dict[str, str] = {
     STRATEGY_PRODUCTION: "线上推荐引擎（仓库默认 / 生产已存配置）",
     STRATEGY_UNIFORM: "均匀随机对照（定义随机基线本身）",
     STRATEGY_FIT_DEMO: "仅拟合演示（不是预测）",
+    STRATEGY_WAVE: "波动法预登记主变体（engine_component|w30|neutral）",
 }
+# 每次冻结默认写入的策略 id（顺序 = 落盘顺序；FIT_ONLY 演示行可用 --no-fit-demo 关闭）
 ALL_STRATEGIES: tuple[str, ...] = (
     STRATEGY_PRODUCTION,
     STRATEGY_UNIFORM,
     STRATEGY_FIT_DEMO,
+    STRATEGY_WAVE,
 )
+
+# CLI 允许的策略别名（英文码 / 白话短名都收；落库一律用 STRATEGY_* 英文码）
+STRATEGY_ALIASES: dict[str, str] = {
+    "production": STRATEGY_PRODUCTION,
+    "production_engine": STRATEGY_PRODUCTION,
+    "uniform": STRATEGY_UNIFORM,
+    "fit": STRATEGY_FIT_DEMO,
+    "fit_only": STRATEGY_FIT_DEMO,
+    "fit_only_markov_1": STRATEGY_FIT_DEMO,
+    "wave": STRATEGY_WAVE,
+    "wave_preregistered": STRATEGY_WAVE,
+}
 
 # 诚实标记：LIVE = 线上真实路径；FIT_ONLY = 样本内拟合演示（与 max_fit 同码）
 FIT_ROLE_LIVE = "LIVE"
@@ -366,7 +385,8 @@ def independence_report(ledger: Mapping[str, Any]) -> dict[str, Any]:
                 "duplicate_of_period": duplicate_of_period,
                 "digest_source": DIGEST_SOURCE_STORED if stored else DIGEST_SOURCE_DERIVED,
             }
-        by_period[period] = entries
+        # 同一期可能有多条记录（append-only 追加新策略）→ 合并策略条目，而不是覆盖
+        by_period.setdefault(period, {}).update(entries)
     return {"by_period": by_period, "first_seen": seen}
 
 
@@ -563,26 +583,142 @@ def fit_only_strategy(
     }
 
 
+def wave_preregistered_variant() -> dict[str, Any]:
+    """取回研究模块里**预登记的主变体**定义（不在这里重写变体网格）。"""
+    from services import wave_study as WS  # 局部导入：只有波动法这一条策略需要它
+
+    for variant in WS.variant_grid():
+        if variant["variant_id"] == WS.PRIMARY_VARIANT_ID:
+            return dict(variant)
+    raise LedgerError(
+        f"wave_study 的变体网格里找不到预登记主变体 {WS.PRIMARY_VARIANT_ID}"
+    )
+
+
+def wave_preregistered_strategy(
+    available: Sequence[Mapping[str, Any]],
+    settings: Mapping[str, Any],
+    pick_count: int,
+) -> dict[str, Any]:
+    """波动法预登记主变体的**前瞻**输出（严格只读 ``available`` 前缀）。
+
+    复用 ``services.wave_study.wave_step`` —— 研究自己的函数，波动 / 点阵数学一个字都不
+    重写。窗口（w30）与波段阈值（``small_max=10`` / ``normal_max=30``）都取研究预登记块
+    里的固定值，**与线上配置无关**：这才叫「预登记的那一条」，而不是事后在网格里挑。
+
+    前置历史口径与研究一致：研究在 210 期里跳过最早 30 期（warmup=30）、在最后 180 期
+    上评估；本记录冻结第 280 期时，可用前缀是第 70…279 期共 210 期，变体看到的就是
+    这 210 期（``available_length = 210``），恰好对应研究评估窗里的「位置 210」。
+    """
+    from services import wave_study as WS
+
+    cfg = clamp_settings(dict(settings))
+    series = [int(row["special_number"]) for row in available]
+    if len(series) < 2:
+        raise LedgerError("历史不足两期，无法生成波动法预登记预测（波动带需要至少两期）")
+    variant = wave_preregistered_variant()
+    position = len(series)
+    # wave_step 的契约是「目标期已经在序列里、但只允许看 numbers[:position]」。前瞻冻结时
+    # 目标期还没开奖，所以补一个**从不被读取**的占位值（取前缀最后一位）：
+    #   * dist_engine.component_logweights_at → _context 只取 numbers[:target_index]；
+    #   * dist_engine.order_from_probabilities 只用 position 作平手键，不读 numbers[position]。
+    # 因此占位值取什么都不影响排序 / 概率 —— 测试里用多个占位值断言过这一点。
+    placeholder = series[-1]
+    step = WS.wave_step(
+        [*series, placeholder], position, variant, k=max(1, int(pick_count))
+    )
+    picks = [int(number) for number in step["picks"]]
+    amounts = _matched_amounts(cfg, len(picks))
+    if len(amounts) < len(picks):
+        picks = picks[: len(amounts)]
+    return {
+        "strategy": STRATEGY_WAVE,
+        "label": STRATEGY_LABELS[STRATEGY_WAVE],
+        "fit_role": FIT_ROLE_LIVE,
+        "available_length": len(series),
+        "pick_count": len(picks),
+        "picks": picks,
+        "amounts": amounts,
+        "staked_total": int(sum(amounts)),
+        "odds": float(cfg["odds"]),
+        "budget": int(cfg["total_amount"]),
+        "mode": str(cfg["mode"]),
+        "ranking": [int(number) for number in step["ranking"]],
+        "probabilities": {
+            int(number): float(value) for number, value in step["probabilities"].items()
+        },
+        # 变体身份写死在记录里（英文码），便于核对「冻结的确实是预登记那一条」
+        "variant": {
+            "variant_id": str(variant["variant_id"]),
+            "definition": str(variant["definition"]),
+            "window": int(variant["window"]),
+            "bias": str(variant["bias"]),
+            "param": variant.get("param"),
+            "band_thresholds": {
+                "small_max": int(WS.WAVE_SMALL_MAX),
+                "normal_max": int(WS.WAVE_NORMAL_MAX),
+            },
+            "warmup": int(WS.WAVE_WARMUP),
+            "k": int(WS.WAVE_K),
+            "preregistered": True,
+            "source": "services.wave_study.PRIMARY_VARIANT_ID",
+        },
+        "notes": [
+            "波动法预登记主变体（engine_component|w30|neutral）：本行是它在开奖前对目标期的"
+            "前瞻输出，严格只读可用前缀；窗口 / 波段阈值取研究预登记块（w30 / small_max=10 / "
+            "normal_max=30），与线上配置无关。",
+            "它的样本内成绩只有 26.67%（主变体 48/180），网格冠军 28.33%（51/180）——"
+            "前瞻账本要看的正是这条数字会不会向 20.41%（10/49）回归。",
+            "波动法只做样本内诚实评估，禁止进入线上推荐路径；本行仅用于命中率对照。",
+        ],
+    }
+
+
 # --------------------------------------------------------------------------- #
 # 冻结（append-only）
 # --------------------------------------------------------------------------- #
+def _planned_strategy_ids(
+    strategies: Iterable[str] | None, include_fit_demo: bool
+) -> list[str]:
+    """本次冻结会写入哪些策略 id（顺序 = 落盘顺序）。
+
+    ``strategies=None`` → 默认全部（线上引擎 / 均匀对照 / 可选 FIT_ONLY / 波动法预登记）；
+    显式传入时按给定顺序只写这些 —— 追加新策略到「已冻结但未开奖」的期时用它。
+    """
+    if strategies is not None:
+        return [str(value) for value in strategies]
+    ids = [STRATEGY_PRODUCTION, STRATEGY_UNIFORM]
+    if include_fit_demo:
+        ids.append(STRATEGY_FIT_DEMO)
+    ids.append(STRATEGY_WAVE)
+    return ids
+
+
 def _strategy_entries(
     available: Sequence[Mapping[str, Any]],
     settings: Mapping[str, Any],
     period: int,
     pick_count: int,
     include_fit_demo: bool,
+    strategies: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     cfg = clamp_settings(dict(settings))
     count = effective_pick_count(str(cfg["mode"]), int(pick_count))
-    entries = [
-        production_strategy(available, cfg, period),
-        uniform_strategy(period, cfg, count),
-    ]
-    # 均匀对照不读开奖，available_length 用前缀长度补齐（与其它策略同口径可比）
-    entries[1]["available_length"] = len(available)
-    if include_fit_demo:
-        entries.append(fit_only_strategy(available, cfg, count))
+    entries: list[dict[str, Any]] = []
+    for sid in _planned_strategy_ids(strategies, bool(include_fit_demo)):
+        if sid == STRATEGY_PRODUCTION:
+            entries.append(production_strategy(available, cfg, period))
+        elif sid == STRATEGY_UNIFORM:
+            entry = uniform_strategy(period, cfg, count)
+            # 均匀对照不读开奖，available_length 用前缀长度补齐（与其它策略同口径可比）
+            entry["available_length"] = len(available)
+            entries.append(entry)
+        elif sid == STRATEGY_FIT_DEMO:
+            entries.append(fit_only_strategy(available, cfg, count))
+        elif sid == STRATEGY_WAVE:
+            entries.append(wave_preregistered_strategy(available, cfg, count))
+        else:
+            raise LedgerError(f"未知策略 id：{sid}")
     return entries
 
 
@@ -596,8 +732,13 @@ def build_record(
     prev_hash: str = GENESIS_HASH,
     frozen_at: str | None = None,
     seen_predictions: MutableMapping[str, dict[str, int]] | None = None,
+    strategies: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """构造一条冻结记录（不改账本）。目标期必须晚于全部已开奖期。
+
+    ``strategies``：显式指定要写入的策略 id 序列（``None`` = 默认全部）。用于
+    「向一个已冻结但还没开奖的期**追加一条新策略**」—— 那正是波动法预登记变体入账
+    的方式：老记录一字不改，只 append 一条只含新策略的新记录。
 
     ``seen_predictions``：``{策略 id: {prediction_digest: 首次出现的期号}}`` 的
     活映射（由 :func:`freeze_periods` 从已有账本播种并逐条更新）。传入时本函数会
@@ -626,7 +767,12 @@ def build_record(
         )
     cfg = clamp_settings(dict(settings))
     entries = _strategy_entries(
-        available, cfg, target, int(pick_count), bool(include_fit_demo)
+        available,
+        cfg,
+        target,
+        int(pick_count),
+        bool(include_fit_demo),
+        strategies,
     )
     # 结构性判重：同一策略下 prediction_digest 首次出现 = 独立预测，重复出现 = 同一注重复登记
     seen = seen_predictions if seen_predictions is not None else {}
@@ -691,13 +837,19 @@ def freeze_periods(
     pick_count: int | None = None,
     include_fit_demo: bool = True,
     frozen_at: str | None = None,
+    strategies: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """冻结若干**尚未开奖**的期，返回追加后的新账本（不改原对象）。
 
     硬性拒绝（抛错，绝不静默覆盖）：
 
     - 目标期已开奖 → :class:`LookAheadError`（禁止事后补冻）；
-    - 目标期已有记录 → :class:`ImmutabilityError`（append-only）。
+    - 目标期的 ``(期号, 策略)`` 已有记录 → :class:`ImmutabilityError`（append-only）。
+
+    判重口径是 ``(期号, 策略)`` 而不是「期号」：这样可以在**不改动历史记录**的前提下，
+    向一个已冻结但还没开奖的期追加一条**只含新策略**的新记录（波动法预登记变体就是这么
+    入账的）；但同一策略在同一期绝不允许登记第二次 —— 同一份已开奖前缀只能产出一个预测，
+    重复登记只是把同一注下注两次。
 
     一次传入多期**不会**报错，但会逐期与更早的预测比对：与更早期次**逐字相同**
     的选号会被标记 ``independent=false`` / ``duplicate_of_period``（见
@@ -709,10 +861,15 @@ def freeze_periods(
         raise LedgerError("开奖数据为空，无法冻结")
     drawn_periods = {int(draw["period"]) for draw in draws}
     latest_drawn = max(drawn_periods)
-    existing = {int(record["period"]) for record in ledger.get("records") or []}
+    existing_pairs = {
+        (int(record["period"]), str(entry["strategy"]))
+        for record in ledger.get("records") or []
+        for entry in record.get("strategies") or []
+    }
     targets = sorted({int(value) for value in periods})
     if not targets:
         raise LedgerError("未指定任何要冻结的期号")
+    planned = _planned_strategy_ids(strategies, bool(include_fit_demo))
 
     for target in targets:
         if target <= latest_drawn:
@@ -720,10 +877,12 @@ def freeze_periods(
                 f"第 {target} 期已开奖（最新已开奖第 {latest_drawn} 期）："
                 "禁止事后补冻，只能冻结尚未开奖的期。"
             )
-        if target in existing:
+        clashes = [sid for sid in planned if (target, sid) in existing_pairs]
+        if clashes:
             raise ImmutabilityError(
-                f"第 {target} 期在本账本中已有冻结记录：账本是 append-only，"
-                "禁止覆盖或追加第二条。"
+                f"第 {target} 期已有这些策略的冻结记录：{clashes}。账本是 append-only："
+                "既禁止覆盖，也禁止对同一 (期号, 策略) 重复登记 —— 同一份已开奖前缀"
+                "只能产出一个预测，重复登记只是把同一注下注两次，不增加有效独立样本。"
             )
 
     cfg = clamp_settings(dict(settings))
@@ -746,6 +905,7 @@ def freeze_periods(
             prev_hash=prev_hash,
             frozen_at=frozen_at,
             seen_predictions=seen_predictions,
+            strategies=strategies,
         )
         records.append(record)
         prev_hash = str(record["record_hash"])
@@ -1164,8 +1324,9 @@ def score_ledger(
     return {
         "scope": f"本账本已冻结 {len(records)} 期",
         "records": len(records),
-        "scored_periods": sorted(scored_periods),
-        "pending_periods": sorted(pending_periods),
+        # 同一期可能有多条记录（追加新策略）→ 去重，避免期号重复出现
+        "scored_periods": sorted(set(scored_periods)),
+        "pending_periods": sorted(set(pending_periods)),
         "drawn_periods": sorted(drawn),
         "strategies": strategies,
         # 账本级样本量：冻结条目（策略×期）里有几条是独立预测、几条是重复登记
@@ -1224,4 +1385,285 @@ def status_payload(
             "minimum_detectable_delta"
         ),
         "required_draws": (primary.get("power") or {}).get("required_draws"),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 回归 / 进度追踪（波动法预登记变体：数字在向基线回归，还是稳住？）
+# --------------------------------------------------------------------------- #
+CONFIDENCE_LEVEL = 0.95
+# 波动法预登记变体的**样本内**成绩（来自 services/wave_study 的预登记评估窗；见
+# scripts/wave_dedicated.py study 输出）：主变体 48/180，同网格 max 零分布冠军 51/180。
+WAVE_IN_SAMPLE_EVALUATED = 180
+WAVE_IN_SAMPLE_PRIMARY_HITS = 48
+WAVE_IN_SAMPLE_BEST_HITS = 51
+WAVE_IN_SAMPLE_PRIMARY_LABEL = "预登记主变体 engine_component|w30|neutral"
+WAVE_IN_SAMPLE_BEST_LABEL = "同网格 max 零分布冠军（合法 p=0.1493，未过显著性）"
+# 噪声投影 / 所需期数的默认台阶（0 = 现状；165 = 研究给出的「还要再攒约 5.4 个月」）
+WAVE_PROJECTION_HORIZONS: tuple[int, ...] = (0, 165, 355, 1000, 5000)
+
+
+def hit_rate_confidence_interval(
+    hits: int, trials: int, *, confidence: float = CONFIDENCE_LEVEL
+) -> dict[str, Any] | None:
+    """命中率的置信区间：Wald 正态近似 + Wilson 得分区间（两个都报）。
+
+    Wald：``p̂ ± z·sqrt(p̂(1−p̂)/n)``；小样本 / ``p̂`` 贴边时 Wilson 更稳。``n = 0``
+    返回 ``None``（不给 ``[0, 0]`` 这种假区间冒充结论）；``n >= 1`` 且 ``hits = 0``
+    时 Wald 会退化成 ``[0, 0]`` —— 这正是必须同时给 Wilson 的原因。
+    """
+    from statistics import NormalDist
+
+    count = int(trials)
+    if count <= 0:
+        return None
+    hit_count = min(max(0, int(hits)), count)
+    rate = hit_count / count
+    level = float(confidence)
+    z = NormalDist().inv_cdf(1.0 - (1.0 - level) / 2.0)
+    standard_error = math.sqrt(max(rate * (1.0 - rate), 0.0) / count)
+    wald = {"low": rate - z * standard_error, "high": rate + z * standard_error}
+    denominator = 1.0 + z * z / count
+    center = (rate + z * z / (2.0 * count)) / denominator
+    half = (
+        z
+        * math.sqrt(
+            max(rate * (1.0 - rate) / count + z * z / (4.0 * count * count), 0.0)
+        )
+        / denominator
+    )
+    wilson = {"low": center - half, "high": center + half}
+    return {
+        "level": level,
+        "z": z,
+        "hits": hit_count,
+        "trials": count,
+        "hit_rate": rate,
+        "standard_error": standard_error,
+        "wald": wald,
+        "wilson": wilson,
+    }
+
+
+def wave_noise_projection(
+    evaluated: int,
+    hits: int,
+    *,
+    horizons: Sequence[int] = WAVE_PROJECTION_HORIZONS,
+    label: str = "",
+) -> dict[str, Any]:
+    """「如果这条成绩是噪声」的累计命中率投影（复用 ``wave_study.regression_path``）。
+
+    ``cumulative_rate_if_noise = (hits + M·p0) / (evaluated + M)``：观测到的偏离会被
+    逐步稀释回基线 ``p0 = 10/49``。若真有优势，它才会稳在观测值附近不再回归。
+    """
+    from services import wave_study as WS
+
+    regression = WS.regression_path(
+        int(evaluated), int(hits), horizons=tuple(int(value) for value in horizons)
+    )
+    return {
+        "label": label,
+        "baseline_rate": float(WS.WAVE_BASELINE_RATE),
+        "evaluated": int(evaluated),
+        "hits": int(hits),
+        "observed_rate": (int(hits) / int(evaluated)) if int(evaluated) > 0 else None,
+        "rows": list(regression.get("rows") or []),
+        "reused_function": "services.wave_study.regression_path",
+        "data_status": regression.get("data_status"),
+        "data_status_label": regression.get("data_status_label"),
+    }
+
+
+def wave_draws_needed(
+    evaluated: int,
+    hits: int,
+    *,
+    extra_draws_per_day: float = 1.0,
+) -> dict[str, Any]:
+    """「要多少期才能定论」的算术（复用 ``wave_study.power_and_verdict``，含每步公式）。
+
+    ``targets`` 里每一步都带 ``arithmetic``（两比例公式逐项展开），所以「+6.26pp → 345 期」
+    这类数字不是拍脑袋，而是可以直接核对的一行算术。
+    """
+    from services import wave_study as WS
+
+    power = WS.power_and_verdict(
+        int(evaluated), int(hits), extra_per_day=float(extra_draws_per_day)
+    )
+    return {
+        **power,
+        "reused_function": "services.wave_study.power_and_verdict",
+    }
+
+
+def regression_payload(
+    ledger: Mapping[str, Any],
+    draws: Sequence[Mapping[str, Any]],
+    *,
+    alpha: float = DEFAULT_ALPHA,
+    power: float = DEFAULT_POWER,
+    confidence: float = CONFIDENCE_LEVEL,
+    horizons: Sequence[int] = WAVE_PROJECTION_HORIZONS,
+) -> dict[str, Any]:
+    """回归 / 进度追踪：波动法预登记变体是在向基线回归，还是稳住？
+
+    口径与 :func:`score_ledger` 完全一致（**pending 绝不参与统计**；推断只用
+    ``effective_independent_rows``）；额外给出每策略的命中率置信区间、与基线的差值及其
+    标准误、Holm 校正后的 p，以及波动法专属的「噪声投影 + 所需期数」。
+    """
+    from services import wave_study as WS
+
+    verification = verify_ledger(ledger, draws)
+    scoring = score_ledger(ledger, draws, alpha=alpha, power=power)
+    baseline = float(WS.WAVE_BASELINE_RATE)  # 10/49 = 0.2040816...
+
+    strategies: dict[str, Any] = {}
+    pvalue_sids: list[str] = []
+    pvalues: list[float] = []
+    for sid, block in scoring["strategies"].items():
+        trials = int(block["effective_independent_rows"])
+        hits = int(block["hits"])
+        baseline_rate = block["baseline_hit_rate"]
+        difference = (
+            (float(block["hit_rate"]) - float(baseline_rate))
+            if block["hit_rate"] is not None and baseline_rate is not None
+            else None
+        )
+        standard_error = (
+            math.sqrt(float(baseline_rate) * (1.0 - float(baseline_rate)) / trials)
+            if trials > 0 and baseline_rate is not None
+            else None
+        )
+        strategies[sid] = {
+            "label": block.get("label"),
+            "frozen_rows": int(block["frozen_rows"]),
+            "scored_rows": int(block["scored_rows"]),
+            "effective_independent_rows": trials,
+            "pending": int(block["pending"]),
+            "excluded_duplicates": len(block["excluded_duplicates"]),
+            "hits": hits,
+            "hit_rate": block["hit_rate"],
+            "confidence_interval": hit_rate_confidence_interval(
+                hits, trials, confidence=confidence
+            ),
+            "baseline_hit_rate": baseline_rate,
+            "difference_vs_baseline": difference,
+            "difference_standard_error": standard_error,
+            "difference_in_standard_errors": (
+                (difference / standard_error)
+                if difference is not None and standard_error
+                else None
+            ),
+            "binomial_p_greater": block["binomial_p_greater"],
+            "binomial_p_two_sided": block["binomial_p_two_sided"],
+            "minimum_detectable_delta": (block.get("power") or {}).get(
+                "minimum_detectable_delta"
+            ),
+            "evidence_status": block["evidence_status"],
+        }
+        if block["binomial_p_greater"] is not None:
+            pvalue_sids.append(sid)
+            pvalues.append(float(block["binomial_p_greater"]))
+
+    holm = A.holm_adjusted_p(pvalues, alpha=float(alpha))
+    for index, sid in enumerate(pvalue_sids):
+        adjusted = float(holm["adjusted"][index])
+        strategies[sid]["p_holm_adjusted"] = adjusted
+        strategies[sid]["survives_holm"] = bool(adjusted <= float(alpha))
+
+    wave = strategies.get(STRATEGY_WAVE) or {}
+    wave_trials = int(wave.get("effective_independent_rows") or 0)
+    wave_hits = int(wave.get("hits") or 0)
+
+    wave_block = {
+        "strategy": STRATEGY_WAVE,
+        "variant_id": WS.PRIMARY_VARIANT_ID,
+        "baseline_hit_rate": baseline,
+        "in_sample": {
+            "evaluated": WAVE_IN_SAMPLE_EVALUATED,
+            "primary": {
+                "label": WAVE_IN_SAMPLE_PRIMARY_LABEL,
+                "hits": WAVE_IN_SAMPLE_PRIMARY_HITS,
+                "hit_rate": WAVE_IN_SAMPLE_PRIMARY_HITS / WAVE_IN_SAMPLE_EVALUATED,
+            },
+            "best_variant": {
+                "label": WAVE_IN_SAMPLE_BEST_LABEL,
+                "hits": WAVE_IN_SAMPLE_BEST_HITS,
+                "hit_rate": WAVE_IN_SAMPLE_BEST_HITS / WAVE_IN_SAMPLE_EVALUATED,
+            },
+            "note": (
+                "样本内成绩来自 services/wave_study 的预登记评估窗（210 期里跳过最早 30 期、"
+                "在最后 180 期上评估）：主变体 26.67%（48 次），网格冠军 28.33%（51 次）。"
+                "两者都没通过合法尺度（同网格 max 零分布 p=0.1493 / Holm），所以本账本要盯的"
+                "就是它们会不会向 20.41%（10/49）回归。"
+            ),
+        },
+        "ledger": wave,
+        "noise_projection": {
+            "in_sample_primary": wave_noise_projection(
+                WAVE_IN_SAMPLE_EVALUATED,
+                WAVE_IN_SAMPLE_PRIMARY_HITS,
+                horizons=horizons,
+                label="若 26.67%（主变体）是噪声",
+            ),
+            "in_sample_best_variant": wave_noise_projection(
+                WAVE_IN_SAMPLE_EVALUATED,
+                WAVE_IN_SAMPLE_BEST_HITS,
+                horizons=horizons,
+                label="若 28.33%（网格冠军）是噪声",
+            ),
+            "ledger": (
+                wave_noise_projection(
+                    wave_trials,
+                    wave_hits,
+                    horizons=horizons,
+                    label="若本账本已计分成绩是噪声",
+                )
+                if wave_trials > 0
+                else None
+            ),
+        },
+        "draws_needed": wave_draws_needed(
+            WAVE_IN_SAMPLE_EVALUATED, WAVE_IN_SAMPLE_PRIMARY_HITS
+        ),
+        "evidence_note": (
+            "什么才算证据：累计已计分（有效独立）期数追上「所需期数」台阶，并且命中率仍"
+            "显著高于 10/49。在那之前，无论多少期命中高低，都只能报 noise —— pending 期"
+            "永远不参与统计。"
+        ),
+    }
+
+    return {
+        "scope": scoring["scope"],
+        "records": scoring["records"],
+        "scored_periods": scoring["scored_periods"],
+        "pending_periods": scoring["pending_periods"],
+        "integrity_ok": verification["ok"],
+        "chain_root": verification["chain_root"],
+        "integrity_problems": verification["problems"],
+        "baseline_hit_rate": baseline,
+        "alpha": float(alpha),
+        "power": float(power),
+        "confidence_level": float(confidence),
+        "strategies": strategies,
+        "holm": {
+            "family_size": len(pvalues),
+            "alpha": float(alpha),
+            "bonferroni_threshold": holm["bonferroni_threshold"],
+            "min_p_adjusted": (min(holm["adjusted"]) if holm["adjusted"] else None),
+            "survivor_count": int(holm["significant_count"]),
+            "tested_strategies": list(pvalue_sids),
+            "reused_function": "services.analytics.holm_adjusted_p",
+        },
+        "wave": wave_block,
+        "notes": [
+            "只统计已开奖的冻结期；未开奖的期一律 pending，绝不参与任何统计"
+            "（命中 / 置信区间 / p 值）。",
+            "推断只用 effective_independent_rows（prediction_digest 去重后的有效独立样本）；"
+            "重复登记的行按 DUPLICATE_PREDICTION 排除。",
+            "p 值复用 services.analytics.binomial_tail_p，Holm 校正复用 holm_adjusted_p，"
+            "所需期数 / 噪声投影复用 services.wave_study 的功效助手 —— 不另起一套算法。",
+            "统计只针对本账本已冻结的期，不升格为任何全量 / 市场结论。",
+        ],
     }

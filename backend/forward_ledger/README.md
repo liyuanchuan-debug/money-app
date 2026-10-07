@@ -1,9 +1,10 @@
 # 前瞻（期外）验证账本 —— `forward_ledger/`
 
 本目录是**唯一**无法被「后见之明」污染的验证口径：预测在开奖**之前**冻结，
-开奖之后只允许「读」。它专门回答一个问题：
+开奖之后只允许「读」。它专门回答两个问题：
 
-> 线上推荐引擎在**没见过的期**上，到底能不能比随机基线更好？
+> ① 线上推荐引擎在**没见过的期**上，到底能不能比随机基线更好？
+> ② 波动法预登记变体那条 26.67%（样本内）会不会向 20.41% 的随机基线回归？
 
 ## 三种验证口径，别混
 
@@ -15,10 +16,13 @@
 
 ## 协议
 
-1. **一次冻结 = 一条记录（按期号）。** 记录里含该期的全部策略输出
-   （线上引擎 / 均匀对照 / 可选 `FIT_ONLY` 演示行）。
-2. **append-only。** 某期一旦有记录：
-   - 再冻结同一期 → **硬报错**（`ImmutabilityError`），绝不覆盖、绝不追加第二条；
+1. **一次冻结 = 一条记录。** 记录里含该期的策略输出：线上引擎 `PRODUCTION_ENGINE`、
+   均匀对照 `UNIFORM`、可选 `FIT_ONLY` 演示行，以及波动法预登记主变体
+   `WAVE_PREREGISTERED`（可用 `freeze --strategies wave,...` 只写入其中几条）。
+2. **append-only，判重口径是 `(期号, 策略)`。**
+   - 同一 `(期号, 策略)` 再冻结 → **硬报错**（`ImmutabilityError`），绝不覆盖；
+   - 向**已冻结但尚未开奖**的期**追加一条新策略**是允许的 —— 波动法预登记变体就是
+     这样入账的：历史记录一个字节不改，只在链尾 append 一条只含新策略的新记录；
    - 目标期若**已经开奖** → **硬报错**（`LookAheadError`）：禁止事后补冻，
      那等于编造一条当时并不存在的预测。
 3. **一个开奖周期只冻结一期**（详见下一节）——一次冻结多期只会把同一注重复登记。
@@ -54,9 +58,50 @@
   `score` 计分 → 再冻结下一期。这样每期的前缀都包含上期开奖，**每期都是独立预测**。
   （`--next` 会跳过账本里已冻结的期号，所以开奖后再跑 `freeze --next 1` 依然顺畅。）
 
-**向后兼容**：新字段只加在**新冻结**的记录上。历史记录（第 280/281/282 期）一个字节
-都不改 —— 改写历史会破坏哈希链与 append-only 保证。缺字段的老记录由 `score`/`verify`
-按**完全相同的规则现算**（`digest_source=DERIVED`），所以链根 `91af45bf…` 依然可验。
+**向后兼容 / 追加记录**：新字段只加在**新冻结**的记录上。历史三条记录（期号
+280 / 281 / 282，各含线上引擎 / 均匀对照 / FIT_ONLY）一个字节都不改 —— 改写历史会
+破坏哈希链与 append-only 保证。波动法预登记变体是**追加**的第 4 条记录（期号 280、
+`prev_hash` = 原链根 `91af45bf…`）：原链根因此仍可单独验证，新链根变成追加记录的
+`record_hash`。缺字段的老记录由 `score` / `verify` 按**完全相同的规则现算**
+（`digest_source=DERIVED`），所以老记录的完整性一模一样可查。
+
+## 波动法预登记变体 `WAVE_PREREGISTERED`（回归追踪）
+
+`services/wave_study.py` 的预登记主变体 `engine_component|w30|neutral`（30 期窗口、
+无走势偏好；波段阈值固定 `small_max=10` / `normal_max=30`，不作为变体轴）在样本内评估
+窗（210 期里跳过最早 30 期 warmup、在最后 180 期上评估）拿到 **48/180 = 26.67%**；
+同网格 max 零分布冠军是 **51/180 = 28.33%**，合法 p = 0.1493 —— **既没显著、也没被
+证伪**。把它放进前瞻账本，就是为了看这条数字会不会向 20.41%（10/49）回归。
+
+- 注码与线上引擎**完全一致**（预算 50 元、10 注、5 元/注、`even` 均分），所以命中率
+  可以和 `PRODUCTION_ENGINE` 逐期直接对照，不需要任何换算。
+- 冻结第 280 期时可用前缀是第 70…279 期共 **210** 期（`available_length = 210`）——
+  恰好是研究评估窗之后的**第一个真正期外位置**；目标期从未出现在输入里。
+- 入账的**只有预登记那一条**（`services.wave_study.PRIMARY_VARIANT_ID`），不是事后在
+  网格里挑冠军。波动 / 点阵数学直接调用 `services.wave_study.wave_step`，一行都不重写。
+- 该变体**禁止进入线上推荐路径**，只用于「这条 26.67% 会不会向 20.41% 回归」的对照。
+
+`regression` 子命令专门回答「回归还是稳住」，输出：
+
+- 每策略的 `frozen_rows` / `scored_rows` / `effective_independent_rows` / 累计命中 /
+  命中率 / **Wilson 置信区间**（Wald 在 0% / 100% 时会塌成 `[0,0]`，所以表里列 Wilson；
+  两条区间都在 JSON 产物里）；
+- 基线 `10/49 = 20.4082%`，以及观测与基线的**差（pp）及其标准误**、差有几倍 SE；
+- 波动法专属：被测的样本内数字（26.67% 与 28.33%）、**噪声投影**（若只是噪声，观测
+  偏离会被稀释回基线：`cumulative_rate_if_noise = (hits + M·p0) / (n + M)`）、以及
+  **所需期数**（含逐项算术）；
+- `p(>随机)` 与 **Holm 校正后 p**（复用 `services.analytics`）—— 多策略同时检验时必须
+  看校正后的 p，而不是单条原始 p。
+
+「什么才算证据」的台阶（80% 功效、α=0.05，复用 `wave_study.power_and_verdict`）：
+
+| 目标 Δ | 共需已计分（有效独立）期数 | 还差 | 说明 |
+|---|---|---|---|
+| +6.26pp | 345 | 165（≈5.4 个月） | 样本内 26.67% 的偏离要坐实 |
+| +5.00pp | 535 | 355 | 常用的「最低值得追的优势」 |
+| +0.87pp | 17,063 | 16,883 | 只求打平赔率（break-even） |
+
+**在追平这些期数之前，无论命中率高低，都只能报 `noise`。**
 
 ## 文件
 
@@ -66,8 +111,8 @@
 | `production_settings.json` | 冻结时使用的「线上生效配置」快照（来自 `Store.get_settings(None)` = 全局模板） |
 
 落盘字段的枚举一律**英文码或数字**（`PRODUCTION_ENGINE` / `UNIFORM` /
-`FIT_ONLY_MARKOV_1` / `LIVE` / `FIT_ONLY` / `even` / `true` / `false`）；汉字只出现在
-人类可读的 `label` / `notes` / `disclaimer` 里。
+`FIT_ONLY_MARKOV_1` / `WAVE_PREREGISTERED` / `LIVE` / `FIT_ONLY` / `even` /
+`true` / `false`）；汉字只出现在人类可读的 `label` / `notes` / `disclaimer` 里。
 
 ## 命令（规范工作流：一次开奖只冻结一期）
 
@@ -75,22 +120,35 @@
 cd D:\myproject\wave-money\backend
 $py = ".\.venv\Scripts\python.exe"
 
-# ① 开奖前：冻结下一个尚未开奖的期（线上引擎 + 均匀对照 + FIT_ONLY 演示行）
+# ① 先把最新一期开奖写进数据文件（backend/data/draws_70_279.json；被 .gitignore 忽略）
+#    数据没更新就冻结 = 策略看不到新信息 → 只会重复上一注（CLI 会提示你）。
+
+# ② 开奖前冻结下一个尚未开奖的期（线上引擎 + 均匀对照 + 可选 FIT_ONLY + 波动法预登记）
 & $py scripts\forward_validate.py freeze --next 1
 
-# ② 立刻校验完整性并提交账本（提交时间 = 「预测早于开奖」的旁证）
+# ③ 立刻校验完整性（哈希链 + 数据摘要 + available_length 无前视）
 & $py scripts\forward_validate.py verify
-git add backend/forward_ledger/ledger.json
-git commit -m "chore(forward-ledger): freeze period <N> before its draw"
 
-# ③ 等该期开奖后把新开奖写进数据文件，再计分
+# ④ 提交账本 —— 这一步不是形式，它是「预测早于开奖」的证据
+git -C D:\myproject\wave-money add -- backend/forward_ledger/ledger.json
+git -C D:\myproject\wave-money commit -m "chore(forward-ledger): freeze period <N> before draw"
+
+# ⑤ 等该期开奖 → 把新开奖写进数据文件 → 计分（未开奖的期一律 pending，绝不提前计分）
 & $py scripts\forward_validate.py score
 
-# ④ 进度（冻结 / 待开奖 / 已计分 + 有效独立样本）+ 当前判定 + 完整性
+# ⑥ 回答「波动法在向 20.41% 基线回归，还是稳住？」
+& $py scripts\forward_validate.py regression
+
+# ⑦ 进度总览（冻结 / 待开奖 / 已计分 + 有效独立样本）+ 当前判定 + 完整性
 & $py scripts\forward_validate.py status
 
-# ⑤ 再冻结下一期（回到 ①）
-& $py scripts\forward_validate.py freeze --next 1
+# ⑧ 回到 ①，冻结再下一期
+
+# 只写波动法预登记变体（向已冻结但未开奖的期追加新策略时用；老记录一个字节不动）
+& $py scripts\forward_validate.py freeze --period 280 --strategies wave
+
+# 只写线上引擎 + 均匀对照（不写波动法 / FIT_ONLY 演示行）
+& $py scripts\forward_validate.py freeze --next 1 --strategies production,uniform
 
 # 用线上库当前生效配置冻结（而不是快照文件）
 & $py scripts\forward_validate.py freeze --next 1 --from-store
@@ -101,7 +159,27 @@ git commit -m "chore(forward-ledger): freeze period <N> before its draw"
 
 `--next N` 只取「尚未开奖**且尚未冻结**」的期号：账本里已冻结的期会被自动跳过并打印
 一行说明，所以开奖后再跑一次 `freeze --next 1` 不会撞上已冻结的期号。想显式指定期号
-请用 `--period`（append-only 仍然会拒绝重复期）。
+请用 `--period`（append-only 仍然会按 `(期号, 策略)` 拒绝重复）。
+
+## 为什么必须「开奖前冻结」、为什么 commit 就是证据
+
+**开奖后写下来的预测一文不值。** 只要目标期已经开奖，就存在无穷多种「我当时就想选这
+几个号」的说法；事后挑一个漂亮的选号再声称早想好了，无法被证伪，也就无法当证据。
+所以本账本在代码层面直接拒绝：目标期已开奖 → `LookAheadError`，连试都不让试。
+
+**开奖前一次性冻结多期同样不值钱。** 线上引擎是确定性的：同一份已开奖前缀只产出一个
+预测。开奖前冻结 280 / 281 / 282，三期的线上引擎选号逐字相同 —— 那是同一注登记了三
+次，不是三条证据。所以规则是**一个开奖周期只冻结一期**：`freeze --next 1` → 等开奖 →
+`score` → 再冻结下一期。这样每期都看到了上一期的新开奖，每期才是独立预测。
+
+**为什么 Git 提交时间是关键。** 账本文件本身可以被任意改写，哈希链只能证明「这堆记录
+自洽」，证不了「它是什么时候写下的」。Git 提交由仓库之外的时间线锚定：`git log` 里的
+提交时间戳独立于账本文件存在。先 `freeze` 再 `git commit`，等于给「这条预测早于第 N 期
+开奖」留下了一份不可事后伪造的旁证 —— 要伪造就得改写已推送的历史，代价极高且会留下
+痕迹。**不 commit，冻结就只是一份本地草稿。**
+
+**`pending` 永远不参与统计。** 目标期还没开奖，就没有命中可言。`score` / `regression`
+只统计已开奖的期；未开奖的期只报 `pending`。任何「先算个大概」的写法都是自欺。
 
 ## 计分口径
 

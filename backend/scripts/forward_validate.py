@@ -6,10 +6,12 @@ r"""前瞻（期外）验证 CLI —— 冻结下一批未开奖期的预测，�
 
 子命令：
 
-    freeze   冻结接下来 N 个尚未开奖的期（线上引擎 + 均匀对照，可选仅拟合演示行）
-    score    对所有「已开奖」的冻结期计分（未开奖的一律 pending，绝不提前计分）
-    status   进度：冻结 / 待开奖 / 已计分各几期 + 有效独立样本 + 当前判定 + 完整性
-    verify   哈希链 + 数据摘要完整性自检
+    freeze     冻结接下来 N 个尚未开奖的期（线上引擎 + 均匀对照 + 可选仅拟合演示行
+               + 波动法预登记主变体；可用 --strategies 只写入其中几条）
+    score      对所有「已开奖」的冻结期计分（未开奖的一律 pending，绝不提前计分）
+    status     进度：冻结 / 待开奖 / 已计分各几期 + 有效独立样本 + 当前判定 + 完整性
+    verify     哈希链 + 数据摘要完整性自检
+    regression 回归 / 进度追踪：波动法预登记变体在向 20.41% 基线回归，还是稳住？
 
 安全铁律（由 ``services.forward_ledger`` 执行）：
 
@@ -28,6 +30,7 @@ r"""前瞻（期外）验证 CLI —— 冻结下一批未开奖期的预测，�
     .\.venv\Scripts\python.exe scripts\forward_validate.py verify            # ② 立刻校验并提交账本
     #  等待该期开奖、把新开奖写进数据文件 → ③ 计分 → ④ 再冻结下一期
     .\.venv\Scripts\python.exe scripts\forward_validate.py score
+    .\.venv\Scripts\python.exe scripts\forward_validate.py regression        # 波动法在回归还是稳住？
     .\.venv\Scripts\python.exe scripts\forward_validate.py status
 
 输出：终端可读表格 + 机器可读 JSON（默认写 ``backend/data/forward_validate_<子命令>.json``，
@@ -69,6 +72,13 @@ def _p(value: Any, digits: int = 4) -> str:
     if value is None:
         return "n/a"
     return f"{float(value):.{digits}f}"
+
+
+def _pp(value: Any, digits: int = 2) -> str:
+    """百分点（percentage point）：把 0.0626 打成 ``+6.26pp``。"""
+    if value is None:
+        return "n/a"
+    return f"{float(value) * 100.0:+.{digits}f}pp"
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -119,6 +129,32 @@ def _resolve_settings(args: argparse.Namespace) -> tuple[dict[str, Any], str]:
     return FL.load_settings_snapshot(args.settings_snapshot), f"snapshot:{args.settings_snapshot}"
 
 
+def _resolve_strategies(raw: str | None) -> list[str] | None:
+    """把 ``--strategies`` 的逗号列表解析成英文策略 id（``None`` = 默认全部）。
+
+    收白话短名（``wave`` / ``production`` / ``uniform`` / ``fit``）与英文 id
+    （``WAVE_PREREGISTERED`` 等）；落库一律用英文 id。
+    """
+    if not raw:
+        return None
+    resolved: list[str] = []
+    for token in str(raw).split(","):
+        name = token.strip()
+        if not name:
+            continue
+        sid = FL.STRATEGY_ALIASES.get(name.lower())
+        if sid is None and name in FL.ALL_STRATEGIES:
+            sid = name
+        if sid is None:
+            raise FL.LedgerError(
+                f"未知策略名：{name}（可用短名：{'/'.join(sorted(FL.STRATEGY_ALIASES))}；"
+                f"或英文 id：{list(FL.ALL_STRATEGIES)}）"
+            )
+        if sid not in resolved:
+            resolved.append(sid)
+    return resolved or None
+
+
 def _counts_by_strategy(score: dict[str, Any]) -> dict[str, dict[str, int]]:
     return {
         sid: {
@@ -145,6 +181,7 @@ def cmd_freeze(args: argparse.Namespace) -> dict[str, Any]:
         if args.period
         else FL.next_undrawn_periods(draws, int(args.next), skip_periods=frozen_periods)
     )
+    original_count = len(ledger.get("records") or [])
     updated = FL.freeze_periods(
         ledger,
         draws,
@@ -152,18 +189,24 @@ def cmd_freeze(args: argparse.Namespace) -> dict[str, Any]:
         settings=settings,
         pick_count=args.pick_count,
         include_fit_demo=not args.no_fit_demo,
+        strategies=_resolve_strategies(getattr(args, "strategies", None)),
     )
     FL.dump_ledger(updated, args.ledger)
 
-    frozen = [record for record in updated["records"] if int(record["period"]) in set(periods)]
+    # 只汇报**本次新增**的记录：向已冻结未开奖的期追加新策略时，老记录也带同一个期号，
+    # 按「期号在 periods 里」过滤会把老记录一起算进来。
+    frozen = [
+        record
+        for record in updated["records"][original_count:]
+        if int(record["period"]) in set(periods)
+    ]
+    frozen_entries = [entry for record in frozen for entry in record["strategies"]]
     latest_drawn = max(int(draw["period"]) for draw in draws)
     print(
         f"已冻结 {len(frozen)} 期：{sorted(int(r['period']) for r in frozen)}"
         f"（当前最新已开奖第 {latest_drawn} 期；配置来源 {source}）"
     )
-    frozen_entries = [
-        entry for record in frozen for entry in record["strategies"]
-    ]
+    print(f"本次写入策略：{sorted({str(entry['strategy']) for entry in frozen_entries})}")
     new_independent = sum(1 for entry in frozen_entries if entry.get("independent", True))
     print(
         f"本次新增冻结条目 {len(frozen_entries)} 条：独立预测 {new_independent} 条 / "
@@ -181,14 +224,13 @@ def cmd_freeze(args: argparse.Namespace) -> dict[str, Any]:
             "要显式指定请用 --period，append-only 会拒绝重复期）"
         )
     # 开奖数据没更新就冻结 = 策略看不到任何新信息 → 只会重复上一注
-    new_periods = {int(record["period"]) for record in frozen}
-    first_new_index = next(
-        index
-        for index, record in enumerate(updated["records"])
-        if int(record["period"]) in new_periods
+    all_duplicate = all(
+        not entry.get("independent", True)
+        for record in frozen
+        for entry in record["strategies"]
     )
-    if first_new_index > 0:
-        previous = updated["records"][first_new_index - 1]
+    if original_count > 0 and frozen and all_duplicate:
+        previous = updated["records"][original_count - 1]
         if int(frozen[0]["available_last_period"]) == int(previous["available_last_period"]):
             print(
                 "\n提示：本次冻结的可用前缀与上一条记录完全相同（都截止第 "
@@ -250,6 +292,7 @@ def cmd_freeze(args: argparse.Namespace) -> dict[str, Any]:
     artifact = {
         "command": "freeze",
         "frozen_periods": sorted(int(r["period"]) for r in frozen),
+        "strategies": sorted({str(entry["strategy"]) for entry in frozen_entries}),
         "latest_drawn_period": latest_drawn,
         "settings_source": source,
         "settings": settings,
@@ -440,6 +483,207 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# regression（波动法预登记变体：在向基线回归，还是稳住？）
+# --------------------------------------------------------------------------- #
+def _wave_answer(wave: dict[str, Any]) -> str:
+    """一句话回答「回归还是稳住」，且绝不把样本不足说成结论。"""
+    block = wave.get("ledger") or {}
+    trials = int(block.get("effective_independent_rows") or 0)
+    if trials <= 0:
+        return (
+            f"尚无已计分样本（冻结 {block.get('frozen_rows', 0)} 条，其中待开奖 "
+            f"{block.get('pending', 0)} 条）：无法判断回归还是稳住 —— 这正是前瞻纪律，"
+            "先冻结、等开奖、再计分，pending 期不参与任何统计。"
+        )
+    rate = float(block["hit_rate"])
+    baseline = float(wave["baseline_hit_rate"])
+    diff = rate - baseline
+    z = block.get("difference_in_standard_errors")
+    if z is None:
+        tail = "样本量仍不足，无法与基线区分。"
+    elif z >= 2 and diff > 0:
+        tail = "当前显著高于基线 —— 但仍要看后续期数是否稳住（小样本早期高点是常见现象）。"
+    elif diff > 0:
+        tail = f"高于基线 {diff * 100:+.2f}pp，但只有 {z:.2f} 个 SE，与基线尚不可区分（既非回归，也非证实）。"
+    else:
+        tail = (
+            f"已回落到基线附近或之下（{diff * 100:+.2f}pp），符合「没有真实优势时观测偏离"
+            "会被逐步稀释」的回归预期。"
+        )
+    return f"已计分有效独立 {trials} 条、命中率 {rate * 100:.2f}%：{tail}"
+
+
+def _print_regression(payload: dict[str, Any]) -> None:
+    print(f"口径：{payload['scope']}；已计分期 {payload['scored_periods']}；待开奖期 {payload['pending_periods']}")
+    print(
+        "统计口径：只统计**已开奖**的冻结期；未开奖的期一律 pending，绝不参与任何统计。"
+        "命中率 / 置信区间 / p 值只按「有效独立样本」（prediction_digest 去重后）计算。"
+    )
+    print(
+        f"基线（均匀 10/49）：{_pct(payload['baseline_hit_rate'], 4)}；"
+        f"置信水平 {payload['confidence_level']:.0%}；alpha={payload['alpha']}；功效={payload['power']}"
+    )
+    print(
+        f"完整性：{'OK' if payload['integrity_ok'] else 'FAILED'}"
+        f"（链根 {payload['chain_root'][:16]}…）"
+    )
+    for problem in payload["integrity_problems"]:
+        print(f"  [FAIL] {problem}")
+
+    header = (
+        f"{'策略':<22s}{'冻结':>6s}{'已计分':>7s}{'有效独立':>9s}{'待开奖':>7s}{'命中':>5s}"
+        f"{'命中率':>9s}{'95%CI low':>11s}{'95%CI high':>11s}{'基线':>9s}"
+        f"{'差(pp)':>9s}{'SE(pp)':>8s}{'SE倍数':>8s}{'p(>随机)':>10s}{'Holm':>7s}"
+    )
+    print()
+    print(header)
+    print("-" * len(header))
+    for sid, block in payload["strategies"].items():
+        ci = ((block.get("confidence_interval") or {}).get("wilson")) or {}
+        print(
+            f"{sid:<22s}{block['frozen_rows']:>6d}{block['scored_rows']:>7d}"
+            f"{block['effective_independent_rows']:>9d}{block['pending']:>7d}{block['hits']:>5d}"
+            f"{_pct(block['hit_rate']):>9s}{_pct(ci.get('low')):>11s}{_pct(ci.get('high')):>11s}"
+            f"{_pct(block['baseline_hit_rate']):>9s}"
+            f"{_pp(block.get('difference_vs_baseline')):>9s}"
+            f"{_pp(block.get('difference_standard_error')):>8s}"
+            f"{_num(block.get('difference_in_standard_errors'), 2):>8s}"
+            f"{_p(block['binomial_p_greater']):>10s}"
+            f"{_p(block.get('p_holm_adjusted')):>7s}"
+        )
+    print(
+        "\nCI 列口径：命中率 0% / 100% 时 Wald 会塌成 [0,0]，所以列里给的是 Wilson 得分区间；"
+        "两条区间都在 JSON 产物里。差(pp) = 观测 − 20.4082%；SE(pp) = sqrt(p0(1−p0)/n)·100；"
+        "SE倍数 = 差 / SE（正态近似的偏离尺度）。"
+    )
+    holm = payload.get("holm") or {}
+    if holm.get("family_size"):
+        print(
+            f"Holm 校正：族大小 {holm['family_size']}，alpha={holm['alpha']}，"
+            f"Bonferroni 阈值 {_p(holm['bonferroni_threshold'])}，显著策略数 {holm['survivor_count']}"
+            f"（复用 services.analytics.holm_adjusted_p）"
+        )
+
+    wave = payload.get("wave") or {}
+    if not wave:
+        return
+    print()
+    print("=" * 100)
+    print(f"波动法预登记变体：{wave['variant_id']}（引擎分量 · 30 期窗口 · 无走势偏好）")
+    print("=" * 100)
+    in_sample = wave["in_sample"]
+    print("它被测的**样本内**成绩（来自 services/wave_study 的预登记评估窗，不重算）：")
+    print(
+        f"  主变体 26.67%：{in_sample['primary']['hits']}/{in_sample['evaluated']} = "
+        f"{_pct(in_sample['primary']['hit_rate'], 4)}"
+    )
+    print(
+        f"  网格冠军 28.33%：{in_sample['best_variant']['hits']}/{in_sample['evaluated']} = "
+        f"{_pct(in_sample['best_variant']['hit_rate'], 4)}"
+    )
+
+    block = wave.get("ledger") or {}
+    ci = block.get("confidence_interval") or {}
+    print()
+    print(
+        f"本账本当前：冻结 {block.get('frozen_rows', 0)} 条 / 已计分 {block.get('scored_rows', 0)} 条 / "
+        f"有效独立 {block.get('effective_independent_rows', 0)} 条 / 待开奖 {block.get('pending', 0)} 条 / "
+        f"命中 {block.get('hits', 0)} 次"
+    )
+    if ci:
+        wald = ci["wald"]
+        wilson = ci["wilson"]
+        print(
+            f"  命中率 {_pct(ci['hit_rate'], 4)}（{ci['hits']}/{ci['trials']}），"
+            f"SE {_pct(ci['standard_error'], 4)}"
+        )
+        print(f"  95% CI（Wald）   [{_pct(wald['low'], 4)}, {_pct(wald['high'], 4)}]")
+        print(f"  95% CI（Wilson） [{_pct(wilson['low'], 4)}, {_pct(wilson['high'], 4)}]")
+        print(
+            f"  与基线 {_pct(wave['baseline_hit_rate'], 4)} 的差："
+            f"{_pp(block.get('difference_vs_baseline'))}，"
+            f"SE {_pp(block.get('difference_standard_error'))}，"
+            f"{_num(block.get('difference_in_standard_errors'), 2)} 个 SE"
+        )
+    else:
+        print("  尚无已计分样本 —— 没有命中率可算，也就不给置信区间（不给假的 [0,0] 充数）。")
+
+    projection = wave.get("noise_projection") or {}
+    proj_labels = {
+        "in_sample_primary": "若样本内 26.67%（主变体）只是噪声",
+        "in_sample_best_variant": "若样本内 28.33%（网格冠军）只是噪声",
+        "ledger": "若本账本已计分成绩只是噪声",
+    }
+    printed_any = False
+    for key, label in proj_labels.items():
+        block_proj = projection.get(key)
+        if not block_proj:
+            continue
+        if not printed_any:
+            print()
+            print(
+                "噪声投影（复用 services.wave_study.regression_path）："
+                "累计命中率 = (hits + M·p0) / (n + M)，M = 之后的新增期数"
+            )
+            printed_any = True
+        cells = "  ".join(
+            f"+{row['extra_draws']}期→{row['total_evaluated']}期 {_pct(row['cumulative_rate_if_noise'], 2)}"
+            for row in block_proj["rows"]
+        )
+        print(
+            f"  {label}：起点 {_pct(block_proj['observed_rate'], 4)}"
+            f"（{block_proj['hits']}/{block_proj['evaluated']}）"
+        )
+        print(f"    {cells}")
+
+    need = wave.get("draws_needed") or {}
+    print()
+    print(
+        "什么才算证据（80% 功效、alpha=0.05 的两比例公式；复用 "
+        "services.wave_study.power_and_verdict，算术逐项可核对）："
+    )
+    for target in need.get("targets") or []:
+        print(
+            f"  目标 Δ = {_pp(target.get('delta'))} → 共需 {target.get('required_draws_80_power')} 期"
+            f"（还要 {target.get('additional_draws_needed')} 期，约 "
+            f"{_num(target.get('months_at_one_draw_per_day'), 1)} 个月 @ 1 期/天）"
+        )
+    first = (need.get("targets") or [None])[0]
+    if first and first.get("arithmetic"):
+        print(f"  算术（示例，目标 Δ = {_pp(first.get('delta'))}）：{first['arithmetic']}")
+    if wave.get("evidence_note"):
+        print(f"  {wave['evidence_note']}")
+
+    print()
+    print(f"判定：{_wave_answer(wave)}")
+    for note in payload.get("notes") or []:
+        print(f"  [口径] {note}")
+
+
+def cmd_regression(args: argparse.Namespace) -> dict[str, Any]:
+    ledger = FL.load_ledger(args.ledger)
+    draws = FL.load_draws(args.draws_json)
+    payload = FL.regression_payload(
+        ledger,
+        draws,
+        alpha=args.alpha,
+        power=args.power,
+        confidence=args.confidence,
+    )
+    print(f"账本：{args.ledger}")
+    _print_regression(payload)
+    artifact = {
+        "command": "regression",
+        "ledger": str(args.ledger),
+        "draws_json": str(args.draws_json),
+        **payload,
+    }
+    _write_json(Path(args.out), artifact)
+    print(f"\nJSON 产物：{args.out}")
+    return artifact
+
+
+# --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -475,6 +719,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     freeze.add_argument("--from-store", action="store_true", help="从线上库读当前生效配置（Store.get_settings(None)）")
     freeze.add_argument("--pick-count", type=int, default=None, help="覆盖注数（默认取配置 pick_count）")
     freeze.add_argument("--no-fit-demo", action="store_true", help="不冻结 max_fit 的 FIT_ONLY 演示行")
+    freeze.add_argument(
+        "--strategies",
+        default=None,
+        help=(
+            "只写入指定策略（逗号分隔；短名 wave/production/uniform/fit 或英文 id "
+            "WAVE_PREREGISTERED 等）。默认全部。用于向已冻结但未开奖的期追加新策略，"
+            "不动历史记录。"
+        ),
+    )
     _add_common(freeze)
 
     score = sub.add_parser("score", help="对所有已开奖的冻结期计分")
@@ -488,6 +741,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     verify = sub.add_parser("verify", help="哈希链 + 数据摘要完整性自检")
     _add_common(verify)
 
+    regression = sub.add_parser(
+        "regression", help="回归 / 进度追踪：波动法在向 20.41% 基线回归，还是稳住？"
+    )
+    regression.add_argument("--alpha", type=float, default=FL.DEFAULT_ALPHA)
+    regression.add_argument("--power", type=float, default=FL.DEFAULT_POWER)
+    regression.add_argument("--confidence", type=float, default=FL.CONFIDENCE_LEVEL)
+    _add_common(regression)
+
     args = parser.parse_args(argv)
     if args.out is None:
         args.out = _default_out(args.command)
@@ -497,6 +758,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "score": cmd_score,
         "status": cmd_status,
         "verify": cmd_verify,
+        "regression": cmd_regression,
     }
     handlers[args.command](args)
 

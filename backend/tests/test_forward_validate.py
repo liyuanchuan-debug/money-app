@@ -31,6 +31,7 @@ import pytest
 from scripts import forward_validate as FV
 from services import analytics as A
 from services import forward_ledger as FL
+from services import wave_study as WS
 from services.lottery import DEFAULT_SETTINGS
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -507,7 +508,12 @@ def test_all_identical_scored_rows_collapse_to_one_observation() -> None:
 
 def test_status_reports_raw_and_effective_sample_sizes() -> None:
     draws = synthetic_draws(30)
-    ledger = freeze(draws, [31, 32, 33])  # 1 期后每期都是重复登记（共 9 条 = 5 独立 + 4 重复）
+    # 固定三条策略（波动法预登记变体的样本量口径另有专门测试），保持本算例 9 = 5 + 4
+    ledger = freeze(
+        draws,
+        [31, 32, 33],
+        strategies=[FL.STRATEGY_PRODUCTION, FL.STRATEGY_UNIFORM, FL.STRATEGY_FIT_DEMO],
+    )  # 1 期后每期都是重复登记（共 9 条 = 5 独立 + 4 重复）
     payload = FL.status_payload(ledger, draws)
 
     assert payload["frozen_rows_total"] == 9
@@ -1005,3 +1011,550 @@ def test_edited_sources_are_valid_utf8_without_bom_and_no_replacement_char() -> 
         assert not raw.startswith(b"\xef\xbb\xbf"), f"{relative} 带 BOM"
         text = raw.decode("utf-8")  # 非 UTF-8 会在这里抛错
         assert "\ufffd" not in text, f"{relative} 存在 U+FFFD 替换字符"
+
+
+# --------------------------------------------------------------------------- #
+# 波动法预登记变体 WAVE_PREREGISTERED（复用研究函数，不重写波动数学）
+# --------------------------------------------------------------------------- #
+# 与已提交账本同口径的合成历史：210 期（第 70…279 期）、warmup 30 → 评估窗最后 180 期
+WAVE_DRAWS = synthetic_draws(210, start_period=70)
+WAVE_LAST_DRAWN = 279
+WAVE_TARGET_PERIOD = 280
+
+
+def test_wave_variant_definition_comes_from_the_study_preregistration() -> None:
+    """预登记身份必须原样取自 ``services.wave_study``，不能在本模块里另行发明。"""
+    prereg = WS.preregistration_block()
+    assert prereg["primary_variant"] == WS.PRIMARY_VARIANT_ID == "engine_component|w30|neutral"
+    assert prereg["warmup"] == 30
+    assert prereg["k"] == 10
+    assert prereg["band_thresholds"]["small_max"] == 10
+    assert prereg["band_thresholds"]["normal_max"] == 30
+    assert prereg["declared_before_looking"] is True
+
+    # 网格里恰好一条被标为主变体，且就是它
+    primary = [variant for variant in WS.variant_grid() if variant.get("is_primary")]
+    assert [variant["variant_id"] for variant in primary] == [WS.PRIMARY_VARIANT_ID]
+    assert FL.wave_preregistered_variant()["variant_id"] == WS.PRIMARY_VARIANT_ID
+
+    entry = _entry_of(
+        freeze(WAVE_DRAWS, [WAVE_TARGET_PERIOD], strategies=[FL.STRATEGY_WAVE])["records"][0],
+        FL.STRATEGY_WAVE,
+    )
+    variant = entry["variant"]
+    assert variant["variant_id"] == prereg["primary_variant"]
+    assert variant["definition"] == "engine_component"
+    assert variant["window"] == 30
+    assert variant["bias"] == "neutral"
+    assert variant["param"] is None
+    assert variant["warmup"] == prereg["warmup"] == 30
+    assert variant["k"] == prereg["k"] == 10
+    assert variant["band_thresholds"] == {"small_max": 10, "normal_max": 30}
+    assert variant["preregistered"] is True
+    assert variant["source"] == "services.wave_study.PRIMARY_VARIANT_ID"
+
+
+def test_wave_picks_come_from_the_study_function_not_a_reimplementation() -> None:
+    """冻结选号必须逐位等于 ``wave_study.wave_step`` 的直接调用（证明是复用）。"""
+    ledger = freeze(WAVE_DRAWS, [WAVE_TARGET_PERIOD], strategies=[FL.STRATEGY_WAVE])
+    record = ledger["records"][0]
+    entry = _entry_of(record, FL.STRATEGY_WAVE)
+
+    # 研究口径：可用前缀 = 第 70…279 期共 210 期（warmup 30 之上的最后 180 期评估窗
+    # 之后的第一个真正期外位置），目标期从不出现在输入里
+    available = FL.available_rows(WAVE_LAST_DRAWN, WAVE_DRAWS)
+    assert len(available) == 210
+    assert record["available_length"] == record["period_index"] == entry["available_length"] == 210
+    assert int(record["available_last_period"]) == WAVE_LAST_DRAWN
+    assert all(int(row["period"]) < WAVE_TARGET_PERIOD for row in available)
+
+    series = [int(row["special_number"]) for row in available]
+    variant = FL.wave_preregistered_variant()
+    step = WS.wave_step([*series, series[-1]], len(series), variant, k=10)
+    assert entry["picks"] == [int(number) for number in step["picks"]]
+    assert entry["ranking"] == [int(number) for number in step["ranking"]]
+    assert {
+        int(number): float(value) for number, value in entry["probabilities"].items()
+    } == pytest.approx({int(number): float(value) for number, value in step["probabilities"].items()})
+
+    # 占位值（= 目标期「当时还不知道」的那个位置）取什么都不影响结果：
+    # wave_step 只读 numbers[:210]，目标期从未被读过
+    for placeholder in (1, 26, 49):
+        other = WS.wave_step([*series, placeholder], len(series), variant, k=10)
+        assert other["picks"] == step["picks"]
+        assert other["ranking"] == step["ranking"]
+
+    # 换掉目标期的实际开奖结果，已冻结记录依旧自洽（不依赖答案）
+    for outcome in (1, 7, 49):
+        extended = [
+            *WAVE_DRAWS,
+            {
+                "period": WAVE_TARGET_PERIOD,
+                "draw_date": "2026-10-07",
+                "special_number": outcome,
+            },
+        ]
+        assert FL.verify_ledger(ledger, extended)["ok"]
+
+
+def test_wave_amounts_mirror_the_production_engine_for_apples_to_apples_comparison() -> None:
+    """注码方案必须复用现有金额逻辑（预算 50 / 10 注 / even 均分），不另起一套。"""
+    ledger = freeze(WAVE_DRAWS, [WAVE_TARGET_PERIOD])  # 默认全部策略
+    record = ledger["records"][0]
+    wave = _entry_of(record, FL.STRATEGY_WAVE)
+    production = _entry_of(record, FL.STRATEGY_PRODUCTION)
+
+    assert wave["mode"] == production["mode"] == "even"
+    assert wave["budget"] == production["budget"] == 50
+    assert wave["pick_count"] == production["pick_count"] == 10
+    assert wave["odds"] == production["odds"]
+    assert wave["amounts"] == production["amounts"] == [5] * 10
+    assert wave["staked_total"] == production["staked_total"] == 50
+    assert wave["fit_role"] == FL.FIT_ROLE_LIVE
+    # 波动法不是 FIT_ONLY 演示行，但同样禁止进入线上推荐路径（笔记里必须写清）
+    assert any("线上推荐路径" in note for note in wave["notes"])
+
+
+def test_wave_duplicate_detection_fires_with_the_new_strategy_present() -> None:
+    """同一前缀下再冻结一期：波动法也是同一注 → 必须标成非独立并指回第一期。"""
+    ledger = freeze(WAVE_DRAWS, [WAVE_TARGET_PERIOD, WAVE_TARGET_PERIOD + 1])
+    first, second = ledger["records"]
+    wave_first = _entry_of(first, FL.STRATEGY_WAVE)
+    wave_second = _entry_of(second, FL.STRATEGY_WAVE)
+
+    assert wave_first["picks"] == wave_second["picks"], "同一前缀下波动法必然给出同一注"
+    assert wave_first["independent"] is True and wave_first["duplicate_of_period"] is None
+    assert wave_second["independent"] is False
+    assert wave_second["duplicate_of_period"] == WAVE_TARGET_PERIOD
+    assert wave_second["prediction_digest"] == wave_first["prediction_digest"]
+    # 推导口径与冻结时写死的一致（verify 靠它抓「谎报独立性」）
+    derived = FL.independence_report(ledger)["by_period"]
+    assert derived[WAVE_TARGET_PERIOD + 1][FL.STRATEGY_WAVE]["independent"] is False
+    assert derived[WAVE_TARGET_PERIOD + 1][FL.STRATEGY_WAVE]["duplicate_of_period"] == WAVE_TARGET_PERIOD
+
+    # 有效独立样本只算 1 条（重复登记不增加功效）
+    extended = [
+        *WAVE_DRAWS,
+        {"period": 280, "draw_date": "2026-10-07", "special_number": 5},
+        {"period": 281, "draw_date": "2026-10-08", "special_number": 5},
+    ]
+    block = FL.score_ledger(ledger, extended)["strategies"][FL.STRATEGY_WAVE]
+    assert block["scored_rows"] == 2
+    assert block["effective_independent_rows"] == 1
+    assert len(block["excluded_duplicates"]) == 1
+    assert block["excluded_duplicates"][0]["reason"] == FL.EXCLUDE_REASON_DUPLICATE
+
+
+def test_appending_the_wave_strategy_leaves_the_existing_chain_intact() -> None:
+    """向「已冻结但未开奖」的期追加新策略：老记录一字不改，链尾接上新记录。"""
+    draws = synthetic_draws(30)
+    base = freeze(
+        draws,
+        [31, 32],
+        strategies=[FL.STRATEGY_PRODUCTION, FL.STRATEGY_UNIFORM],
+    )
+    assert FL.verify_ledger(base, draws)["ok"]
+    old_roots = [record["record_hash"] for record in base["records"]]
+
+    appended = FL.freeze_periods(
+        base,
+        draws,
+        [31],
+        settings=TEST_SETTINGS,
+        frozen_at=FROZEN_AT,
+        strategies=[FL.STRATEGY_WAVE],
+    )
+    records = appended["records"]
+    assert [int(record["period"]) for record in records] == [31, 32, 31]
+    # 老记录逐字节未变（哈希不变、策略集合不变）
+    assert [record["record_hash"] for record in records[:2]] == old_roots
+    assert [len(record["strategies"]) for record in records[:2]] == [2, 2]
+    # 新记录接在链尾，prev_hash = 追加前的链根
+    assert records[2]["prev_hash"] == old_roots[-1]
+    assert _entry_of(records[2], FL.STRATEGY_WAVE)["independent"] is True
+
+    # append-only 判重按 (期号, 策略)：同一策略不能在同一期登记第二次
+    with pytest.raises(FL.ImmutabilityError):
+        FL.freeze_periods(
+            appended,
+            draws,
+            [31],
+            settings=TEST_SETTINGS,
+            frozen_at=FROZEN_AT,
+            strategies=[FL.STRATEGY_WAVE],
+        )
+    with pytest.raises(FL.ImmutabilityError):
+        FL.freeze_periods(
+            appended,
+            draws,
+            [31],
+            settings=TEST_SETTINGS,
+            frozen_at=FROZEN_AT,
+            strategies=[FL.STRATEGY_PRODUCTION],
+        )
+    # 老链根仍然单独可验，新链根变成追加记录
+    result = FL.verify_ledger(appended, draws)
+    assert result["ok"], result["problems"]
+    assert result["details"][1]["record_hash"] == old_roots[-1]
+    assert result["chain_root"] == records[2]["record_hash"]
+
+
+def test_committed_ledger_wave_record_chains_onto_the_old_root() -> None:
+    """回归守卫：已提交账本里波动法记录必须接在原链根 91af45bf… 之后，老记录不变。"""
+    ledger = FL.load_ledger(COMMITTED_LEDGER_PATH)
+    records = ledger["records"]
+    assert [int(record["period"]) for record in records[:3]] == [280, 281, 282]
+    assert records[2]["record_hash"] == COMMITTED_THIRD_RECORD_ROOT
+
+    wave_records = [
+        record
+        for record in records
+        if any(entry["strategy"] == FL.STRATEGY_WAVE for entry in record["strategies"])
+    ]
+    assert wave_records, "已提交账本里应当已有波动法预登记记录"
+    wave_record = wave_records[0]
+    assert int(wave_record["period"]) == 280
+    assert wave_record["prev_hash"] == COMMITTED_THIRD_RECORD_ROOT
+    assert wave_record["available_length"] == 210
+
+    wave_entry = _entry_of(wave_record, FL.STRATEGY_WAVE)
+    assert wave_entry["variant"]["variant_id"] == WS.PRIMARY_VARIANT_ID
+    assert wave_entry["variant"]["preregistered"] is True
+    assert wave_entry["pick_count"] == 10
+    assert wave_entry["staked_total"] == 50
+    assert wave_entry["independent"] is True
+    # 同一期号下老记录的三条策略仍在（追加而不是覆盖）
+    assert [entry["strategy"] for entry in records[0]["strategies"]] == [
+        FL.STRATEGY_PRODUCTION,
+        FL.STRATEGY_UNIFORM,
+        FL.STRATEGY_FIT_DEMO,
+    ]
+
+    # 只验哈希链（不依赖 gitignore 的 backend/data/*）：整条链必须自洽
+    previous = FL.GENESIS_HASH
+    for record in records:
+        assert record["prev_hash"] == previous
+        assert FL.compute_record_hash(record, previous) == record["record_hash"]
+        previous = record["record_hash"]
+
+    draws_path = BACKEND_ROOT / "data" / "draws_70_279.json"
+    if draws_path.exists():
+        result = FL.verify_ledger(ledger, FL.load_draws(draws_path))
+        assert result["ok"], result["problems"]
+        assert result["chain_root"] == records[-1]["record_hash"]
+        assert result["details"][2]["record_hash"] == COMMITTED_THIRD_RECORD_ROOT
+        # 冻结的选号必须与「直接用研究函数跑同一份历史」一致（复用证明）
+        series = [
+            int(row["special_number"])
+            for row in FL.available_rows(279, FL.load_draws(draws_path))
+        ]
+        step = WS.wave_step(
+            [*series, series[-1]], len(series), FL.wave_preregistered_variant(), k=10
+        )
+        assert [int(number) for number in wave_entry["picks"]] == [
+            int(number) for number in step["picks"]
+        ]
+
+
+# --------------------------------------------------------------------------- #
+# regression：回归 / 进度追踪（置信区间 + 噪声投影 + 所需期数）
+# --------------------------------------------------------------------------- #
+def test_hit_rate_confidence_interval_matches_hand_computed_wald_and_wilson() -> None:
+    from statistics import NormalDist
+
+    hits, trials = 1, 2
+    ci = FL.hit_rate_confidence_interval(hits, trials)
+    rate = hits / trials
+    z = NormalDist().inv_cdf(0.975)
+    standard_error = math.sqrt(rate * (1.0 - rate) / trials)
+    assert ci["z"] == pytest.approx(z)
+    assert ci["standard_error"] == pytest.approx(standard_error)
+    assert ci["wald"]["low"] == pytest.approx(rate - z * standard_error)
+    assert ci["wald"]["high"] == pytest.approx(rate + z * standard_error)
+
+    denominator = 1.0 + z * z / trials
+    center = (rate + z * z / (2.0 * trials)) / denominator
+    half = (
+        z * math.sqrt(rate * (1.0 - rate) / trials + z * z / (4.0 * trials * trials))
+        / denominator
+    )
+    assert ci["wilson"]["low"] == pytest.approx(center - half)
+    assert ci["wilson"]["high"] == pytest.approx(center + half)
+
+    # 0 命中时 Wald 塌成 [0, 0]（假区间）→ Wilson 仍给出有信息的上界，这是同时报两者的理由
+    degenerate = FL.hit_rate_confidence_interval(0, 2)
+    assert degenerate["wald"] == {"low": 0.0, "high": 0.0}
+    assert 0.0 < degenerate["wilson"]["high"] < 1.0
+    assert 0.0 <= ci["wilson"]["low"] < ci["wilson"]["high"] <= 1.0
+
+    # n = 0 → None，绝不给 [0, 0] 这种冒充结论的区间
+    assert FL.hit_rate_confidence_interval(0, 0) is None
+
+
+def test_regression_report_matches_hand_computed_math() -> None:
+    """手工算例：逐期开奖再冻结 → 线上引擎 2 条已计分（1 命中）+ 1 条待开奖。"""
+    p0 = 10.0 / 49.0
+    draws = synthetic_draws(30)
+    ledger = freeze(draws, [31])
+    production_31 = _entry_of(ledger["records"][0], FL.STRATEGY_PRODUCTION)
+    # 第 31 期故意开出线上引擎的首选号 → 命中
+    draws = [
+        *draws,
+        {
+            "period": 31,
+            "draw_date": "2026-01-31",
+            "special_number": int(production_31["picks"][0]),
+        },
+    ]
+    ledger = freeze(draws, [32], ledger=ledger)
+    production_32 = _entry_of(ledger["records"][1], FL.STRATEGY_PRODUCTION)
+    assert production_32["independent"] is True, "前缀已更新，线上引擎应当给出新预测"
+    # 第 32 期故意开出不在新一注里的号 → 未命中
+    miss_number = next(number for number in range(1, 50) if number not in production_32["picks"])
+    draws = [*draws, {"period": 32, "draw_date": "2026-02-01", "special_number": miss_number}]
+    ledger = freeze(draws, [33], ledger=ledger)
+
+    payload = FL.regression_payload(ledger, draws)
+    assert payload["scored_periods"] == [31, 32]
+    assert payload["pending_periods"] == [33]  # 第 33 期没开奖 → 只报 pending
+    assert payload["integrity_ok"] is True
+    assert payload["chain_root"] == ledger["records"][-1]["record_hash"]
+    assert payload["baseline_hit_rate"] == pytest.approx(p0)
+
+    # 手工：第 33 期没开奖 → 每个策略的样本量都是 2，不是 3
+    for sid, block in payload["strategies"].items():
+        assert block["frozen_rows"] == 3, sid
+        assert block["scored_rows"] == 2, sid
+        assert block["pending"] == 1, sid
+        assert block["confidence_interval"]["trials"] == block["effective_independent_rows"], sid
+
+    block = payload["strategies"][FL.STRATEGY_PRODUCTION]
+    assert block["effective_independent_rows"] == 2  # 前缀不同 → 两条都是独立预测
+    assert block["excluded_duplicates"] == 0
+    assert block["hits"] == 1
+    assert block["hit_rate"] == pytest.approx(0.5)
+    assert block["baseline_hit_rate"] == pytest.approx(p0)
+    assert block["difference_vs_baseline"] == pytest.approx(0.5 - p0)
+    # SE 用基线方差（不是观测方差）：sqrt(p0(1−p0)/n)
+    assert block["difference_standard_error"] == pytest.approx(math.sqrt(p0 * (1 - p0) / 2))
+    assert block["difference_in_standard_errors"] == pytest.approx(
+        (0.5 - p0) / math.sqrt(p0 * (1 - p0) / 2)
+    )
+    # 置信区间必须与独立算出的同一个区间完全一致（同一函数、同一口径），且只用 2 条样本
+    assert block["confidence_interval"] == FL.hit_rate_confidence_interval(1, 2)
+    assert block["confidence_interval"]["trials"] == 2
+    assert block["confidence_interval"]["hits"] == 1
+    from statistics import NormalDist
+
+    z = NormalDist().inv_cdf(0.975)
+    se = math.sqrt(0.5 * 0.5 / 2)
+    assert block["confidence_interval"]["wald"]["low"] == pytest.approx(0.5 - z * se)
+    assert block["confidence_interval"]["wald"]["high"] == pytest.approx(0.5 + z * se)
+    # p 值 / Holm 都必须复用 services.analytics
+    assert block["binomial_p_greater"] == pytest.approx(
+        A.binomial_tail_p(1, 2, p0, alternative="greater")
+    )
+    assert block["binomial_p_two_sided"] == pytest.approx(
+        A.binomial_tail_p(1, 2, p0, alternative="two-sided")
+    )
+    assert payload["holm"]["reused_function"] == "services.analytics.holm_adjusted_p"
+    tested = [b for b in payload["strategies"].values() if b["binomial_p_greater"] is not None]
+    assert payload["holm"]["family_size"] == len(tested)
+    for item in tested:
+        assert item["p_holm_adjusted"] >= item["binomial_p_greater"] - 1e-12
+        assert isinstance(item["survives_holm"], bool)
+    # Holm 校正 = 同一族上单调放大的 p 值（单条族时等于原始 p）
+    single = A.holm_adjusted_p([block["binomial_p_greater"]])
+    assert float(single["adjusted"][0]) == pytest.approx(float(block["binomial_p_greater"]))
+
+    # 波动法专属块：被测的样本内数字 + 噪声投影 + 所需期数
+    wave = payload["wave"]
+    assert wave["variant_id"] == WS.PRIMARY_VARIANT_ID
+    assert wave["baseline_hit_rate"] == pytest.approx(p0)
+    assert wave["in_sample"]["evaluated"] == 180
+    assert wave["in_sample"]["primary"]["hits"] == 48
+    assert wave["in_sample"]["primary"]["hit_rate"] == pytest.approx(48 / 180)
+    assert wave["in_sample"]["best_variant"]["hits"] == 51
+    assert wave["in_sample"]["best_variant"]["hit_rate"] == pytest.approx(51 / 180)
+    assert wave["ledger"]["frozen_rows"] == 3
+    assert wave["ledger"]["scored_rows"] == 2
+    assert wave["ledger"]["pending"] == 1
+    assert (
+        wave["noise_projection"]["ledger"]["evaluated"]
+        == wave["ledger"]["effective_independent_rows"]
+    )
+    assert (
+        wave["noise_projection"]["ledger"]["reused_function"]
+        == "services.wave_study.regression_path"
+    )
+    assert (
+        wave["noise_projection"]["in_sample_primary"]["reused_function"]
+        == "services.wave_study.regression_path"
+    )
+    assert wave["draws_needed"]["reused_function"] == "services.wave_study.power_and_verdict"
+    assert payload["notes"], "口径说明不能为空"
+
+
+def test_regression_excludes_pending_rows_from_every_statistic() -> None:
+    """待开奖的行绝不能进入任何统计：只有第 31 期开奖，其余全是 pending。"""
+    draws = synthetic_draws(30)
+    ledger_all = freeze(draws, [31, 32, 33])
+    ledger_one = freeze(draws, [31])
+    record_31 = ledger_all["records"][0]
+    # 手工算例：命中只可能来自第 31 期那批预测（实际开出的号是 5）
+    drawn_31 = 5
+    manual_hits = {
+        str(entry["strategy"]): int(drawn_31 in [int(number) for number in entry["picks"]])
+        for entry in record_31["strategies"]
+    }
+    extended = [*draws, {"period": 31, "draw_date": "2026-01-31", "special_number": drawn_31}]
+
+    payload = FL.regression_payload(ledger_all, extended)
+    assert payload["scored_periods"] == [31]
+    assert payload["pending_periods"] == [32, 33]
+    assert payload["integrity_ok"] is True
+    for sid, block in payload["strategies"].items():
+        assert block["frozen_rows"] == 3, sid
+        assert block["scored_rows"] == 1, sid
+        assert block["pending"] == 2, sid
+        # 命中数只由第 31 期决定（第 32/33 期的那两注一概不算）
+        assert block["hits"] == manual_hits[sid], sid
+        assert block["hit_rate"] == pytest.approx(float(manual_hits[sid])), sid
+        ci = block["confidence_interval"]
+        assert ci["trials"] == 1, sid  # 样本量不是 3
+        assert ci["hits"] == manual_hits[sid], sid
+        assert block["difference_standard_error"] == pytest.approx(
+            math.sqrt((10.0 / 49.0) * (1 - 10.0 / 49.0) / 1)
+        ), sid
+
+    # 只冻结第 31 期的账本：所有统计量与「冻结了 3 期」逐项相同 → 待开奖行零贡献
+    single = FL.regression_payload(ledger_one, extended)
+    assert single["scored_periods"] == [31]
+    assert single["pending_periods"] == []
+    for sid, block in single["strategies"].items():
+        other = payload["strategies"][sid]
+        assert block["frozen_rows"] == 1 and other["frozen_rows"] == 3, sid
+        assert block["scored_rows"] == other["scored_rows"] == 1, sid
+        for field in (
+            "hits",
+            "hit_rate",
+            "confidence_interval",
+            "difference_vs_baseline",
+            "difference_standard_error",
+            "binomial_p_greater",
+            "binomial_p_two_sided",
+        ):
+            assert block[field] == other[field], (sid, field)
+
+    # 开奖前：一条都不计分，命中率 / CI / 差 全部为 None（不给假的数字）
+    pending_only = FL.regression_payload(ledger_all, draws)
+    assert pending_only["scored_periods"] == []
+    assert pending_only["pending_periods"] == [31, 32, 33]
+    for sid, block in pending_only["strategies"].items():
+        assert block["scored_rows"] == 0, sid
+        assert block["effective_independent_rows"] == 0, sid
+        assert block["hits"] == 0, sid
+        assert block["hit_rate"] is None, sid
+        assert block["confidence_interval"] is None, sid
+        assert block["difference_vs_baseline"] is None, sid
+        assert block["difference_standard_error"] is None, sid
+        assert block["binomial_p_greater"] is None, sid
+
+
+def test_wave_noise_projection_matches_hand_arithmetic_at_known_n() -> None:
+    """噪声投影：累计命中率必须等于手工算术 ``(hits + M·p0) / (n + M)``。"""
+    p0 = 10.0 / 49.0
+    projection = FL.wave_noise_projection(180, 48, horizons=[0, 165, 1000])
+    assert projection["baseline_rate"] == pytest.approx(p0)
+    assert projection["observed_rate"] == pytest.approx(48 / 180)
+    assert projection["reused_function"] == "services.wave_study.regression_path"
+    assert projection["data_status"] == WS.DATA_STATUS_OK
+
+    rows = {int(row["extra_draws"]): row for row in projection["rows"]}
+    assert rows[0]["total_evaluated"] == 180
+    assert rows[0]["cumulative_rate_if_noise"] == pytest.approx(48 / 180)
+    assert rows[165]["total_evaluated"] == 345
+    assert rows[165]["cumulative_rate_if_noise"] == pytest.approx((48 + 165 * p0) / 345)
+    assert rows[1000]["total_evaluated"] == 1180
+    assert rows[1000]["cumulative_rate_if_noise"] == pytest.approx((48 + 1000 * p0) / 1180)
+    # 噪声下必然单调稀释回基线（仍高于基线，但越来越近）
+    assert p0 < rows[1000]["cumulative_rate_if_noise"] < rows[165]["cumulative_rate_if_noise"]
+    assert rows[165]["cumulative_rate_if_noise"] < rows[0]["cumulative_rate_if_noise"]
+    # 网格冠军 51/180 的投影起点更高、但同样回落
+    best = FL.wave_noise_projection(180, 51, horizons=[165])
+    assert best["rows"][0]["cumulative_rate_if_noise"] == pytest.approx((51 + 165 * p0) / 345)
+
+
+def test_wave_draws_needed_reproduces_the_study_figures() -> None:
+    """所需期数必须复现研究给出的台阶：+6.26pp → 345、+5pp → 535、打平 → 17063。"""
+    p0 = 10.0 / 49.0
+    need = FL.wave_draws_needed(180, 48)
+    assert need["reused_function"] == "services.wave_study.power_and_verdict"
+    assert need["observed_delta"] == pytest.approx(48 / 180 - p0)
+
+    def target(delta: float) -> Mapping[str, Any]:
+        return min(need["targets"], key=lambda item: abs(float(item["delta"]) - delta))
+
+    claimed = target(48 / 180 - p0)
+    # 26.6667% − 20.4082% = +6.2585pp → 共需 345 期（还要 165 期 ≈ 5.4 个月）
+    assert float(claimed["delta"]) == pytest.approx(0.062585, abs=1e-6)
+    assert claimed["required_draws_80_power"] == 345
+    assert claimed["additional_draws_needed"] == 165
+    assert claimed["months_at_one_draw_per_day"] == pytest.approx(5.42, abs=0.01)
+    assert "n =" in str(claimed["arithmetic"])  # 逐项算术可核对，不是拍脑袋数字
+
+    assert target(0.05)["required_draws_80_power"] == 535
+    break_even = target(10.0 / 47.0 - p0)
+    assert float(break_even["delta"]) == pytest.approx(0.008684, abs=1e-6)
+    assert break_even["required_draws_80_power"] == 17063
+
+    # 与另一个帮手互相印证：208 期上 +5% 需 510 期（同一套两比例公式）
+    assert A.minimum_detectable_delta(208, p0, alpha=0.05, power=0.8)[
+        "required_draws"
+    ]["+5%"] == 510
+
+
+def test_cli_regression_prints_and_writes_a_json_artifact(tmp_path: Path) -> None:
+    """CLI 层：regression 子命令必须能跑通、落 JSON，且 pending 期不参与统计。"""
+    draws = synthetic_draws(30)
+    draws_path, settings_path = _write_fixtures(tmp_path, draws)
+    ledger_path = tmp_path / "ledger.json"
+    FV.main(
+        [
+            "freeze", "--period", "31", "--ledger", str(ledger_path),
+            "--draws-json", str(draws_path), "--settings-json", str(settings_path),
+            "--strategies", "wave,production,uniform",
+            "--out", str(tmp_path / "freeze.json"),
+        ]
+    )
+    ledger = FL.load_ledger(ledger_path)
+    assert [entry["strategy"] for entry in ledger["records"][0]["strategies"]] == [
+        FL.STRATEGY_WAVE,
+        FL.STRATEGY_PRODUCTION,
+        FL.STRATEGY_UNIFORM,
+    ]
+
+    FV.main(
+        [
+            "regression", "--ledger", str(ledger_path), "--draws-json", str(draws_path),
+            "--out", str(tmp_path / "regression.json"),
+        ]
+    )
+    artifact = json.loads((tmp_path / "regression.json").read_text(encoding="utf-8"))
+    assert artifact["command"] == "regression"
+    assert artifact["scored_periods"] == []
+    assert artifact["pending_periods"] == [31]
+    assert artifact["integrity_ok"] is True
+    assert artifact["wave"]["variant_id"] == WS.PRIMARY_VARIANT_ID
+    assert artifact["wave"]["ledger"]["pending"] == 1
+    assert artifact["strategies"][FL.STRATEGY_WAVE]["hit_rate"] is None
+    # 未知策略名要明确报错，而不是静默忽略
+    with pytest.raises(FL.LedgerError):
+        FV.main(
+            [
+                "freeze", "--period", "32", "--ledger", str(ledger_path),
+                "--draws-json", str(draws_path), "--settings-json", str(settings_path),
+                "--strategies", "no-such-strategy",
+                "--out", str(tmp_path / "bad.json"),
+            ]
+        )
