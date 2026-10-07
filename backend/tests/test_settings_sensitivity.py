@@ -255,18 +255,21 @@ def test_role_weights_need_budget_slack_to_do_anything():
     assert cls == CLASS_INERT
 
 
-def test_engine_bug_is_recorded_not_swallowed():
-    """score_top + 预算不足 1 个注码单位时引擎自身会崩：审计必须如实记录。"""
+def test_engine_bug_is_fixed_and_cell_is_now_evaluable():
+    """回归护栏：score_top + 预算不足 1 个注码单位过去会让引擎抛 KeyError。
+
+    该崩溃已由 ``plan_budget`` 统一预算归一化修掉（改为返回显式 ``no_ticket``
+    与 ``BUDGET_TOO_SMALL_FOR_ONE_UNIT``），因此这一格不再报错，而是被正常评估。
+    本用例与审计的 ``engine_error_values`` 口径互为反向护栏：过去断言「必须记下
+    崩溃」，现在断言「崩溃不再发生、且该格确实被评估到」。
+    """
     series = _series()
     effect = evaluate_setting(
         "amount_unit", "score_top", AUDIT_CONFIGS["score_top"], series, (100,)
     )
-    errors = effect["engine_error_values"]
-    assert len(errors) == 1
-    assert errors[0]["value"] == 100
-    assert "KeyError" in errors[0]["error"] or "amount" in errors[0]["error"]
-    # 出错的格子不计入分类依据，但也不允许被当成「无变化」
-    assert effect["alternatives_evaluated"] == 0
+    assert effect["engine_error_values"] == []
+    # 该格不再被算作「引擎出错」而排除，因此确实被评估到了
+    assert effect["alternatives_evaluated"] == 1
 
 
 # --------------------------------------------------------------------------- #
