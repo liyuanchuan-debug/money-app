@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from datetime import date, datetime
+from statistics import NormalDist
 from typing import Any, Iterable, Sequence
 
 from services.lottery import (
@@ -1641,3 +1642,216 @@ def walk_forward_config_search(
         }
     )
     return envelope
+
+
+# --------------------------------------------------------------------------- #
+# 8. 小样本功效工具（纯函数）
+#
+# 用途：``scripts/challenge_210_draws.py`` 用它们回答「就本池这几百期，能不能
+# 证明优于随机」——精确二项检验、多重比较校正、最小可检测效应（MDD），以及把
+# 「整池逐期命中序列」换算成训练 / 验证两段 Δ。
+#
+# 这些函数本身不含任何样本口径判断；调用方必须把结果锁在
+# 「本池已导入 N 期样本内」（``_scope``），禁止升格为全量 / 市场结论。
+# --------------------------------------------------------------------------- #
+def binomial_log_pmf(k: int, n: int, p: float) -> float:
+    """``log P(X = k)``，其中 ``X ~ Binomial(n, p)``（对数域，避免下溢）。
+
+    ``p`` 取 0 / 1 时按退化分布处理（不再是 ``-inf * 0``）。
+    """
+    if n < 0 or k < 0 or k > n:
+        return -math.inf
+    if p <= 0.0:
+        return 0.0 if k == 0 else -math.inf
+    if p >= 1.0:
+        return 0.0 if k == n else -math.inf
+    return (
+        math.lgamma(n + 1)
+        - math.lgamma(k + 1)
+        - math.lgamma(n - k + 1)
+        + k * math.log(p)
+        + (n - k) * math.log1p(-p)
+    )
+
+
+def binomial_tail_p(
+    hits: int, trials: int, baseline_rate: float, *, alternative: str = "two-sided"
+) -> float | None:
+    """精确二项检验 p 值：一次抽 k 注、每期命中概率 ``baseline_rate`` 下的尾概率。
+
+    ``alternative``：
+    - ``"greater"``：P(X >= hits) —— 「优于随机」的单侧 p；
+    - ``"less"``：P(X <= hits)；
+    - ``"two-sided"``：累加所有概率质量 <= 观测质量的取值（与
+      ``scripts/lottery_power_analysis.py`` 的 ``binom_two_sided_p`` 同口径）。
+
+    样本不足（``trials <= 0`` 或 ``hits`` 越界）返回 ``None``，不用 0 冒充结论。
+    """
+    if trials <= 0 or hits < 0 or hits > trials:
+        return None
+    if alternative == "greater":
+        total = sum(
+            math.exp(binomial_log_pmf(i, trials, baseline_rate))
+            for i in range(hits, trials + 1)
+        )
+    elif alternative == "less":
+        total = sum(
+            math.exp(binomial_log_pmf(i, trials, baseline_rate))
+            for i in range(0, hits + 1)
+        )
+    elif alternative == "two-sided":
+        threshold = binomial_log_pmf(hits, trials, baseline_rate) + 1e-9
+        total = sum(
+            math.exp(binomial_log_pmf(i, trials, baseline_rate))
+            for i in range(0, trials + 1)
+            if binomial_log_pmf(i, trials, baseline_rate) <= threshold
+        )
+    else:
+        raise ValueError(f"未知的 alternative：{alternative}")
+    return min(1.0, max(0.0, total))
+
+
+def holm_adjusted_p(pvalues: Sequence[float], alpha: float = 0.05) -> dict[str, Any]:
+    """Holm 逐步向下校正（比 Bonferroni 均匀更不易保守），返回校正后 p 值。
+
+    ``adjusted[i] = max_{j: p_(j) <= p_(i)} (m - rank(j)) * p_(j)``，保持单调；
+    某组在 ``alpha`` 下显著 <=> 其校正后 p 值 <= ``alpha``。
+    """
+    m = len(pvalues)
+    if m == 0:
+        return {
+            "alpha": alpha,
+            "adjusted": [],
+            "significant_count": 0,
+            "significant_indices": [],
+            "bonferroni_threshold": alpha,
+        }
+    order = sorted(range(m), key=lambda i: pvalues[i])
+    adjusted = [1.0] * m
+    running = 0.0
+    for rank, index in enumerate(order):
+        value = min(1.0, pvalues[index] * (m - rank))
+        running = max(running, value)
+        adjusted[index] = running
+    significant = [i for i in range(m) if adjusted[i] <= alpha]
+    return {
+        "alpha": alpha,
+        "adjusted": adjusted,
+        "significant_count": len(significant),
+        "significant_indices": significant,
+        "bonferroni_threshold": alpha / m,
+    }
+
+
+def minimum_detectable_delta(
+    evaluated: int,
+    baseline_rate: float,
+    *,
+    alpha: float = 0.05,
+    power: float = 0.8,
+) -> dict[str, Any]:
+    """在 ``evaluated`` 期、随机基线 ``baseline_rate`` 下「能看见」的最小真实 Δ。
+
+    返回
+    - ``standard_error``：单期命中率的标准误 ``sqrt(p(1-p)/N)``；
+    - ``two_sigma_delta``：``2 × 标准误``（「刚能被看见」的经验口径）；
+    - ``minimum_detectable_delta``：双侧 ``alpha`` + 指定功效下可检出的最小 Δ ——
+      真实优势 >= 该值时，本样本以约 ``power`` 的概率拒绝「等于随机」；
+      反过来，真实优势 >= 该值却未被检出，才能说「至少排除了这么大的优势」；
+    - ``required_draws`` / ``power_at_current_n``：若干目标 Δ 的期数需求与当前功效。
+
+    样本量为 0 时各项为 ``None``（数据不足），不返回 0 冒充。
+    """
+    p = float(baseline_rate)
+    if evaluated <= 0 or not 0.0 < p < 1.0:
+        return {
+            "evaluated": int(max(0, evaluated)),
+            "baseline_rate": p if 0.0 <= p <= 1.0 else None,
+            "standard_error": None,
+            "two_sigma_delta": None,
+            "alpha": alpha,
+            "power": power,
+            "minimum_detectable_delta": None,
+            "power_at_mdd": None,
+            "required_draws": {},
+            "power_at_current_n": {},
+            "data_status": DATA_STATUS_INSUFFICIENT,
+            "data_status_label": DATA_STATUS_LABELS[DATA_STATUS_INSUFFICIENT],
+        }
+    n = int(evaluated)
+    se = math.sqrt(p * (1.0 - p) / n)
+    normal = NormalDist()
+    z_alpha = normal.inv_cdf(1.0 - alpha / 2.0)
+    z_power = normal.inv_cdf(power)
+    mdd = (z_alpha + z_power) * se
+
+    def power_for(delta: float) -> float:
+        if se <= 0.0:
+            return 1.0 if delta > 0 else alpha
+        return (1.0 - normal.cdf(z_alpha - delta / se)) + normal.cdf(
+            -z_alpha - delta / se
+        )
+
+    def required_draws(delta: float) -> int | None:
+        if delta <= 0.0:
+            return None
+        return math.ceil(((z_alpha + z_power) ** 2) * p * (1.0 - p) / (delta * delta))
+
+    targets = ("+1%", "+2%", "+5%", "+10%")
+    return {
+        "evaluated": n,
+        "baseline_rate": p,
+        "standard_error": se,
+        "two_sigma_delta": 2.0 * se,
+        "alpha": alpha,
+        "power": power,
+        "z_alpha": z_alpha,
+        "z_power": z_power,
+        "minimum_detectable_delta": mdd,
+        "power_at_mdd": power_for(mdd),
+        "required_draws": {
+            target: required_draws(float(target.strip("+%")) / 100.0)
+            for target in targets
+        },
+        "power_at_current_n": {
+            target: power_for(float(target.strip("+%")) / 100.0) for target in targets
+        },
+        "data_status": DATA_STATUS_OK,
+        "data_status_label": DATA_STATUS_LABELS[DATA_STATUS_OK],
+    }
+
+
+def window_delta_from_hits(
+    hits: Sequence[bool], split_offset: int, baseline_rate: float
+) -> dict[str, Any]:
+    """把「整池逐期命中序列」切成训练 / 验证两段，分别算命中率与相对随机 Δ。
+
+    ``hits[i]`` 必须与 ``walk_forward_split`` 的 ``eval_start`` 对齐（第 i 个元素
+    是第 ``eval_start + i`` 期）；``split_offset`` = ``split_index - eval_start``，
+    即验证段起点。这样切出来的两段与 ``walk_forward_eval_config`` **逐位同口径**
+    （同样本、同划分、同基线 → 同 Δ），可用它把一次整池回测展开成任意窗口组合，
+    避免为每个窗口重跑回测。
+    """
+    total = len(hits)
+    offset = max(0, min(int(split_offset), total))
+    train = [bool(value) for value in hits[:offset]]
+    valid = [bool(value) for value in hits[offset:]]
+
+    def _segment(values: list[bool]) -> dict[str, Any]:
+        count = len(values)
+        hit_count = sum(1 for value in values if value)
+        rate = _rate(hit_count, count)
+        return {
+            "hits": hit_count,
+            "evaluated": count,
+            "hit_rate": rate,
+            "delta": (rate - baseline_rate) if rate is not None else None,
+        }
+
+    return {
+        "baseline_rate": baseline_rate,
+        "train_eval": len(train),
+        "valid_eval": len(valid),
+        "train": _segment(train),
+        "valid": _segment(valid),
+    }
