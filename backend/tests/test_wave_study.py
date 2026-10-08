@@ -63,6 +63,10 @@ LIVE_SETTINGS: dict = {
     "avoid_cold_enabled": False,
     "avoid_cold_days": 60,
     "pick_strategy": "wave_round",
+    # 冻结锚点：2026-10-07 起 wave_alloc 默认 balanced（点阵关闭时按非空桶均分注数），
+    # 会换掉点阵关闭路径的号码集合、命中数随之漂移。本快照是历史线上配置，
+    # 为保住「生产行为不许漂移」对照的历史数字，这里显式钉住当时的旧口径 drain。
+    "wave_alloc": "drain",
     "role_w_primary": 3.0,
     "role_w_secondary": 2.0,
     "role_w_defense": 1.0,

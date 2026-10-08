@@ -214,6 +214,32 @@ PICK_STRATEGY_PATTERN = "^(" + "|".join(PICK_STRATEGIES) + ")$"
 DEFAULT_PICK_STRATEGY = PICK_STRATEGY_WAVE_ROUND
 
 # --------------------------------------------------------------------------- #
+# 波动桶注数分配（仅作用于 lattice 关闭的波动轮取路径；点阵路径不变）
+#
+# 背景：三类波动桶是**以最新一期特码为圆心**的连续区段：
+#   small  = |n − latest| ≤ small_max ；normal = small_max < |n − latest| ≤ normal_max ；
+#   big    = |n − latest| > normal_max 。
+# 旧口径「drain」按 WAVE_ORDER（小→常→大）逐桶取满：小波动桶先取 1 注，
+# 再在补齐轮里被**一次性抽干**，于是 10 注里恒有 8~9 注落在同一个连续区段
+# （最新=10 时即 1..20），形成「一坨 + 两个离群点」。这是下注形状问题，
+# 与期望值无关：任意 10 个不同号的命中概率恒为 10/49。
+#
+# 「balanced」改为：按非空桶均分注数（最大余额法，10 注 → 4/3/3），
+# 轮转取号，且桶内用「离已选号码最远优先」挑号（并列时保持池内既有顺序：
+# 点阵 → 软降权 → 遗漏）。结果仍是 10 个不同号、确定性可复现，
+# P(hit) / EV 不变。旧行为保留在 drain 值下，可随时切回。
+# --------------------------------------------------------------------------- #
+WAVE_ALLOC_DRAIN = "drain"
+WAVE_ALLOC_BALANCED = "balanced"
+WAVE_ALLOCS = [WAVE_ALLOC_DRAIN, WAVE_ALLOC_BALANCED]
+WAVE_ALLOC_LABELS = {
+    WAVE_ALLOC_DRAIN: "逐桶取满（旧：号码挤在一段）",
+    WAVE_ALLOC_BALANCED: "均衡分散（推荐：每个波动桶均分）",
+}
+WAVE_ALLOC_PATTERN = "^(" + "|".join(WAVE_ALLOCS) + ")$"
+DEFAULT_WAVE_ALLOC = WAVE_ALLOC_BALANCED
+
+# --------------------------------------------------------------------------- #
 # 出票状态 / 机器可读原因码（一律英文枚举；汉字只出现在 *_message / notes）
 #
 # 预算连 **1 个注码单位** 都覆盖不了时（``total_amount // amount_unit == 0``），
@@ -347,6 +373,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "avoid_cold_days": DEFAULT_AVOID_COLD_DAYS,
     # 选号策略与打分权重（score_top 才读权重；wave_round 忽略）
     "pick_strategy": DEFAULT_PICK_STRATEGY,
+    # 波动桶注数分配：balanced=非空桶均分 + 桶内最远点优先（默认，防「一坨」）；
+    # drain=旧行为（按小→常→大逐桶取满，号码会挤在同一连续区段）
+    "wave_alloc": DEFAULT_WAVE_ALLOC,
     "score_w_focus": DEFAULT_SCORE_W_FOCUS,
     "score_w_mid": DEFAULT_SCORE_W_MID,
     "score_w_omit": DEFAULT_SCORE_W_OMIT,
@@ -525,6 +554,9 @@ def clamp_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     merged["pick_strategy"] = (
         strategy if strategy in PICK_STRATEGIES else DEFAULT_PICK_STRATEGY
     )
+    # 波动桶注数分配：缺失 / 脏值一律回退为默认（均衡分散）
+    alloc = str(merged.get("wave_alloc") or "").strip().lower()
+    merged["wave_alloc"] = alloc if alloc in WAVE_ALLOCS else DEFAULT_WAVE_ALLOC
     for weight_key, default in (
         ("score_w_focus", DEFAULT_SCORE_W_FOCUS),
         ("score_w_mid", DEFAULT_SCORE_W_MID),
@@ -1340,6 +1372,62 @@ def assign_roles(pick_count: int) -> list[str]:
         else:
             roles.append(ROLE_DEFENSE)
     return roles
+
+
+def balanced_wave_quotas(
+    pick_count: int, available: Mapping[str, int]
+) -> dict[str, int]:
+    """把 ``pick_count`` 注按**非空波动桶均分**（最大余额法），返回各桶配额。
+
+    - 只有候选数 > 0 的桶参与分配；不足由其余桶继续摊（不会留下分不完的注数）；
+    - 并列时按 ``WAVE_ORDER``（小→常→大）取靠前者 → 结果确定、可复现；
+    - 配额之和恒等于 ``min(pick_count, 候选总数)``，因此不会凭空多出 / 少掉注数。
+
+    例：10 注 / 三桶非空 → 4 / 3 / 3（不是旧口径的 8 / 1 / 1）。
+    """
+    total = max(0, int(pick_count))
+    waves = list(WAVE_ORDER)
+    quota = {wave: 0 for wave in waves}
+    caps = {wave: max(0, int(available.get(wave, 0))) for wave in waves}
+    remaining = total
+    active = [wave for wave in waves if caps[wave] > 0]
+    while remaining > 0 and active:
+        base, extra = divmod(remaining, len(active))
+        progressed = False
+        for index, wave in enumerate(active):
+            want = base + (1 if index < extra else 0)
+            give = min(want, caps[wave] - quota[wave])
+            if give > 0:
+                quota[wave] += give
+                remaining -= give
+                progressed = True
+        active = [wave for wave in active if quota[wave] < caps[wave]]
+        if not progressed:
+            break
+    return quota
+
+
+def pick_most_spread(numbers: Sequence[int], used: Iterable[int]) -> int:
+    """在候选序列里挑「离已选号码最远」的那个 → 返回下标（并列取最靠前的候选）。
+
+    距离定义为「到最近一个已选号码的绝对差」；``used`` 为空时返回 0，
+    即保持候选取号池既有的排序（点阵 → 软降权 → 遗漏），不引入任何随机性。
+    纯函数：同一组入参 → 同一结果，满足前向台账的确定性要求。
+    """
+    pool = [int(number) for number in numbers]
+    if not pool:
+        return 0
+    anchors = [int(number) for number in used]
+    if not anchors:
+        return 0
+    best_index = 0
+    best_distance = min(abs(pool[0] - anchor) for anchor in anchors)
+    for index in range(1, len(pool)):
+        distance = min(abs(pool[index] - anchor) for anchor in anchors)
+        if distance > best_distance:
+            best_distance = distance
+            best_index = index
+    return best_index
 
 
 def amount_seed_key(
@@ -2266,6 +2354,9 @@ def recommend(
     pick_strategy = str(cfg.get("pick_strategy") or DEFAULT_PICK_STRATEGY)
     if pick_strategy not in PICK_STRATEGIES:
         pick_strategy = DEFAULT_PICK_STRATEGY
+    wave_alloc = str(cfg.get("wave_alloc") or DEFAULT_WAVE_ALLOC)
+    if wave_alloc not in WAVE_ALLOCS:
+        wave_alloc = DEFAULT_WAVE_ALLOC
     score_weights = clamp_score_weights(cfg)
 
     def _annex_pick(wave: str, item: dict[str, Any], *, score: float | None = None) -> None:
@@ -2339,6 +2430,50 @@ def recommend(
             _annex_pick(wave, band_item)
             return True
 
+        def _take_spread_one(wave: str, preferred_role: str | None = None) -> bool:
+            """均衡分配专用：从该波动桶取**离已选号码最远**的一个号。
+
+            候选顺序与 ``_take_one`` 完全一致（``neutral`` = 池内既有排序；
+            加权时 = 偏好角色带优先，同带内同样按池内排序回落），只把
+            「取池首」换成「取最分散的一个」；并列时取池内靠前者，
+            因此仍然确定、可复现。``used_numbers`` 为空时等价于取池首。
+            """
+            if not ordered_pools[wave]:
+                return False
+            if trend_bias == TREND_BIAS_NEUTRAL:
+                candidates = list(ordered_pools[wave])
+            else:
+                role = (
+                    preferred_role
+                    if preferred_role
+                    else role_for_focus_rank(focus.index(wave))
+                )
+                candidates = []
+                for role_name in [role] + [
+                    name for name in ROLE_ORDER if name != role
+                ]:
+                    group = [
+                        item
+                        for item in wave_bands[wave].get(role_name, [])
+                        if int(item["number"]) not in used_numbers
+                    ]
+                    if cold_predicate is not None and group:
+                        # 与 take_from_role_band 同口径：先在带内挑非冷号
+                        warm = [
+                            item for item in group if not cold_predicate(int(item["number"]))
+                        ]
+                        group = warm or group
+                    if group:
+                        candidates = group
+                        break
+                if not candidates:
+                    candidates = list(ordered_pools[wave])
+            index = pick_most_spread(
+                [int(item["number"]) for item in candidates], used_numbers
+            )
+            _annex_pick(wave, candidates[index])
+            return True
+
         # 「预测波动桶」：点阵开启时先在该桶内取满（带内优先），不足才向其余桶扩散；
         # 关闭点阵 / 无预测时为 None → 完全走旧的「小→常→大」轮取（旧行为）。
         wave_pass_order = (
@@ -2356,9 +2491,33 @@ def recommend(
                     role = assign_roles(pick_count)[len(picks)]
                     if not _take_one(wave, role):
                         break
+        elif wave_alloc == WAVE_ALLOC_BALANCED:
+            # 均衡分散：配额按非空桶均分（最大余额法），轮转取号，
+            # 桶内选「离已选号码最远」的号 → 不再把某一个连续区段抽干。
+            # 注数、命中概率与期望值均不变（仍是 pick_count 个不同号）。
+            quotas = balanced_wave_quotas(
+                pick_count, {wave: len(ordered_pools[wave]) for wave in WAVE_ORDER}
+            )
+            while len(picks) < pick_count:
+                progressed = False
+                for wave in WAVE_ORDER:
+                    if len(picks) >= pick_count:
+                        break
+                    if quotas[wave] <= 0:
+                        continue
+                    # 角色顺位与旧路径一致（只影响角色带映射，不影响金额口径）
+                    role = assign_roles(pick_count)[len(picks)]
+                    if not _take_spread_one(wave, role):
+                        quotas[wave] = 0
+                        continue
+                    quotas[wave] -= 1
+                    progressed = True
+                if not progressed:
+                    break
         else:
-            # 决策 1：候选选取固定按 WAVE_ORDER（小波动 → 常规波动 → 大跳）逐类取一个，
-            # 与侧重/回补顺序解耦；侧重顺序只用于角色分配，以及加权时的角色带映射。
+            # 旧口径（wave_alloc=drain）：候选选取固定按 WAVE_ORDER
+            # （小波动 → 常规波动 → 大跳）逐类取一个，与侧重/回补顺序解耦；
+            # 侧重顺序只用于角色分配，以及加权时的角色带映射。
             for wave in WAVE_ORDER:
                 if len(picks) >= pick_count:
                     break
@@ -2597,10 +2756,25 @@ def recommend(
             "选号策略为打分 Top-N：在候选池内按侧重波段、中频接近度、遗漏与差值综合打分后取前 N 注；"
             "这是样本内排序对照（用于相对随机命中差），不是真实概率，也不承诺提高命中率。"
         )
+    elif lattice_primary is not None:
+        notes.append(
+            "选号策略为波动轮取：点阵开启时先在预测波动桶内取满再向其余桶扩散。"
+        )
+    elif wave_alloc == WAVE_ALLOC_BALANCED:
+        notes.append(
+            "选号策略为波动轮取（均衡分散）：三个波动桶按非空桶均分注数"
+            f"（{pick_count} 注 → 各桶尽量均分，最多相差 1 注），轮转取号，"
+            "桶内优先挑「离已选号码最远」的号，避免号码挤在同一个连续区段。"
+            "以最新特码为圆心的波动桶本身是连续区段，因此这只是下注形状的调整："
+            "命中概率与期望值完全不变（任意"
+            f" {pick_count} 个不同号命中概率恒为 {pick_count}/49），"
+            "也不承诺提高命中率。"
+        )
     else:
         notes.append(
-            "选号策略为波动轮取：点阵开启时先在预测波动桶内取满再向其余桶扩散；"
-            "点阵关闭时为旧的「小/常/大跳各取一注，不足再按波动桶补齐」。"
+            "选号策略为波动轮取（逐桶取满）：点阵关闭时为旧的"
+            "「小/常/大跳各取一注，不足再按波动桶补齐」——"
+            "该口径会把小波动桶一次性抽干，号码容易挤在同一连续区段。"
         )
 
     # 派生展示值（deprecated）：均分后再向下对齐到 amount_unit

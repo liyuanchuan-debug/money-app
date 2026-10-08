@@ -60,6 +60,7 @@ from services.lottery import (
     TREND_BIAS_HOT,
     TREND_BIAS_MID,
     TREND_BIAS_NEUTRAL,
+    WAVE_ALLOC_DRAIN,
     classify_wave,
     clamp_settings,
     lattice_weight,
@@ -1084,6 +1085,10 @@ AUDIT_SNAPSHOT: dict[str, Any] = {
     "normal_max": 30,
     "trend_bias": TREND_BIAS_NEUTRAL,
     "exclude_repeat_zodiac": False,
+    # 冻结锚点：本快照是**历史审计基线**，不是「当前代码默认」的同义词。
+    # 2026-10-07 起 ``wave_alloc`` 默认改为 balanced（均衡分散），会把点阵关闭时的
+    # 号码集合整体换掉、命中数随之漂移；为保留审计快照的历史可比性，这里显式钉住旧口径。
+    "wave_alloc": WAVE_ALLOC_DRAIN,
 }
 
 

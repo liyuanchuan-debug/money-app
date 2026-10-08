@@ -58,6 +58,13 @@ export interface LotterySettings {
    * 不是「提高命中率」承诺。
    */
   pick_strategy?: 'wave_round' | 'score_top'
+  /**
+   * 波动桶注数分配（仅作用于点阵关闭的波动轮取路径）：
+   * balanced=非空波动桶均分 + 桶内最远点优先（默认，避免号码挤在同一连续区段）；
+   * drain=旧行为（按小→常→大逐桶取满）。
+   * 只改下注形状，不改命中概率 / 期望值。
+   */
+  wave_alloc?: 'balanced' | 'drain'
   score_w_focus?: number
   score_w_mid?: number
   score_w_omit?: number
@@ -92,6 +99,7 @@ export interface LotterySettingsPatch {
   avoid_cold_enabled?: boolean
   avoid_cold_days?: number
   pick_strategy?: 'wave_round' | 'score_top'
+  wave_alloc?: 'balanced' | 'drain'
   score_w_focus?: number
   score_w_mid?: number
   score_w_omit?: number
@@ -576,6 +584,25 @@ export interface TrendBiasOption {
   value: TrendBias
   label: string
 }
+
+/**
+ * 波动桶注数分配；与后端 ``WAVE_ALLOC_*`` 一致。
+ * - ``balanced``（默认）：非空波动桶均分注数 + 桶内「离已选号码最远优先」；
+ * - ``drain``（旧）：按小→常→大逐桶取满，号码容易挤在同一个连续区段。
+ * 只改下注形状，不改命中概率 / 期望值（任意 10 个不同号命中率恒为 10/49）。
+ */
+export type WaveAlloc = 'balanced' | 'drain'
+
+export interface WaveAllocOption {
+  value: WaveAlloc
+  label: string
+}
+
+/** 波动桶注数分配取值表（设置页持久化）；默认 balanced */
+export const WAVE_ALLOC_OPTIONS: WaveAllocOption[] = [
+  { value: 'balanced', label: '均衡分散' },
+  { value: 'drain', label: '逐桶取满（旧）' },
+]
 
 /**
  * 筹码模式的唯一取值表（默认值在「设置」页持久化，临场切换在「波浪买入法」页）。

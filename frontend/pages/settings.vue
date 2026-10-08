@@ -35,8 +35,10 @@ import {
   TREND_WINDOW_DEFAULT,
   TREND_WINDOW_OPTIONS,
   previewEvenAmounts,
+  WAVE_ALLOC_OPTIONS,
   type ChipMode,
   type TrendBias,
+  type WaveAlloc,
 } from '~/composables/useApi'
 
 definePageMeta({ role: 'USER' })
@@ -63,6 +65,8 @@ const infoMessage = ref('')
 const chipModes = CHIP_MODE_OPTIONS
 const trendBiasOptions = TREND_BIAS_OPTIONS
 const trendWindowOptions = TREND_WINDOW_OPTIONS
+/** 波动桶注数分配取值表（== 后端 services/lottery.py 的 WAVE_ALLOCS） */
+const waveAllocOptions = WAVE_ALLOC_OPTIONS
 /** 软降权权重档位（1.0 = 不降权） */
 const softWeightOptions = SOFT_WEIGHT_OPTIONS
 
@@ -72,6 +76,10 @@ function isChipMode(value: unknown): value is ChipMode {
 
 function isTrendBias(value: unknown): value is TrendBias {
   return trendBiasOptions.some(option => option.value === value)
+}
+
+function isWaveAlloc(value: unknown): value is WaveAlloc {
+  return waveAllocOptions.some(option => option.value === value)
 }
 
 const form = reactive({
@@ -98,6 +106,8 @@ const form = reactive({
   // 预测波动线 + 号码点阵（参与选号：带内优先）；默认关闭（2026-10-07 用户偏好）
   lattice_enabled: false,
   lattice_window: LATTICE_WINDOW_DEFAULT,
+  // 波动桶注数分配：均衡分散（默认）—— 非空桶均分 + 桶内最远点优先，避免「一坨」
+  wave_alloc: 'balanced' as WaveAlloc,
   // 角色金额配额（均注模式）：主推 : 次选 : 防守 = 3:2:1（防守最低）
   role_w_primary: ROLE_WEIGHT_PRIMARY_DEFAULT,
   role_w_secondary: ROLE_WEIGHT_SECONDARY_DEFAULT,
@@ -220,6 +230,8 @@ async function load() {
     form.lattice_window = typeof settings.lattice_window === 'number'
       ? settings.lattice_window
       : LATTICE_WINDOW_DEFAULT
+    // 只在后端返回合法枚举时覆盖，避免把状态搞成取值之外的脏值
+    if (isWaveAlloc(settings.wave_alloc)) form.wave_alloc = settings.wave_alloc
     form.role_w_primary = typeof settings.role_w_primary === 'number'
       ? settings.role_w_primary
       : ROLE_WEIGHT_PRIMARY_DEFAULT
@@ -364,6 +376,7 @@ async function save() {
       stale_weight: form.stale_weight,
       lattice_enabled: form.lattice_enabled,
       lattice_window: form.lattice_window,
+      wave_alloc: form.wave_alloc,
       role_w_primary: form.role_w_primary,
       role_w_secondary: form.role_w_secondary,
       role_w_defense: form.role_w_defense,
@@ -396,6 +409,8 @@ async function save() {
     form.lattice_window = typeof settings.lattice_window === 'number'
       ? settings.lattice_window
       : LATTICE_WINDOW_DEFAULT
+    // 只在后端返回合法枚举时覆盖，避免把状态搞成取值之外的脏值
+    if (isWaveAlloc(settings.wave_alloc)) form.wave_alloc = settings.wave_alloc
     form.role_w_primary = typeof settings.role_w_primary === 'number'
       ? settings.role_w_primary
       : ROLE_WEIGHT_PRIMARY_DEFAULT
@@ -955,6 +970,40 @@ const readonlyInputClass
                     样本不足两对差值时不生成预测波动线，点阵不参与选号。
                   </p>
                 </div>
+              </div>
+
+              <!-- 波动桶注数分配（仅点阵关闭时生效） -->
+              <div class="space-y-2">
+                <p id="wave-alloc-label" class="text-sm font-medium text-slate-200">
+                  波动桶注数分配
+                </p>
+                <div
+                  role="radiogroup"
+                  aria-labelledby="wave-alloc-label"
+                  class="flex flex-wrap gap-2"
+                >
+                  <GlassButton
+                    v-for="option in waveAllocOptions"
+                    :key="option.value"
+                    role="radio"
+                    :aria-checked="form.wave_alloc === option.value"
+                    :variant="form.wave_alloc === option.value ? 'primary' : 'glass'"
+                    class="min-h-[44px] px-4 text-base"
+                    @click="form.wave_alloc = option.value"
+                  >
+                    {{ option.label }}
+                  </GlassButton>
+                </div>
+                <p class="text-xs leading-relaxed text-slate-500">
+                  三个波动桶是以「上期特码」为圆心的连续区段（小波动 = 差值 ≤
+                  <span class="num text-slate-300">{{ form.small_max }}</span>，
+                  常规 = 差值 ≤
+                  <span class="num text-slate-300">{{ form.normal_max }}</span>，
+                  大跳 = 更远）。「逐桶取满」会先把小波动桶抽干，10 注里常有 8~9 注挤在同一段；
+                  「均衡分散」按非空桶均分注数（10 注 → 4/3/3）并优先挑离已选号最远的号，
+                  只改下注形状 —— 命中概率与期望值（−2.04 元/注）完全不变，
+                  真正决定盈亏的仍是投注金额。仅当上面的号码点阵关闭时生效。
+                </p>
               </div>
 
               <!-- 近期走势加权：默认不加权；财富密码页可临时预览 -->

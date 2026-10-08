@@ -38,10 +38,14 @@ from services.analytics import (  # noqa: E402
 )
 from services.lottery import (  # noqa: E402
     DEFAULT_SETTINGS,
+    DEFAULT_WAVE_ALLOC,
     MODES,
     PICK_STRATEGIES,
     TREND_BIASES,
     TREND_BIAS_EXPLICIT_KEY,
+    WAVE_ALLOC_BALANCED,
+    WAVE_ALLOC_DRAIN,
+    WAVE_ALLOCS,
     clamp_settings,
     recommend,
 )  # noqa: E402
@@ -479,6 +483,7 @@ def test_lottery_public_contract_unchanged():
         "avoid_cold_enabled",
         "avoid_cold_days",
         "pick_strategy",
+        "wave_alloc",
         "score_w_focus",
         "score_w_mid",
         "score_w_omit",
@@ -497,6 +502,8 @@ def test_lottery_public_contract_unchanged():
     }
     assert MODES == ["even", "weighted", "single", "random"]
     assert PICK_STRATEGIES == ["wave_round", "score_top"]
+    assert WAVE_ALLOCS == ["drain", "balanced"]
+    assert DEFAULT_WAVE_ALLOC == WAVE_ALLOC_BALANCED
     assert TREND_BIASES == ["neutral", "hot", "cold", "mid"]
 
     # 号码范围 1..49 不得被改动

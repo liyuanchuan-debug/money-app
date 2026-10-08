@@ -60,6 +60,9 @@ from services.lottery import (
     STALE_PERIODS_MIN,
     TOTAL_AMOUNT_MAX,
     TOTAL_AMOUNT_MIN,
+    WAVE_ALLOC_BALANCED,
+    WAVE_ALLOC_DRAIN,
+    DEFAULT_WAVE_ALLOC,
     WAVE_BIG,
     WAVE_NORMAL,
     WAVE_SMALL,
@@ -69,7 +72,9 @@ from services.lottery import (
     apply_soft_weights,
     assign_roles,
     avoid_cold_weight,
+    balanced_wave_quotas,
     distribute_units_by_role,
+    pick_most_spread,
     role_amount_weights,
     role_weights_are_uniform,
     build_candidate_pools,
@@ -290,7 +295,7 @@ def test_prev_big_focus_puts_small_first():
 
 
 def test_wave_round_takes_one_per_bucket_then_refills_small():
-    """三类池都有号时：先小/常/大各 1，再按 WAVE_ORDER 从小波动补齐。"""
+    """旧口径（wave_alloc=drain）：先小/常/大各 1，再按 WAVE_ORDER 从小波动补齐。"""
     from collections import Counter
 
     result = recommend(
@@ -306,6 +311,8 @@ def test_wave_round_takes_one_per_bucket_then_refills_small():
             "normal_max": 30,
             # 关闭点阵：本用例只校验旧的「小→常→大」轮取顺序
             "lattice_enabled": False,
+            # 显式固定旧口径：默认值已改为 balanced（均衡分散）
+            "wave_alloc": "drain",
         },
     )
     counts = Counter(pick["wave_type"] for pick in result["picks"])
@@ -345,6 +352,171 @@ def test_wave_round_refills_when_small_empty():
     assert counts.get(WAVE_NORMAL, 0) + counts.get(WAVE_BIG, 0) == 6
     # 空桶如实上报
     assert any("小波动" in item["note"] for item in result["missing_waves"])
+
+
+# --------------------------------------------------------------------------- #
+# 波动桶注数分配：balanced（默认，均衡分散）vs drain（旧，逐桶取满）
+# 只改下注形状；注数、可复现性与金额口径不变，期望值不变。
+# --------------------------------------------------------------------------- #
+def test_balanced_wave_quotas_splits_evenly_with_remainder():
+    """10 注 / 三桶非空 → 4/3/3（按 WAVE_ORDER 取最大余额），不是 8/1/1。"""
+    quota = balanced_wave_quotas(10, {WAVE_SMALL: 19, WAVE_NORMAL: 20, WAVE_BIG: 9})
+    assert quota == {WAVE_SMALL: 4, WAVE_NORMAL: 3, WAVE_BIG: 3}
+    assert sum(quota.values()) == 10
+    # 1 / 2 注也严格等于请求注数，且按 WAVE_ORDER 优先给靠前的桶
+    assert balanced_wave_quotas(1, {WAVE_SMALL: 19, WAVE_NORMAL: 20, WAVE_BIG: 9}) == {
+        WAVE_SMALL: 1, WAVE_NORMAL: 0, WAVE_BIG: 0,
+    }
+    assert balanced_wave_quotas(2, {WAVE_SMALL: 19, WAVE_NORMAL: 20, WAVE_BIG: 9}) == {
+        WAVE_SMALL: 1, WAVE_NORMAL: 1, WAVE_BIG: 0,
+    }
+
+
+def test_balanced_wave_quotas_skips_empty_and_redistributes_small_buckets():
+    """空桶不参与分配；某个桶装不下时余量摊给其它桶，配额之和不变。"""
+    assert balanced_wave_quotas(10, {WAVE_SMALL: 19, WAVE_NORMAL: 20, WAVE_BIG: 0}) == {
+        WAVE_SMALL: 5, WAVE_NORMAL: 5, WAVE_BIG: 0,
+    }
+    # 小波动桶只能供 2 注 → 余量 2 注分给常规 / 大跳
+    quota = balanced_wave_quotas(10, {WAVE_SMALL: 2, WAVE_NORMAL: 20, WAVE_BIG: 9})
+    assert quota[WAVE_SMALL] == 2
+    assert quota[WAVE_NORMAL] + quota[WAVE_BIG] == 8
+    assert abs(quota[WAVE_NORMAL] - quota[WAVE_BIG]) <= 1
+    # 候选总数不足时只发得出现有注数，绝不凭空多出
+    assert sum(balanced_wave_quotas(10, {WAVE_SMALL: 1, WAVE_NORMAL: 1, WAVE_BIG: 1}).values()) == 3
+
+
+def test_pick_most_spread_prefers_farthest_and_is_deterministic():
+    """挑「离已选号码最远」的候选；并列取最靠前者；空锚点回到池首。"""
+    assert pick_most_spread([10, 20, 30], set()) == 0
+    # 已选 1 → 30 最远
+    assert pick_most_spread([10, 20, 30], {1}) == 2
+    # 已选 1 与 40 → 到最近锚点距离：10→9、20→19、30→10 → 取 20
+    assert pick_most_spread([10, 20, 30], {1, 40}) == 1
+    # 并列（到唯一锚点距离都为 5）→ 取最靠前者
+    assert pick_most_spread([10, 20], {15}) == 0
+    # 同一组入参重复调用结果一致（确定性）
+    assert pick_most_spread([7, 15, 22, 40], {3, 45}) == pick_most_spread([7, 15, 22, 40], {3, 45})
+
+
+def test_default_wave_alloc_is_balanced():
+    assert DEFAULT_WAVE_ALLOC == WAVE_ALLOC_BALANCED
+    assert clamp_settings({})["wave_alloc"] == WAVE_ALLOC_BALANCED
+    # 脏值 / 未知值一律回退默认，不落成非法枚举
+    assert clamp_settings({"wave_alloc": "even"})["wave_alloc"] == WAVE_ALLOC_BALANCED
+    assert clamp_settings({"wave_alloc": "drain"})["wave_alloc"] == WAVE_ALLOC_DRAIN
+    assert clamp_settings({"wave_alloc": "DRAIN"})["wave_alloc"] == WAVE_ALLOC_DRAIN
+
+
+def test_balanced_alloc_spreads_buckets_and_keeps_exact_pick_count():
+    """默认（均衡分散）：各桶注数最多相差 1，绝不出现「一个桶抽走 8 注」。"""
+    from collections import Counter
+
+    result = recommend(
+        latest=10,
+        previous=2,
+        history_numbers=[10, 2, 33, 12, 41, 5, 26, 9, 44, 3] * 3,
+        settings={
+            "pick_count": 10,
+            "small_max": 10,
+            "normal_max": 30,
+            "trend_bias": "neutral",
+            "lattice_enabled": False,
+            "avoid_cold_enabled": False,
+            "wave_alloc": WAVE_ALLOC_BALANCED,
+        },
+    )
+    numbers = [pick["number"] for pick in result["picks"]]
+    assert len(numbers) == 10
+    assert len(set(numbers)) == 10  # 严格不同号
+    assert all(1 <= n <= 49 for n in numbers)
+    counts = Counter(pick["wave_type"] for pick in result["picks"])
+    bucket_counts = [counts.get(w, 0) for w in (WAVE_SMALL, WAVE_NORMAL, WAVE_BIG)]
+    assert sum(bucket_counts) == 10
+    assert max(bucket_counts) - min(bucket_counts) <= 1
+    assert max(bucket_counts) <= 5  # 不再是 8/9
+    # 三个波动桶（以最新特码为圆心的连续区段）都要有号
+    assert all(c >= 1 for c in bucket_counts)
+    # 不再是「一坨连续号」：最大连续段不超过 4
+    ordered = sorted(numbers)
+    run = best = 1
+    for a, b in zip(ordered, ordered[1:]):
+        run = run + 1 if b == a + 1 else 1
+        best = max(best, run)
+    assert best <= 4
+    # 说明口径：明确写出「均衡分散」且不改期望值
+    assert any("均衡分散" in note for note in result["notes"])
+    assert any("期望值" in note for note in result["notes"])
+
+
+def test_balanced_alloc_is_deterministic():
+    """同一组入参 → 逐字节一致（前向台账要求）。"""
+    settings = {
+        "pick_count": 10,
+        "small_max": 10,
+        "normal_max": 30,
+        "trend_bias": "neutral",
+        "lattice_enabled": False,
+        "avoid_cold_enabled": False,
+    }
+    history = [10, 2, 33, 12, 41, 5, 26, 9, 44, 3, 18, 27]
+    first = recommend(latest=10, previous=2, history_numbers=history, settings=settings)
+    second = recommend(latest=10, previous=2, history_numbers=history, settings=settings)
+    assert [p["number"] for p in first["picks"]] == [p["number"] for p in second["picks"]]
+    assert [p["amount"] for p in first["picks"]] == [p["amount"] for p in second["picks"]]
+    assert [p["role"] for p in first["picks"]] == [p["role"] for p in second["picks"]]
+
+
+def test_wave_alloc_drain_reproduces_legacy_clump():
+    """旧口径仍可用：drain 会把小波动桶抽干（8/1/1），作为可回退的对照。"""
+    from collections import Counter
+
+    result = recommend(
+        latest=10,
+        previous=2,
+        history_numbers=[10, 2, 33, 12, 41, 5, 26, 9, 44, 3] * 3,
+        settings={
+            "pick_count": 10,
+            "small_max": 10,
+            "normal_max": 30,
+            "trend_bias": "neutral",
+            "lattice_enabled": False,
+            "avoid_cold_enabled": False,
+            "wave_alloc": WAVE_ALLOC_DRAIN,
+        },
+    )
+    counts = Counter(pick["wave_type"] for pick in result["picks"])
+    assert len(result["picks"]) == 10
+    assert counts.get(WAVE_SMALL, 0) == 8
+    assert counts.get(WAVE_NORMAL, 0) == 1
+    assert counts.get(WAVE_BIG, 0) == 1
+
+
+def test_balanced_alloc_keeps_role_quota_amounts():
+    """均衡分散只改号码集合：角色顺位与金额分配口径原样保留。"""
+    settings = {
+        "pick_count": 10,
+        "small_max": 10,
+        "normal_max": 30,
+        "trend_bias": "neutral",
+        "lattice_enabled": False,
+        "avoid_cold_enabled": False,
+        "total_amount": 50,
+        "amount_unit": 5,
+        "mode": "even",
+    }
+    balanced = recommend(
+        latest=10, previous=2, history_numbers=[10, 2, 33, 12, 41, 5, 26, 9, 44, 3],
+        settings={**settings, "wave_alloc": WAVE_ALLOC_BALANCED},
+    )
+    drained = recommend(
+        latest=10, previous=2, history_numbers=[10, 2, 33, 12, 41, 5, 26, 9, 44, 3],
+        settings={**settings, "wave_alloc": WAVE_ALLOC_DRAIN},
+    )
+    assert [p["role"] for p in balanced["picks"]] == [p["role"] for p in drained["picks"]]
+    assert [p["amount"] for p in balanced["picks"]] == [p["amount"] for p in drained["picks"]]
+    assert balanced["role_quota"] == drained["role_quota"]
+    assert balanced["staked_total"] == drained["staked_total"] == 50
 
 
 # --------------------------------------------------------------------------- #
@@ -857,7 +1029,11 @@ def test_recommend_allows_repeat_zodiac_when_disabled():
             pick_count=3,
             trend_bias="neutral",
             # 本用例只校验「避开重肖」开关：关闭避冷与三类软降权，
-            # 否则它们会把同肖号排到后面（另有专门用例覆盖新行为）
+            # 否则它们会把同肖号排到后面（另有专门用例覆盖新行为）。
+            # 同时固定旧口径 wave_alloc="drain"：只有「按遗漏排序逐桶取首」
+            # 才会把同肖冷号（10/34/46）顶进注单；均衡分散口径会按「离已选号最远」
+            # 挑号，与「是否过滤同肖」这一被测属性无关（过滤方向另有断言覆盖）。
+            wave_alloc="drain",
             avoid_cold_enabled=False,
         ),
     )
@@ -1911,13 +2087,19 @@ def _zodiac_picks(history_dates: list[date] | None) -> dict:
     """latest=1 的确定性场景：前十注固定为 2..9 / 12 / 32（含个位与两位号）。
 
     关闭避冷加权只为让金额分配干净，不影响选号顺序（本用例不校验金额）。
+    固定 ``wave_alloc="drain"``：本组用例校验的是**生肖映射**（与选号分配无关），
+    用旧口径保证号码集合稳定，避免分配口径变化时误伤生肖断言。
     """
     return recommend(
         latest=1,
         previous=None,
         history_numbers=[1],
         history_dates=history_dates,
-        settings={"pick_count": 10, "avoid_cold_enabled": False},
+        settings={
+            "pick_count": 10,
+            "avoid_cold_enabled": False,
+            "wave_alloc": "drain",
+        },
     )
 
 

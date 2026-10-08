@@ -28,6 +28,7 @@ from services.lottery import (
     TREND_BIAS_PATTERN,
     TREND_WINDOW_MAX,
     TREND_WINDOW_MIN,
+    WAVE_ALLOC_PATTERN,
 )
 
 
@@ -71,6 +72,8 @@ class SettingsOut(BaseModel):
     avoid_cold_days: int
     # 选号策略：wave_round|score_top
     pick_strategy: str
+    # 波动桶注数分配：balanced=非空桶均分 + 桶内最远点优先（默认）；drain=旧逐桶取满
+    wave_alloc: str
     score_w_focus: float
     score_w_mid: float
     score_w_omit: float
@@ -178,6 +181,14 @@ class SettingsPatch(BaseModel):
         default=None,
         pattern=PICK_STRATEGY_PATTERN,
         description="wave_round=波动轮取；score_top=打分Top-N对照Δ",
+    )
+    wave_alloc: str | None = Field(
+        default=None,
+        pattern=WAVE_ALLOC_PATTERN,
+        description=(
+            "波动桶注数分配：balanced=非空波动桶均分 + 桶内最远点优先（默认）；"
+            "drain=旧行为（按小→常→大逐桶取满，号码会挤在同一连续区段）"
+        ),
     )
     score_w_focus: float | None = Field(default=None, ge=-5, le=5)
     score_w_mid: float | None = Field(default=None, ge=-5, le=5)
