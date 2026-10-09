@@ -12,6 +12,7 @@ import {
   LATTICE_WINDOW_MAX,
   LATTICE_WINDOW_MIN,
   MIN_BET_AMOUNT,
+  PICK_SAMPLING_OPTIONS,
   REPEAT_NUMBER_WEIGHT_DEFAULT,
   REPEAT_ZODIAC_WEIGHT_DEFAULT,
   PICK_ROLE_LABELS,
@@ -37,6 +38,7 @@ import {
   previewEvenAmounts,
   WAVE_ALLOC_OPTIONS,
   type ChipMode,
+  type PickSampling,
   type TrendBias,
   type WaveAlloc,
 } from '~/composables/useApi'
@@ -67,6 +69,8 @@ const trendBiasOptions = TREND_BIAS_OPTIONS
 const trendWindowOptions = TREND_WINDOW_OPTIONS
 /** 波动桶注数分配取值表（== 后端 services/lottery.py 的 WAVE_ALLOCS） */
 const waveAllocOptions = WAVE_ALLOC_OPTIONS
+/** 桶内取号方式取值表（== 后端 services/lottery.py 的 PICK_SAMPLINGS） */
+const pickSamplingOptions = PICK_SAMPLING_OPTIONS
 /** 软降权权重档位（1.0 = 不降权） */
 const softWeightOptions = SOFT_WEIGHT_OPTIONS
 
@@ -80,6 +84,10 @@ function isTrendBias(value: unknown): value is TrendBias {
 
 function isWaveAlloc(value: unknown): value is WaveAlloc {
   return waveAllocOptions.some(option => option.value === value)
+}
+
+function isPickSampling(value: unknown): value is PickSampling {
+  return pickSamplingOptions.some(option => option.value === value)
 }
 
 const form = reactive({
@@ -103,11 +111,13 @@ const form = reactive({
   repeat_zodiac_weight: REPEAT_ZODIAC_WEIGHT_DEFAULT,
   stale_periods: STALE_PERIODS_DEFAULT,
   stale_weight: STALE_WEIGHT_DEFAULT,
-  // 预测波动线 + 号码点阵（参与选号：带内优先）；默认关闭（2026-10-07 用户偏好）
-  lattice_enabled: false,
+  // 预测波动线 + 号码点阵（定义抽样概率分布：带内号码概率更高）；默认开启（2026-10-09）
+  lattice_enabled: true,
   lattice_window: LATTICE_WINDOW_DEFAULT,
-  // 波动桶注数分配：均衡分散（默认）—— 非空桶均分 + 桶内最远点优先，避免「一坨」
+  // 波动桶注数分配：均衡分散（默认）—— 非空桶均分（形状骨架），避免「一坨」
   wave_alloc: 'balanced' as WaveAlloc,
+  // 桶内取号方式：种子随机（默认）—— 期号确定性加权抽样；换期换样本、同期可复现
+  pick_sampling: 'seeded_random' as PickSampling,
   // 角色金额配额（均注模式）：主推 : 次选 : 防守 = 3:2:1（防守最低）
   role_w_primary: ROLE_WEIGHT_PRIMARY_DEFAULT,
   role_w_secondary: ROLE_WEIGHT_SECONDARY_DEFAULT,
@@ -232,6 +242,7 @@ async function load() {
       : LATTICE_WINDOW_DEFAULT
     // 只在后端返回合法枚举时覆盖，避免把状态搞成取值之外的脏值
     if (isWaveAlloc(settings.wave_alloc)) form.wave_alloc = settings.wave_alloc
+    if (isPickSampling(settings.pick_sampling)) form.pick_sampling = settings.pick_sampling
     form.role_w_primary = typeof settings.role_w_primary === 'number'
       ? settings.role_w_primary
       : ROLE_WEIGHT_PRIMARY_DEFAULT
@@ -377,6 +388,7 @@ async function save() {
       lattice_enabled: form.lattice_enabled,
       lattice_window: form.lattice_window,
       wave_alloc: form.wave_alloc,
+      pick_sampling: form.pick_sampling,
       role_w_primary: form.role_w_primary,
       role_w_secondary: form.role_w_secondary,
       role_w_defense: form.role_w_defense,
@@ -411,6 +423,7 @@ async function save() {
       : LATTICE_WINDOW_DEFAULT
     // 只在后端返回合法枚举时覆盖，避免把状态搞成取值之外的脏值
     if (isWaveAlloc(settings.wave_alloc)) form.wave_alloc = settings.wave_alloc
+    if (isPickSampling(settings.pick_sampling)) form.pick_sampling = settings.pick_sampling
     form.role_w_primary = typeof settings.role_w_primary === 'number'
       ? settings.role_w_primary
       : ROLE_WEIGHT_PRIMARY_DEFAULT
@@ -782,16 +795,18 @@ const readonlyInputClass
                 </div>
               </div>
 
-              <!-- 三类软降权：重号 / 同肖 / 冷号（不排除、只降权） -->
+              <!-- 三类软降权：重号 / 同肖 / 冷号（已停用为权重，仅保留信息徽章） -->
               <div class="space-y-4 rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-4">
                 <div class="space-y-1">
                   <p class="text-sm font-medium text-slate-200">
-                    降权（不排除，只排后 + 压金额）
+                    号码标签（不再降权）
                   </p>
                   <p class="text-xs leading-relaxed text-slate-500">
-                    三类号码，<span class="text-slate-300">不会</span>被剔除出候选池，只是排序靠后并按系数打折金额；
-                    若仍被选中，会在推荐卡片上标出对应徽章。省下的金额不补给其它注。
-                    这是本池样本内的偏好，不是概率，也不承诺提高命中率。
+                    三类号码（重号 / 同肖 / 冷号）<span class="text-slate-300">不会</span>被剔除出候选池，
+                    也<span class="text-slate-300">不再</span>影响排序或金额 —— 选号只看点阵概率 + 期号种子随机。
+                    命中时仍会在推荐卡片上标出对应徽章（信息诚实保留）。
+                    下面三项系数与冷号口径仅用于生成徽章，改它们不会再改变推荐号码或金额。
+                    这是本池样本内的标签，不是概率，也不承诺提高命中率。
                   </p>
                 </div>
 
@@ -802,7 +817,7 @@ const readonlyInputClass
                       上期出过的号不避开
                     </p>
                     <p class="text-xs leading-relaxed text-slate-500">
-                      开启（默认）：上期特码本身留在候选池内，按「重号降权系数」排后并打折。
+                      开启（默认）：上期特码本身留在候选池内，命中时标「重号」徽章。
                       关闭 = 旧行为，直接把上期特码本身排除。
                     </p>
                   </div>
@@ -841,8 +856,9 @@ const readonlyInputClass
                     </GlassButton>
                   </div>
                   <p class="text-xs text-slate-500">
-                    当前 <span class="num text-slate-300">{{ form.repeat_number_weight }}</span>；
-                    上期特码本身（差距 0）的排序权重与金额都乘以它（默认 0.5）。
+                    当前 <span class="num text-slate-300">{{ form.repeat_number_weight }}</span>
+                    （默认 0.5）。<span class="text-slate-300">仅生成徽章</span>：
+                    上期特码本身命中时标「重号」，不再影响排序或金额。
                   </p>
                 </div>
 
@@ -869,12 +885,13 @@ const readonlyInputClass
                     </GlassButton>
                   </div>
                   <p class="text-xs text-slate-500">
-                    当前 <span class="num text-slate-300">{{ form.repeat_zodiac_weight }}</span>；
-                    与上期特码同肖、但不等于上期特码的号（默认 0.8）。
+                    当前 <span class="num text-slate-300">{{ form.repeat_zodiac_weight }}</span>
+                    （默认 0.8）。<span class="text-slate-300">仅生成徽章</span>：
+                    与上期特码同肖、但不等于上期特码的号命中时标「同肖」，不再影响排序或金额。
                   </p>
                 </div>
 
-                <!-- 冷号：按期数，一律降权 -->
+                <!-- 冷号：按期数，仅生成徽章 -->
                 <div class="space-y-2">
                   <label for="stale-periods" class="block text-sm font-medium text-slate-200">
                     冷号口径（最近 N 期没出现过）
@@ -891,8 +908,8 @@ const readonlyInputClass
                   <p class="text-xs leading-relaxed text-slate-500">
                     按<span class="text-slate-300">期数</span>（不是自然日）：本池样本内最近
                     <span class="num text-slate-300">{{ form.stale_periods }}</span>
-                    期都没出现过的号一律降权（默认 60 期）。样本不足该期数时无法证明「一直没出现」，
-                    此时不降权，避免把短样本里的号误判成冷号。
+                    期都没出现过的号命中时标「冷号」徽章（默认 60 期），不再影响排序或金额。
+                    样本不足该期数时无法证明「一直没出现」，此时不打冷号标签，避免把短样本里的号误判成冷号。
                   </p>
                 </div>
 
@@ -919,8 +936,8 @@ const readonlyInputClass
                   </div>
                   <p class="text-xs text-slate-500">
                     当前 <span class="num text-slate-300">{{ form.stale_weight }}</span>
-                    （默认 0.3）。金额打折下限为每注
-                    <span class="num text-slate-300">{{ MIN_BET_AMOUNT }}</span> 元，号码仍会列出。
+                    （默认 0.3）。<span class="text-slate-300">仅生成徽章</span>：
+                    冷号命中时标「冷号」，不再影响排序或金额，号码始终会列出。
                   </p>
                 </div>
               </div>
@@ -935,8 +952,8 @@ const readonlyInputClass
                     <p class="text-xs leading-relaxed text-slate-500">
                       用最近若干期相邻差值估一条「预测波动线」（中心 = 中位数、带宽 = P25~P75），
                       把 1~49 号按「与上期特码的差值是否落在这条线上」铺成点阵；
-                      开启时选号先在预测波动桶内取满，出号优先落在带内，不足才向带外扩散。
-                      这是样本内经验分布，不是真实概率。
+                      开启后它定义抽样概率分布：带内号码被抽到的概率更高、带外按距离衰减，
+                      取号形状仍由「波动桶注数分配」决定。这是样本内经验分布，不是真实概率。
                     </p>
                   </div>
                   <GlassButton
@@ -972,7 +989,7 @@ const readonlyInputClass
                 </div>
               </div>
 
-              <!-- 波动桶注数分配（仅点阵关闭时生效） -->
+              <!-- 波动桶注数分配（形状骨架） -->
               <div class="space-y-2">
                 <p id="wave-alloc-label" class="text-sm font-medium text-slate-200">
                   波动桶注数分配
@@ -1000,9 +1017,38 @@ const readonlyInputClass
                   常规 = 差值 ≤
                   <span class="num text-slate-300">{{ form.normal_max }}</span>，
                   大跳 = 更远）。「逐桶取满」会先把小波动桶抽干，10 注里常有 8~9 注挤在同一段；
-                  「均衡分散」按非空桶均分注数（10 注 → 4/3/3）并优先挑离已选号最远的号，
-                  只改下注形状 —— 命中概率与期望值（−2.04 元/注）完全不变，
-                  真正决定盈亏的仍是投注金额。仅当上面的号码点阵关闭时生效。
+                  「均衡分散」按非空桶均分注数（10 注 → 4/3/3），只改下注形状 ——
+                  命中概率与期望值（−2.04 元/注）完全不变，真正决定盈亏的仍是投注金额。
+                </p>
+              </div>
+
+              <!-- 桶内取号方式：种子随机 / 按名次 -->
+              <div class="space-y-2">
+                <p id="pick-sampling-label" class="text-sm font-medium text-slate-200">
+                  桶内取号方式
+                </p>
+                <div
+                  role="radiogroup"
+                  aria-labelledby="pick-sampling-label"
+                  class="flex flex-wrap gap-2"
+                >
+                  <GlassButton
+                    v-for="option in pickSamplingOptions"
+                    :key="option.value"
+                    role="radio"
+                    :aria-checked="form.pick_sampling === option.value"
+                    :variant="form.pick_sampling === option.value ? 'primary' : 'glass'"
+                    class="min-h-[44px] px-4 text-base"
+                    @click="form.pick_sampling = option.value"
+                  >
+                    {{ option.label }}
+                  </GlassButton>
+                </div>
+                <p class="text-xs leading-relaxed text-slate-500">
+                  「种子随机」在每个波动桶内按点阵概率做加权随机抽样：同一期 + 同一组设置
+                  永远抽出同一份号码（可复现），换一期就换一批；号码点阵开启时带内号码被抽到的
+                  概率更高。「按名次」是旧的确定性排序取号，仅供历史结果复现。
+                  两者都不改命中概率（任意 10 个不同号恒为 10/49）与期望值。
                 </p>
               </div>
 

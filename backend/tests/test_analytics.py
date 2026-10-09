@@ -33,12 +33,18 @@ from services.analytics import (
     zodiac_trend_stats,
 )
 import services.analytics as analytics
-from services.lottery import DEFAULT_SETTINGS, recommend
+from services.lottery import (
+    DEFAULT_SETTINGS,
+    PICK_SAMPLING_RANKED,
+    WAVE_ALLOC_DRAIN,
+    recommend,
+)
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 
-# 关闭「本轮新增的三类软降权 + 号码点阵 + 重号保留」，让只校验旧引擎已知答案的
-# 回测用例不被新规则影响（新规则另有专门用例覆盖）。
+# 关闭「本轮新增的三类软降权 + 号码点阵 + 重号保留」，并把取号口径钉回**旧确定性引擎**
+# （`pick_sampling=ranked` + `wave_alloc=drain`），让只校验旧引擎已知答案的回测用例
+# 不被新的「期号种子随机抽样」影响（新口径另有专门用例覆盖）。
 LEGACY_ENGINE_OFF: dict = {
     "avoid_cold_enabled": False,
     "repeat_number_weight": 1.0,
@@ -46,6 +52,8 @@ LEGACY_ENGINE_OFF: dict = {
     "stale_weight": 1.0,
     "lattice_enabled": False,
     "include_repeat_number": False,
+    "wave_alloc": WAVE_ALLOC_DRAIN,
+    "pick_sampling": PICK_SAMPLING_RANKED,
 }
 REAL_DRAWS_FILE = BACKEND_DIR / "data" / "draws_70_269.txt"
 
@@ -434,7 +442,14 @@ def test_backtest_reflects_avoid_cold_setting():
         draws,
         mode="even",
         pick_count=1,
-        base_settings={"avoid_cold_enabled": True, "avoid_cold_days": 60},
+        base_settings={
+            "avoid_cold_enabled": True,
+            "avoid_cold_days": 60,
+            # 本用例断言的是「避冷如何改变确定性排序」→ 钉回旧确定性取号口径，
+            # 并排除最新重号（软降权已去除，diff=0 的重号否则会抢先）
+            "pick_sampling": PICK_SAMPLING_RANKED,
+            "include_repeat_number": False,
+        },
     )
 
     # 关闭：旧引擎「遗漏最久优先」→ 小波动桶里 24…19（差 1）先取
@@ -513,8 +528,13 @@ def test_backtest_picks_match_live_newest_first_history():
     """回测口径必须与线上 `POST /api/recommend` 同源：同一期 / 同一设置 /
     同一「最新在前」历史 → 同一份号码。
 
-    这组参数对顺序高度敏感（大部分期数两种顺序会给出不同号码），
+    这组参数对历史顺序高度敏感（大部分期数两种顺序会给出不同号码），
     因此一旦顺序退回旧的「最旧在前」，本用例会大面积失败。
+
+    顺序敏感度来源：``avoid_cold_days=5``（避冷权重按「距上次出现的自然日 / 期数」，
+    而后者依赖列表里**首次出现**的位置 → 随顺序变化）与 ``lattice_window=3``
+    （预测波动线取序列前 3 个相邻差值）。旧的「按**期数**软降权」已停用为信息标签，
+    因此不再靠它制造顺序敏感度。
     """
     specials = [(((i * 37 + 11) % 49) + 1) for i in range(45)]
     draws = _draws(specials)
@@ -523,8 +543,8 @@ def test_backtest_picks_match_live_newest_first_history():
         "mode": "even",
         "pick_count": 3,
         "lattice_window": 3,
-        "stale_periods": 5,
-        "stale_weight": 0.1,
+        "avoid_cold_enabled": True,
+        "avoid_cold_days": 5,
     }
 
     result = backtest_stats(draws, base_settings=settings)

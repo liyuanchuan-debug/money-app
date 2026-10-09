@@ -68,9 +68,13 @@ from services.lottery import (  # noqa: E402
     MODES,
     NUMBER_MAX,
     NUMBER_MIN,
+    PICK_SAMPLINGS,
+    PICK_SAMPLING_SEEDED_RANDOM,
     PICK_STRATEGIES,
     TREND_BIAS_EXPLICIT_KEY,
     TREND_BIASES,
+    WAVE_ALLOC_BALANCED,
+    WAVE_ALLOCS,
     clamp_settings,
     resolve_trend_bias,
 )
@@ -108,12 +112,15 @@ LIVE_SETTINGS: dict[str, Any] = {
     "odds": 47.0,
     "exclude_repeat_zodiac": True,
     "include_repeat_number": True,
+    # 三项软降权（2026-10-09「降权去除」后**保留键、不再生效**：只留信息标签）
     "repeat_number_weight": 0.5,
     "repeat_zodiac_weight": 0.8,
     "stale_periods": 60,
     "stale_weight": 0.3,
     "lattice_enabled": True,
     "lattice_window": 30,
+    "wave_alloc": WAVE_ALLOC_BALANCED,
+    "pick_sampling": PICK_SAMPLING_SEEDED_RANDOM,
     "role_w_primary": 3.0,
     "role_w_secondary": 2.0,
     "role_w_defense": 1.0,
@@ -143,10 +150,14 @@ def _settings_snapshot() -> dict[str, Any]:
 
 
 def _settings_naked() -> dict[str, Any]:
-    """「裸排序」配置：关点阵 / 关走势加权 / 不排同肖 / 软降权全 1.0。
+    """「裸配置」：关点阵 / 关走势加权 / 不排同肖，用来让候选池开关可见。
 
-    目的是让 ``include_repeat_number``、``repeat_*_weight``、``stale_*``
-    这几项在池内排序里真正可见（现场配置里它们被点阵与重肖排除盖住）。
+    目的是让 ``include_repeat_number`` 在池内真正可见（现场配置里它被
+    「排同肖 + 点阵加权」盖住）。
+
+    注意（2026-10-09「降权去除」后）：三项软降权 ``repeat_number_weight`` /
+    ``repeat_zodiac_weight`` / ``stale_weight`` 已**完全不再参与选号与金额**，
+    因此本配置里把它们设成 1.0 只是历史留痕，不再有任何「解除降权」的作用。
     """
     return {
         **LIVE_SETTINGS,
@@ -224,6 +235,8 @@ SETTING_SWEEPS: dict[str, tuple[Any, ...]] = {
     "avoid_cold_enabled": (True,),
     "avoid_cold_days": (10, 30, 120),
     "pick_strategy": ("score_top",),
+    "wave_alloc": tuple(WAVE_ALLOCS),
+    "pick_sampling": tuple(PICK_SAMPLINGS),
     "score_w_focus": (0.0, 3.0),
     "score_w_mid": (0.0, 4.0),
     "score_w_omit": (-1.0, 1.0),
@@ -247,6 +260,8 @@ BOOL_SETTING_KEYS: frozenset[str] = frozenset(
 ENUM_SETTING_VALUES: dict[str, tuple[Any, ...]] = {
     "mode": tuple(MODES),
     "pick_strategy": tuple(PICK_STRATEGIES),
+    "wave_alloc": tuple(WAVE_ALLOCS),
+    "pick_sampling": tuple(PICK_SAMPLINGS),
     "trend_bias": tuple(TREND_BIASES),
 }
 
@@ -287,11 +302,11 @@ SETTING_GATES: dict[str, str] = {
     "odds": "只进 pnl / 兑付展示；recommend 不读赔率 → 不改变号码与金额",
     "exclude_repeat_zodiac": "候选池整组剔除最新同肖（build_candidate_pools:607）",
     "include_repeat_number": "候选池是否保留上期特码；exclude_repeat_zodiac=True 时该号已被剔除",
-    "repeat_number_weight": "soft_penalty_weight:737 重号软降权；重肖排除时该号不在池内",
-    "repeat_zodiac_weight": "soft_penalty_weight:739 同肖软降权；重肖排除时同肖号不在池内",
-    "stale_periods": "soft_penalty_weight:742 冷号判定样本门槛与阈值",
-    "stale_weight": "soft_penalty_weight:746 冷号软降权",
-    "lattice_enabled": "点阵总开关：predict_wave_band / lattice_primary / lattice_scores（recommend:1970-1993）",
+    "repeat_number_weight": "**已停用（2026-10-09 降权去除）**：值仍被 clamp 接受并回显，但不参与选号 / 金额",
+    "repeat_zodiac_weight": "**已停用（2026-10-09 降权去除）**：同上；同肖仍照常打标签",
+    "stale_periods": "冷号判定阈值：只决定 is_stale 标签与冷号展示，**不再参与任何降权**",
+    "stale_weight": "**已停用（2026-10-09 降权去除）**：同上",
+    "lattice_enabled": "点阵总开关：predict_wave_band → bucket_sampling_weight（**只定义抽样概率分布**，不再是排序键）",
     "lattice_window": "仅在 lattice_enabled=True 时被 predict_wave_band:766 读取",
     "role_w_primary": "只进 allocate_amounts 的角色配额（distribute_units_by_role:1403）；无余量时不生效",
     "role_w_secondary": "只进 allocate_amounts 的角色配额（distribute_units_by_role:1403）；无余量时不生效",
@@ -301,6 +316,8 @@ SETTING_GATES: dict[str, str] = {
     "avoid_cold_enabled": "避冷总开关（order_pool:1154 / take_from_role_band:1208 / 金额封顶:2238）",
     "avoid_cold_days": "仅在 avoid_cold_enabled=True 时读取",
     "pick_strategy": "wave_round / score_top 分支（recommend:2135）",
+    "wave_alloc": "drain / balanced 配额口径（recommend 选号分支）；balanced = 非空桶按最大余数均分",
+    "pick_sampling": "seeded_random / ranked 抽样口径；seeded_random 走 sampling_seed_key:1484 期号种子",
     "score_w_focus": "只在 pick_strategy=score_top 时被 score_candidate:1743 读取",
     "score_w_mid": "只在 pick_strategy=score_top 时被 score_candidate:1743 读取",
     "score_w_omit": "只在 pick_strategy=score_top 时读取；且现场值 0.0 → 该项恒为 0（乘以零）",

@@ -14,7 +14,8 @@ r"""``services.wave_study`` / ``scripts.wave_dedicated`` 的单元与回归测�
 - 对半 / 三分 / 滚动窗稳定性算术可独立重算；符号一致性按定义重算；
 - 功效算术用 ``statistics.NormalDist`` **独立重算**两比例公式（不引用被测实现）；
 - 生产路径（``services/lottery.py`` / ``routers/*`` / ``main.py``）不得引入本模块，
-  且线上 38/208 锚点与点阵消融（38 vs 56）不得漂移；
+  且线上快照回测锚点与点阵开关不可漂移（2026-10-09 起「降权去除 + 点阵分布化」
+  后锚点值随新引擎更新为 49/208；点阵不再是排序键，仅在种子随机口径下改样本）；
 - 判定码 / 变体 id 一律英文枚举，源码 UTF-8 无 BOM、无替换字符。
 
 （口径：所有断言只针对测试内合成的样本或本池已导入的 210 期，不涉及全市场数据。）
@@ -641,15 +642,41 @@ def test_audit_config_matches_the_audit_snapshot() -> None:
 def test_mechanism_note_points_at_the_real_gating_lines() -> None:
     note = WS.mechanism_note()
     assert "lattice_primary" in note
-    assert "2183-2196" in note
     assert "trend_bias" in note
     path = WS.LATTICE_CODE_PATH
-    assert set(path) >= {"band", "primary_wave", "pass_order", "round_robin", "pool"}
+    assert set(path) >= {
+        "band",
+        "primary_wave",
+        "pass_order",
+        "round_robin",
+        "pool",
+        "sampling",
+        "soft_flags",
+    }
     for value in path.values():
         assert value.startswith(("services/lottery.py:", "services/pick_ticket.py:"))
-    src = (BACKEND_ROOT / "services" / "lottery.py").read_text(encoding="utf-8").splitlines()
-    for line in (993, 1166, 2183, 2197):
-        assert src[line - 1].strip(), f"机制说明引用的行号 {line} 落空"
+    # 机制说明引用的每一处代码行都必须真实存在（行号随源码移动，因此这里**动态解析**
+    # 引用值里的区间，而不是钉死常量 —— 钉死会在任何无关重构后假失败）。
+    import re
+    from pathlib import Path
+
+    ranges: list[tuple[str, int, int]] = []
+    for text in list(path.values()) + [note]:
+        for match in re.finditer(r"services/(lottery|pick_ticket)\.py:(\d+)(?:-(\d+))?", text):
+            module, start = match.group(1), int(match.group(2))
+            stop = int(match.group(3)) if match.group(3) else start
+            ranges.append((module, start, stop))
+    assert ranges, "机制说明必须至少引用一处代码行"
+    cache: dict[str, list[str]] = {}
+    for module, start, stop in ranges:
+        if module not in cache:
+            cache[module] = (BACKEND_ROOT / "services" / f"{module}.py").read_text(
+                encoding="utf-8"
+            ).splitlines()
+        src = cache[module]
+        assert 1 <= start <= stop <= len(src), f"{module}.py 引用区间非法：{start}-{stop}"
+        # 锚点 = 引用区间的起点行必须非空（区间内部允许空行）
+        assert src[start - 1].strip(), f"{module}.py 第 {start} 行是空行（引用锚点落空）"
 
 
 # --------------------------------------------------------------------------- #
@@ -728,42 +755,77 @@ def _backtest(draws: list[dict[str, object]], **overrides: object) -> dict:
     )
 
 
-def test_live_snapshot_backtest_anchor_is_still_38_of_208() -> None:
+def test_live_snapshot_backtest_anchor_is_stable() -> None:
+    """线上配置快照的回测锚点（2026-10-09「降权去除」后重算为 49/208）。
+
+    LIVE_SETTINGS 是钉住 ``wave_alloc="drain"`` 的历史线上配置快照，仍是**逐期确定性**
+    的：种子随机只在 balanced 配额内生效，drain 忽略 ``pick_sampling``。因此这里断言
+    的是「同一份快照每次跑出同一组命中」，不是「再也不许变」——引擎口径变更即会改这个数字。
+    """
     draws = _real_draws_for_backtest()
     body = _backtest(draws)
-    assert (body["hits"], body["evaluated"]) == (38, 208)
+    assert (body["hits"], body["evaluated"]) == (49, 208)
     assert body["verdict"]["kind"] == "noise"
-    assert body["hit_rate"] == pytest.approx(0.18269, abs=5e-5)
+    assert body["hit_rate"] == pytest.approx(49 / 208)
+    # 再跑一次必须逐位一致（确定性 → 锚点可复现）
+    assert _backtest(draws)["hits"] == 49
 
 
-def test_lattice_toggle_changes_the_number_in_both_configs() -> None:
-    """点阵是**硬门控**：两种配置下开 / 关都不是同一个号码集合，也都不 inert。"""
+def test_lattice_toggle_is_not_a_sort_key_but_a_sampling_knob() -> None:
+    """点阵已从「硬门控排序键」改为「抽样概率分布」。
+
+    - 确定性名次口径（``pick_sampling="ranked"``）下，开 / 关号码集合**完全相同** →
+      证明它不再决定取号顺序（旧口径下它会把某个波动桶一次性取满）；
+    - 审计快照的 drain 口径同样与开关无关；
+    - 新默认（``seeded_random``）下，点阵作为抽样概率才改变样本（开 ≠ 关）。
+    """
     draws = _real_draws_for_backtest()
-    assert _backtest(draws, lattice_enabled=False)["hits"] == 56  # 线上配置：关掉反而更高
-    # 审计快照原先靠代码默认继承 lattice_enabled=True；默认已改为 False（2026-10-07），
-    # 为保留「ON vs OFF 同配置对照」，这里对 on 显式钉住 True（off 仍显式 False）。
-    on = A.backtest_stats(
+
+    # 1) 旧确定性口径：开 / 关命中数完全一致 → 点阵不再是排序键
+    ranked_on = _backtest(
+        draws, wave_alloc="balanced", lattice_enabled=True, pick_sampling="ranked"
+    )
+    ranked_off = _backtest(
+        draws, wave_alloc="balanced", lattice_enabled=False, pick_sampling="ranked"
+    )
+    assert ranked_on["hits"] == ranked_off["hits"] == 38
+    assert ranked_on["evaluated"] == ranked_off["evaluated"] == 208
+
+    # 2) 审计快照（drain）：同样与开关无关
+    audit_on = A.backtest_stats(
         draws,
         base_settings={**WS.audit_config(), "lattice_enabled": True},
         include_results=False,
         include_wave_breakdown=False,
     )
-    off = A.backtest_stats(
+    audit_off = A.backtest_stats(
         draws,
         base_settings={**WS.audit_config(), "lattice_enabled": False},
         include_results=False,
         include_wave_breakdown=False,
     )
-    assert (on["hits"], off["hits"]) == (46, 48)  # 审计快照：开比关低 2 → 与审计行一致
-    assert on["evaluated"] == off["evaluated"] == 208
+    assert audit_on["hits"] == audit_off["hits"] == 51
     assert WS.audit_config()["pick_count"] == K_DEFAULT
 
+    # 3) 新默认（期号种子随机）：点阵作为抽样概率改变样本
+    seeded_on = _backtest(draws, wave_alloc="balanced", lattice_enabled=True)
+    seeded_off = _backtest(draws, wave_alloc="balanced", lattice_enabled=False)
+    assert (seeded_on["hits"], seeded_off["hits"]) == (52, 44)
 
-def test_repeat_zodiac_toggle_is_hit_count_neutral_under_the_live_snapshot() -> None:
-    """线上配置下避开重肖的净命中变化为 0（但选号集合并不相同，不是结构性无效）。"""
+
+def test_repeat_zodiac_toggle_changes_the_sample_not_the_edge() -> None:
+    """排除重肖是**候选池口径**开关（改池 → 改样本），不是降权。
+
+    2026-10-09「降权去除」后这两条路径都会产出不同的确定性样本；两边的命中数
+    （45 / 49）都落在零边均值 ±2SE（42.45 ± 5.81）内，不构成任何边际优势声明。
+    """
     draws = _real_draws_for_backtest()
-    assert _backtest(draws, exclude_repeat_zodiac=False)["hits"] == 38
-    assert _backtest(draws, exclude_repeat_zodiac=True)["hits"] == 38
+    off = _backtest(draws, exclude_repeat_zodiac=False)
+    on = _backtest(draws, exclude_repeat_zodiac=True)
+    assert off["hits"] == 45
+    assert on["hits"] == 49
+    assert off["verdict"]["kind"] == "noise"
+    assert on["verdict"]["kind"] == "noise"
 
 
 def test_wave_modules_never_leak_into_production_paths() -> None:

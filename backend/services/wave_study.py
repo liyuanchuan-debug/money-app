@@ -171,22 +171,43 @@ VERDICT_LABELS: dict[str, str] = {
     VERDICT_INSUFFICIENT: "数据不足",
 }
 
-# 引擎特征消融与点阵门控的机制说明（代码位置随仓库源码，这里只做引用）
+# 引擎特征消融与点阵角色的机制说明（代码位置随仓库源码，这里只做引用）
+#
+# 2026-10-09 变更（「降权去除 + 点阵分布化 + 期号种子随机」）后，点阵**不再是硬门控**：
+# 它只定义 1..49 上的抽样概率分布；取号形状由 balanced 配额决定，具体号码由期号种子
+# PRNG 抽出。因此下面的引用描述的是**新机制**，旧门控路径（wave_pass_order 以
+# lattice_primary 开头）已从 recommend 中移除。
 LATTICE_CODE_PATH: dict[str, str] = {
-    "band": "services/lottery.py:1970-1992  lattice_enabled → lattice_band → lattice_scores",
-    "primary_wave": "services/lottery.py:1993-2002  lattice_primary = lattice_primary_wave(...)",
-    "pass_order": "services/lottery.py:2183-2196  点阵开启时 wave_pass_order 以 lattice_primary 开头，"
-                  "while 循环把该桶取满后才会向其余桶扩散",
-    "round_robin": "services/lottery.py:2197-2212  点阵关闭 / 无预测时走旧的 WAVE_ORDER 轮取 + 补齐",
-    "neutral_take": "services/lottery.py:2164-2166  neutral 直接取 ordered_pools[wave][0]",
-    "role_take": "services/lottery.py:2167-2178  非 neutral 走 take_from_role_band（同桶内角色带）",
-    "sort_prefix": "services/lottery.py:1166  order_pool 排序键最前置 lattice_prefix（-权重）",
-    "band_rank": "services/lottery.py:993-999  角色带 rank_key 同样以点阵权重为最前置",
-    "pool": "services/lottery.py:586-616  build_candidate_pools 只按重号 / 重肖剔除，"
+    "band": "services/lottery.py:993-1039  predict_wave_band：近窗相邻差值的 P25/P50/P75 → "
+            "预测波动带（样本内经验分布，不是真实概率）",
+    "lattice_weight": "services/lottery.py:1041-1055  lattice_weight：带内 1.0、带外 1/(1+距离/6)"
+                      "（**只当抽样概率**，不再当排序键）",
+    "primary_wave": "services/lottery.py:1057-1079  lattice_primary_wave = 预测带中心所在的波动桶"
+                    "（**仅展示**：前端徽章 / 文案，不参与取号）",
+    "pass_order": "services/lottery.py:2687-2758  取号分派（**旧门控已移除**）：不再有以 lattice_primary "
+                  "开头的 wave_pass_order；balanced 走配额内抽样（2699-2743 期号种子随机 / "
+                  "2740-2758 确定性名次），drain 走旧逐桶取满",
+    "round_robin": "services/lottery.py:2740-2758  ranked 口径：按配额逐桶轮转，桶内取「离已选号码最远」的号",
+    "drain": "services/lottery.py:2759-2772  旧 drain 口径：固定按 WAVE_ORDER 逐桶取满（仅历史审计复现）",
+    "neutral_take": "services/lottery.py:2624-2628  neutral 直接取 ordered_pools[wave][0]",
+    "role_take": "services/lottery.py:2634-2641  非 neutral 走 take_from_role_band（同桶内角色频次带）",
+    "spread_take": "services/lottery.py:2643-2685  _take_spread_one（ranked 专用：取最分散的号）",
+    "sort_prefix": "services/lottery.py:1330-1346   _trend_sort_prefix **已移除** lattice / penalty 前缀"
+                   "（只剩走势偏好）；services/lottery.py:1348-1405 order_pool 排序键 = 避冷 → 走势 → 遗漏 → 回落",
+    "band_rank": "services/lottery.py:1167-1186   _band_rank_prefix **已移除**点阵前缀（只按走势偏好）；"
+                 "services/lottery.py:1188-1282 split_pool_into_role_bands 据此切主推 / 次选 / 防守三段",
+    "sampling": "services/lottery.py:1484-1540  sampling_seed_key：期号 + 结构设置白名单 → SHA-256 种子 →"
+                " random.Random；services/lottery.py:1572-1597 bucket_sampling_weight = 点阵 × 避冷 × 走势；"
+                "services/lottery.py:1599-1636 weighted_sample_distinct（不放回轮盘赌）",
+    "quotas": "services/lottery.py:1451-1482  balanced_wave_quotas 按非空桶均分注数（最大余额法，10 注 → 4/3/3）",
+    "pool": "services/lottery.py:791-820  build_candidate_pools 只按重号 / 重肖剔除，"
             "normal_max 仅决定 classify_wave 的分桶（不缩小并集）",
-    "classify": "services/lottery.py:335-342  classify_wave(diff, small_max, normal_max)",
-    "primary": "services/lottery.py:830-851  lattice_primary_wave 把带内差值按 classify_wave 投票",
-    "ticket_mirror": "services/pick_ticket.py:304-315 / 384-389  出票单镜像同一门控；不在回测路径内",
+    "classify": "services/lottery.py:528-536  classify_wave(diff, small_max, normal_max)",
+    "soft_flags": "services/lottery.py:916-947  soft_flags 只产出信息标签；"
+                  "services/lottery.py:949-977 soft_penalty_weight 恒返回 1.0（权重参数被忽略）；"
+                  "services/lottery.py:1108-1146 apply_soft_weights 保留为纯工具（线上引擎不再调用）",
+    "ticket_mirror": "services/pick_ticket.py:356-390  出票单镜像同一排序口径"
+                     "（点阵不再参与排序；不在回测路径内）",
 }
 
 
@@ -1299,20 +1320,34 @@ def ablation_side_by_side(
 
 
 def mechanism_note() -> str:
-    """机制结论（白话 + 代码位置）：为什么同一个开关在不同配置下幅度不同。"""
+    """机制结论（白话 + 代码位置）：同一个开关在不同配置下幅度为何不同。
+
+    2026-10-09 起点阵**不再是硬门控**：它只定义 1..49 上的抽样概率分布，
+    取号形状由 balanced 配额决定、具体号码由期号种子 PRNG 抽出；旧的
+    「以 ``lattice_primary`` 开头把该桶取满」路径已从 ``recommend`` 移除。
+    """
     return (
-        "点阵不是「只加一列排序分」：它是**硬门控**。开启时 ``lattice_primary`` 决定"
-        "先把哪一个波动桶取满（services/lottery.py:2183-2196 的 while 循环），"
-        "剩下的桶只有在该桶取不到号时才会被访问；关闭时才回到"
-        "「小/常规/大跳各取一个再补齐」的轮取（2197-2212）。"
-        "所以「开 / 关」比较的是两条不同的取号路径，幅度取决于 lattice_primary 落在哪个桶："
-        "审计快照 small_max=10/normal_max=30 时带内差值（P25~P75 均值约 7.4~23.8）大多被判为"
-        "「常规波动」→ 10 注几乎全从常规桶取；线上配置 small_max=15/normal_max=20 时同一批带内差值"
-        "大多被判为「小波动」→ 10 注几乎全从小波动桶取。"
-        "trend_bias **不**给点阵开门（lattice_primary 与偏好无关，1993-2002），它只决定"
-        "「同一个桶里先取谁」：neutral 直接取池首（2164-2166），非 neutral 走角色带（2167-2178）。"
-        "normal_max 也**不**把号码踢出候选池（586-616 只按重号 / 重肖剔除），"
-        "它只改分桶归属（335-342）与 lattice_primary 的投票结果（830-851）。"
+        "点阵已从「硬门控」改为「抽样概率分布」：开启时它只决定带内号码的"
+        "**抽样概率更高**（services/lottery.py:1484-1540 的 sampling_seed_key → "
+        "services/lottery.py:1572-1597 的 bucket_sampling_weight → "
+        "services/lottery.py:1599-1636 的 weighted_sample_distinct），不再决定取号顺序；"
+        "旧口径里以 ``lattice_primary`` 开头把该桶一次性取满的 wave_pass_order 循环"
+        "已从 recommend 移除（services/lottery.py:2687-2758）。因此「开 / 关」比较的是"
+        "同一形状下的两条不同抽样概率：开启时带内号码被抽到的频率更高，关闭时桶内概率均匀。"
+        "取号形状改由 balanced 配额定型（services/lottery.py:1451-1482 最大余额法均分注数，"
+        "10 注 → 4/3/3），ranked 模式下桶内按确定性名次取号"
+        "（services/lottery.py:2740-2758），两种模式都不再让点阵独占某一个波动桶。"
+        "``lattice_primary`` 现在只作**展示**：告诉前端预测带中心落在哪个桶"
+        "（services/lottery.py:1057-1079）。"
+        "``trend_bias`` 仍不与点阵耦合：它只决定「同一个桶里谁更容易被抽到」——"
+        "neutral 取池首（services/lottery.py:2624-2628），非 neutral 走频次带优先"
+        "（services/lottery.py:2634-2641），两者最终都在 bucket_sampling_weight 里按连续"
+        "倍数加权（services/lottery.py:1572-1597）。"
+        "``normal_max`` 也**不**把号码踢出候选池（services/lottery.py:791-820 只按重号 / 重肖剔除），"
+        "它只改分桶归属（services/lottery.py:528-536）与配额分配。"
+        "三类软降权（重号 / 同肖 / 冷号）已**去除权重**，只留信息标签"
+        "（services/lottery.py:916-947 soft_flags；services/lottery.py:949-977 "
+        "soft_penalty_weight 恒返回 1.0）。"
     )
 
 

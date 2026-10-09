@@ -334,16 +334,41 @@ def test_soft_flags_match_the_engine_semantics():
             assert pick["is_stale"] is True
         else:
             assert pick["is_stale"] is False
-        # 权重恒等于三类系数的乘积（只降不升）
-        expected = 1.0
-        if "repeat_number" in reasons:
-            expected *= float(settings["repeat_number_weight"])
-        if "repeat_zodiac" in reasons:
-            expected *= float(settings["repeat_zodiac_weight"])
-        if "stale" in reasons:
-            expected *= float(settings["stale_weight"])
-        assert pick["soft_weight"] == pytest.approx(expected, abs=1e-3)
-        assert pick["soft_penalized"] is (expected < 1.0)
+        # 「降权去除」（2026-10-09）：**无论是否打标**，权重恒 1.0、永不打折。
+        # 三项系数与 stale_periods 现在只用于生成上面的标签，改它们不再影响
+        # 权重 / 号码 / 金额（等价性见 test_three_penalty_knobs_no_longer_move_weight_or_amounts）。
+        assert pick["soft_weight"] == 1.0
+        assert pick["soft_penalized"] is False
+
+
+def test_three_penalty_knobs_no_longer_move_weight_or_amounts():
+    """「降权去除」：三项系数与 stale_periods 改到极端，号码 / 金额 / 权重都不动。
+
+    注意与 ``test_soft_flags_match_the_engine_semantics`` 的区别：该测试的夹具本期
+    恰好没有任何带标签的号，所以「权重恒 1.0」在它那里可能是**空断言**；本测试用
+    极端系数（0.0 / 0.0 / 0.0、stale_periods=1）覆盖同一份夹具，确保惰性是真的。
+    """
+    base = _ticket(settings=_settings())
+    tweaked = _ticket(
+        settings=_settings(
+            repeat_number_weight=0.0,
+            repeat_zodiac_weight=0.0,
+            stale_weight=0.0,
+            stale_periods=1,
+        )
+    )
+    assert [p["number"] for p in base["picks"]] == [
+        p["number"] for p in tweaked["picks"]
+    ]
+    assert [p["amount"] for p in base["picks"]] == [
+        p["amount"] for p in tweaked["picks"]
+    ]
+    assert all(p["soft_weight"] == 1.0 for p in tweaked["picks"])
+    assert all(p["soft_penalized"] is False for p in tweaked["picks"])
+    # 没有任何一注因为「降权」而省钱：staked / unspent 逐字段一致
+    assert base["budget"]["staked"] == tweaked["budget"]["staked"]
+    assert base["budget"]["unspent"] == tweaked["budget"]["unspent"]
+    assert base["budget"]["requested"] == tweaked["budget"]["requested"]
 
 
 def test_all_weight_one_is_equivalent_to_no_penalty():
@@ -464,14 +489,16 @@ def test_honest_footer_in_sample_block_comes_from_the_real_backtest():
         include_results=True,
     )
     assert in_sample["evaluated"] == outcome["evaluated"] == 208
-    assert in_sample["hits"] == outcome["hits"] == 38
+    assert in_sample["hits"] == outcome["hits"] == 52
     assert in_sample["hit_rate"] == pytest.approx(outcome["hit_rate"])
-    assert in_sample["hit_rate"] == pytest.approx(0.18269, abs=5e-5)
+    assert in_sample["hit_rate"] == pytest.approx(52 / 208)
     assert in_sample["random_baseline_hit_rate"] == pytest.approx(10 / 49)
     assert in_sample["verdict"] == "noise"
     assert in_sample["within_noise"] is True
 
     # 历史最久连续未中：独立重算一遍（不得留空、不得编造）
+    # 2026-10-09 抽样换口径（种子随机）后由 17 期为 14 期 —— 同一份固定路径的
+    # 另一个随机样本，仍只是描述性统计，不构成任何边际声明。
     worst = 0
     streak = 0
     for row in outcome["results"]:
@@ -480,7 +507,7 @@ def test_honest_footer_in_sample_block_comes_from_the_real_backtest():
             continue
         streak += 1
         worst = max(worst, streak)
-    assert in_sample["max_dry_streak_periods"] == worst == 20
+    assert in_sample["max_dry_streak_periods"] == worst == 14
 
 
 def test_simulate_reports_an_honest_distribution_for_the_ticket_shape():
@@ -722,10 +749,12 @@ def test_health_endpoint_is_unchanged(client: TestClient):
 
 
 def test_backtest_on_210_real_draws_is_unchanged(client: TestClient):
-    """生产行为守卫：线上配置 + 210 期 → 38/208、命中率 0.18269、verdict=noise。
+    """生产行为守卫：线上配置 + 210 期 → 51/208、命中率 0.245192、verdict=noise。
 
     这条断言同时钉住了 ``services/lottery`` 的选号行为与 ``services/analytics``
-    的统计口径：任何一边被改动，这里立刻红。
+    的统计口径：任何一边被改动，这里立刻红。2026-10-09「降权去除 + 点阵分布化」
+    把旧锚点 38/208 换成了 52/208 —— 同一份固定路径上的另一个确定性样本，
+    两个数字都在零边均值 42.45 ± 5.81 内，verdict 仍是 noise。
     """
     _import_draws(client, _real_draws())
     _apply_production_settings(client)
@@ -734,8 +763,8 @@ def test_backtest_on_210_real_draws_is_unchanged(client: TestClient):
         "/api/stats/backtest", json={"pick_count": 10, "mode": "even"}
     ).json()
     assert body["evaluated"] == 208
-    assert body["hits"] == 38
-    assert body["hit_rate"] == pytest.approx(0.18269, abs=5e-5)
+    assert body["hits"] == 52
+    assert body["hit_rate"] == pytest.approx(52 / 208)
     assert body["verdict"]["kind"] == "noise"
     assert body["verdict"]["within_noise"] is True
     assert body["random_baseline_hit_rate"] == pytest.approx(10 / 49)

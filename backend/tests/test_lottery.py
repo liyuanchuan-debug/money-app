@@ -38,6 +38,10 @@ from services.lottery import (
     MODES,
     PICK_COUNT_MAX,
     PICK_COUNT_MIN,
+    PICK_SAMPLING_RANKED,
+    PICK_SAMPLING_SEEDED_RANDOM,
+    PICK_SAMPLINGS,
+    DEFAULT_PICK_SAMPLING,
     PICK_STRATEGIES,
     PICK_STRATEGY_SCORE_TOP,
     PICK_STRATEGY_WAVE_ROUND,
@@ -73,6 +77,7 @@ from services.lottery import (
     assign_roles,
     avoid_cold_weight,
     balanced_wave_quotas,
+    bucket_sampling_weight,
     distribute_units_by_role,
     pick_most_spread,
     role_amount_weights,
@@ -96,9 +101,12 @@ from services.lottery import (
     random_amounts,
     recommend,
     resolve_zodiac_date,
+    sampling_seed_key,
     select_score_top_candidates,
     soft_penalty_weight,
+    trend_sampling_weight,
     validate_settings,
+    weighted_sample_distinct,
     with_derived_settings,
     zodiac_numbers,
 )
@@ -112,6 +120,8 @@ PICK_COUNTS = [1, 2, 3, 5, 10]
 
 # 关闭「本轮新增的三类软降权 + 号码点阵」，让只校验旧口径（避冷 / 分配 / 角色带）
 # 的用例不被新规则叠加影响；新规则另有专门用例覆盖。
+# 同时把桶内取号钉回**旧确定性名次口径**（`pick_sampling=ranked`）：这些用例断言的是
+# 「排序 / 避冷 / 角色带」的确定性结果，随机抽样口径由新用例专门覆盖。
 LEGACY_PENALTY_OFF: dict = {
     "repeat_number_weight": 1.0,
     "repeat_zodiac_weight": 1.0,
@@ -119,6 +129,7 @@ LEGACY_PENALTY_OFF: dict = {
     "lattice_enabled": False,
     # 旧口径：候选池排除上期特码本身（重号）
     "include_repeat_number": False,
+    "pick_sampling": PICK_SAMPLING_RANKED,
 }
 
 
@@ -1865,7 +1876,12 @@ def test_avoid_cold_all_cold_bucket_still_fills_picks():
         previous=None,
         history_numbers=history,
         history_dates=dates,
-        settings={"pick_count": 5, "avoid_cold_enabled": True},
+        settings={
+            "pick_count": 5,
+            "avoid_cold_enabled": True,
+            # 排除最新的重号，让本用例聚焦「整桶冷号」而不是重号处理
+            "include_repeat_number": False,
+        },
     )
     picks = result["picks"]
 
@@ -1946,7 +1962,15 @@ def test_avoid_cold_applies_in_weighted_path_for_every_bias(bias: str):
         "history_dates": dates,
         "mode": MODE_SINGLE,
     }
-    common = {"pick_count": 1, "trend_bias": bias, "trend_window": 0}
+    common = {
+        "pick_count": 1,
+        "trend_bias": bias,
+        "trend_window": 0,
+        # 本用例断言的是避冷对**确定性排序**的影响 → 钉回旧名次口径
+        "pick_sampling": PICK_SAMPLING_RANKED,
+        # 排除最新重号：本用例聚焦避冷对 24 的排后效果，不让 diff=0 的重号抢先
+        "include_repeat_number": False,
+    }
 
     off = recommend(**base, settings={**common, "avoid_cold_enabled": False})
     on = recommend(**base, settings={**common, "avoid_cold_enabled": True})
@@ -2015,6 +2039,9 @@ def test_trend_window_ignored_for_selection_when_neutral():
     回归：用户反馈「窗口从 60 改到 100，号码没变化」。neutral 走 ``ordered_pools``，
     排序键是**全历史**遗漏计数，``_trend_sort_prefix`` 返回空元组 ——
     近窗统计（``trend_counts``）根本没有进入选号排序键，窗口只在展示里出现。
+
+    本用例断言的是**旧确定性名次口径**（`pick_sampling=ranked`）下的排序结果；
+    新的期号种子随机口径下「窗口是否换样本」由 ``sampling_seed_key`` 决定，另有专门用例覆盖。
     """
     latest, previous = 25, 10
     # 近 3 期最热是 26；全样本最热是 24 —— 让「窗口不同 → 频次不同 → 角色带不同」
@@ -2032,6 +2059,7 @@ def test_trend_window_ignored_for_selection_when_neutral():
                 "avoid_cold_enabled": False,
                 "small_max": 10,
                 "normal_max": 30,
+                "pick_sampling": PICK_SAMPLING_RANKED,
             },
         )
 
@@ -2087,8 +2115,8 @@ def _zodiac_picks(history_dates: list[date] | None) -> dict:
     """latest=1 的确定性场景：前十注固定为 2..9 / 12 / 32（含个位与两位号）。
 
     关闭避冷加权只为让金额分配干净，不影响选号顺序（本用例不校验金额）。
-    固定 ``wave_alloc="drain"``：本组用例校验的是**生肖映射**（与选号分配无关），
-    用旧口径保证号码集合稳定，避免分配口径变化时误伤生肖断言。
+    固定 ``wave_alloc="drain"`` + ``pick_sampling="ranked"``：本组用例校验的是**生肖映射**
+    （与选号分配无关），用旧确定性口径保证号码集合稳定，避免抽样口径变化时误伤生肖断言。
     """
     return recommend(
         latest=1,
@@ -2099,6 +2127,10 @@ def _zodiac_picks(history_dates: list[date] | None) -> dict:
             "pick_count": 10,
             "avoid_cold_enabled": False,
             "wave_alloc": "drain",
+            "pick_sampling": PICK_SAMPLING_RANKED,
+            # 排除最新重号：否则 diff=0 的 01 会占掉一个小波动名额（软降权已去除，
+            # 不再把重号排到队尾），固定集合会退化成 1..8 / 12 / 32
+            "include_repeat_number": False,
         },
     )
 
@@ -2256,8 +2288,13 @@ def test_compute_periods_since_last_counts_draws_not_days():
     assert set(result) == set(range(1, 50))
 
 
-def test_soft_penalty_weight_covers_three_kinds():
-    # 重号：与上期特码相同 → repeat_number_weight，且与「同肖」互斥
+def test_soft_penalty_weight_is_inert_but_keeps_flags():
+    """「降权去除」：``soft_penalty_weight`` 恒返回 1.0，但**信息标签依旧诚实**。
+
+    这是「不能只把 DB 值改成 1.0」的落地点：四个权重参数被显式忽略，
+    因此写任何设置值都无法恢复降权行为；返回的原因码照旧供前端徽章使用。
+    """
+    # 重号：与上期特码相同 → 权重恒 1.0（忽略 repeat_number_weight），标签仍在
     weight, reasons = soft_penalty_weight(
         24,
         latest=24,
@@ -2268,10 +2305,10 @@ def test_soft_penalty_weight_covers_three_kinds():
         stale_periods=60,
         stale_weight=0.3,
     )
-    assert weight == pytest.approx(0.5)
+    assert weight == 1.0
     assert reasons == ["repeat_number"]
 
-    # 同肖（不含重号本身）→ repeat_zodiac_weight
+    # 同肖（不含重号本身）→ 权重恒 1.0，标签 repeat_zodiac
     weight, reasons = soft_penalty_weight(
         12,  # 与 24 同肖（(24-1)%12 == (12-1)%12 == 11）
         latest=24,
@@ -2282,10 +2319,10 @@ def test_soft_penalty_weight_covers_three_kinds():
         stale_periods=60,
         stale_weight=0.3,
     )
-    assert weight == pytest.approx(0.8)
+    assert weight == 1.0
     assert reasons == ["repeat_zodiac"]
 
-    # 冷号：样本 ≥ 60 期且最近 60 期未出现 → stale_weight
+    # 冷号：样本 ≥ 60 期且最近 60 期未出现 → 权重恒 1.0，标签 stale
     weight, reasons = soft_penalty_weight(
         5,
         latest=24,
@@ -2296,10 +2333,24 @@ def test_soft_penalty_weight_covers_three_kinds():
         stale_periods=60,
         stale_weight=0.3,
     )
-    assert weight == pytest.approx(0.3)
+    assert weight == 1.0
     assert reasons == ["stale"]
 
-    # 样本不足 60 期时无法证明「60 期未出现」→ 一律不降权
+    # 极端权重（0.0）也不产生任何折扣：结构上无法恢复降权
+    for key in ("repeat_number_weight", "repeat_zodiac_weight", "stale_weight"):
+        kwargs = {
+            "repeat_number_weight": 0.5,
+            "repeat_zodiac_weight": 0.8,
+            "stale_periods": 60,
+            "stale_weight": 0.3,
+        }
+        kwargs[key] = 0.0
+        weight, _reasons = soft_penalty_weight(
+            24, latest=24, periods_since_last=0, sample_size=80, **kwargs
+        )
+        assert weight == 1.0
+
+    # 样本不足 60 期时无法证明「60 期未出现」→ 不打冷号标签（与降权无关）
     weight, reasons = soft_penalty_weight(
         5,
         latest=24,
@@ -2310,19 +2361,6 @@ def test_soft_penalty_weight_covers_three_kinds():
     )
     assert weight == 1.0
     assert reasons == []
-
-    # 三类可叠加（重号 + 冷号在不同维度上，实际重号必然近 60 期出现过，这里只验相乘）
-    weight, _reasons = soft_penalty_weight(
-        5,
-        latest=24,
-        periods_since_last=60,
-        sample_size=80,
-        repeat_number_weight=1.0,
-        repeat_zodiac_weight=1.0,
-        stale_periods=60,
-        stale_weight=0.3,
-    )
-    assert weight == pytest.approx(0.3)  # 正好 60 期 → 算冷号
 
 
 def test_apply_soft_weights_discounts_but_keeps_min_bet():
@@ -2364,12 +2402,13 @@ def test_soft_weight_settings_are_clamped():
     assert DEFAULT_SETTINGS["repeat_zodiac_weight"] == DEFAULT_REPEAT_ZODIAC_WEIGHT
     assert DEFAULT_SETTINGS["stale_periods"] == DEFAULT_STALE_PERIODS
     assert DEFAULT_SETTINGS["stale_weight"] == DEFAULT_STALE_WEIGHT
-    # 点阵默认关闭（2026-10-07 用户偏好：点阵把 10 注押进单一波动桶 → 双峰下注，
-    # 约 51.4% 的期数被结构性判负；EV 与开关无关，只改下注形状）。
-    assert DEFAULT_SETTINGS["lattice_enabled"] is False
+    # 点阵默认**开启**（2026-10-09：点阵从「硬门控排序键」改为「抽样概率分布」，
+    # 形状由 balanced 配额定型 → 不再有「10 注全挤进一个桶」的双峰问题；
+    # EV 与开关无关，只改「偏向哪些号」）。
+    assert DEFAULT_SETTINGS["lattice_enabled"] is True
     assert DEFAULT_SETTINGS["lattice_window"] == DEFAULT_LATTICE_WINDOW
 
-    # 权重钳到 0..1
+    # 权重钳到 0..1（键保留：存量配置 / 审计快照仍可读，但已不再影响选号）
     assert clamp_settings({"repeat_number_weight": -1})["repeat_number_weight"] == (
         SOFT_WEIGHT_MIN
     )
@@ -2384,8 +2423,8 @@ def test_soft_weight_settings_are_clamped():
     assert clamp_settings({"include_repeat_number": "false"})[
         "include_repeat_number"
     ] is False
-    # None 回退到代码默认；默认已改为关闭（2026-10-07 用户偏好）
-    assert clamp_settings({"lattice_enabled": None})["lattice_enabled"] is False
+    # None 回退到代码默认；默认已改为开启（2026-10-09）
+    assert clamp_settings({"lattice_enabled": None})["lattice_enabled"] is True
     assert clamp_settings({"lattice_window": -3})["lattice_window"] == 0
 
 
@@ -2457,11 +2496,11 @@ def _long_history() -> list[int]:
     return series
 
 
-def test_recommend_keeps_repeat_number_but_discounts_it():
-    """重号只降权、不排除：仍在候选池里，金额 ×0.5 并带 is_repeat_number 标记。
+def test_recommend_keeps_repeat_number_but_does_not_discount_it():
+    """重号只保留信息标签、**不再降权**：仍在候选池里，金额不打折。
 
     为了让「重号确实留在池里」可确定性验证，把波动阈值收窄到 ``small_max=0``：
-    此时小波动桶只剩重号本身（diff=0），选号必然取到它；
+    此时小波动桶只剩重号本身（diff=0），选号必然取到它（单元素桶与采样模式无关）；
     同一阈值下关闭 ``include_repeat_number`` 该桶就会空 → 反证它没有被排除。
     """
     history = [24] + [n for n in range(1, 50) if n != 24]
@@ -2472,7 +2511,7 @@ def test_recommend_keeps_repeat_number_but_discounts_it():
         small_max=0,
         include_repeat_number=True,
         repeat_number_weight=0.5,
-        # 只打开重号降权，避免同肖/冷号干扰
+        # 只打开重号标记，避免同肖/冷号干扰
         repeat_zodiac_weight=1.0,
         stale_weight=1.0,
         avoid_cold_enabled=False,
@@ -2488,17 +2527,18 @@ def test_recommend_keeps_repeat_number_but_discounts_it():
     assert pick["number"] == 24
     assert pick["is_repeat_number"] is True
     assert pick["is_repeat_zodiac"] is False  # 重号不计入同肖标记
-    assert pick["soft_weight"] == pytest.approx(0.5)
     assert pick["soft_reasons"] == ["repeat_number"]
-    assert pick["soft_penalized"] is True
-    assert pick["amount_reduced"] is True
-    # 20 × 0.5 = 10 → 向下取整到 5 的倍数 = 10（≥ 每注最低 5 元）；省下的不补给别注
-    assert pick["amount"] == 10
-    assert result["staked_total"] == 10
+    # 「降权去除」：权重恒 1.0、金额不被软降权压低（单挑 = 整份预算 20 元）
+    assert pick["soft_weight"] == 1.0
+    assert pick["soft_penalized"] is False
+    assert pick["amount"] == 20
+    assert result["staked_total"] == 20
+    # 信息标签仍然逐注如实回报（前端徽章依据）
     assert result["soft_weights"]["repeat_number_picks"] == [24]
+    assert result["soft_weights"]["penalized_picks"] == 0
     assert any("重号" in note for note in result["notes"])
 
-    # 反证：候选池口径由 include_repeat_number 控制（重号只降权、不是被排除）
+    # 反证：候选池口径由 include_repeat_number 控制（重号只保留标签、不是被排除）
     kept = build_candidate_pools(
         24, 0, 30, include_repeat_number=True
     )[WAVE_SMALL]
@@ -2508,34 +2548,48 @@ def test_recommend_keeps_repeat_number_but_discounts_it():
     assert [row["number"] for row in kept] == [24]
     assert dropped == []
 
+    # 改「重号降权系数」不再改变选号与金额（同一个号、同一份金额）
+    for weight in (0.0, 0.3, 1.0):
+        again = recommend(
+            latest=24,
+            previous=None,
+            history_numbers=history,
+            settings={**settings, "repeat_number_weight": weight},
+            mode=MODE_SINGLE,
+        )
+        again_pick = again["picks"][0]
+        assert again_pick["number"] == pick["number"]
+        assert again_pick["amount"] == pick["amount"]
+        assert again_pick["soft_weight"] == 1.0
 
-def test_recommend_discounts_repeat_zodiac_but_marks_it():
-    """同肖不被排除，金额按 0.8 打折，并带 is_repeat_zodiac 标记。
 
-    确定性构造：把波动阈值收到 ``small_max=12``，让 12 / 36（都与上期 24 同肖）
-    落在小波动桶里；近 5 期只出现过这两个同肖号，桶内其余号码全部触发冷号降权（×0.3），
-    于是同肖号以 0.8 胜出；同权重再按 (差值, 号码) 取最小 → 12。
-    （选号固定按 小 → 常 → 大 逐桶取一个，与侧重顺序解耦，所以必须让目标落在小波动桶。）
+def test_recommend_marks_repeat_zodiac_but_does_not_discount_it():
+    """同肖不被排除、命中时带 ``is_repeat_zodiac`` 标记，但**不再按系数打折金额**。
+
+    确定性构造：把波动阈值放宽到 ``small_max=48``（全部号码落进小波动桶），
+    历史里除同肖组（12/36/48）外每个号都出现过 → 旧确定性排序按
+    ``(出现次数, 差值, 号码)`` 优先取「最少见 + 差值最小 + 号码最小」的 12。
     """
-    # 近 5 期只出现过 12 / 36（同肖），填充号都放在小波动桶之外
-    history = [24, 12, 36, 2, 3, 4, 5, 6, 7]
+    # latest=24 的同肖组（(n-1)%12 == (24-1)%12）：{12, 24, 36, 48}
+    history = [24] + [n for n in range(1, 50) if n not in (12, 24, 36, 48)]
+    settings = legacy_settings(
+        pick_count=1,
+        total_amount=20,
+        amount_unit=5,
+        small_max=48,
+        include_repeat_number=False,
+        repeat_number_weight=0.5,
+        repeat_zodiac_weight=0.8,
+        stale_periods=60,
+        stale_weight=0.3,
+        lattice_enabled=False,
+        avoid_cold_enabled=False,
+    )
     result = recommend(
         latest=24,
         previous=None,
         history_numbers=history,
-        settings=legacy_settings(
-            pick_count=1,
-            total_amount=20,
-            amount_unit=5,
-            small_max=12,
-            include_repeat_number=False,
-            repeat_number_weight=0.5,
-            repeat_zodiac_weight=0.8,
-            stale_periods=5,
-            stale_weight=0.3,
-            lattice_enabled=False,
-            avoid_cold_enabled=False,
-        ),
+        settings=settings,
         mode=MODE_SINGLE,
     )
     pick = result["picks"][0]
@@ -2543,15 +2597,31 @@ def test_recommend_discounts_repeat_zodiac_but_marks_it():
     assert pick["is_repeat_zodiac"] is True
     assert pick["is_repeat_number"] is False
     assert pick["is_stale"] is False
-    assert pick["soft_weight"] == pytest.approx(0.8)
     assert pick["soft_reasons"] == ["repeat_zodiac"]
-    # 20 × 0.8 = 16 → 向下取整到 5 的倍数 = 15
-    assert pick["amount"] == 15
+    # 「降权去除」：同肖只标记、不打折（20 元整份预算原样下注）
+    assert pick["soft_weight"] == 1.0
+    assert pick["soft_penalized"] is False
+    assert pick["amount"] == 20
     assert result["soft_weights"]["repeat_zodiac_picks"] == [12]
+    assert result["soft_weights"]["penalized_picks"] == 0
+
+    # 改「同肖降权系数」不再改变选号与金额
+    for weight in (0.0, 0.3, 0.8, 1.0):
+        again = recommend(
+            latest=24,
+            previous=None,
+            history_numbers=history,
+            settings={**settings, "repeat_zodiac_weight": weight},
+            mode=MODE_SINGLE,
+        )
+        again_pick = again["picks"][0]
+        assert again_pick["number"] == pick["number"]
+        assert again_pick["amount"] == pick["amount"]
+        assert again_pick["soft_weight"] == 1.0
 
 
-def test_recommend_stale_numbers_are_discounted_not_excluded():
-    """60 期未出现 → 降权到 0.3（仍会出号），并带 is_stale 标记。"""
+def test_recommend_stale_numbers_are_flagged_not_discounted():
+    """60 期未出现 → 仍会出号并带 ``is_stale`` 标记，但**不再降权 / 打折**。"""
     history = _long_history()
     result = recommend(
         latest=37,
@@ -2565,50 +2635,111 @@ def test_recommend_stale_numbers_are_discounted_not_excluded():
             repeat_zodiac_weight=1.0,
             stale_periods=60,
             stale_weight=0.3,
+            avoid_cold_enabled=False,
             lattice_enabled=False,
         ),
     )
     stale = [pick for pick in result["picks"] if pick["is_stale"]]
     assert stale, "80 期样本里应当存在最近 60 期未出现的号码"
     for pick in stale:
-        assert pick["soft_weight"] == pytest.approx(0.3)
+        # 标签诚实：命中的冷号原因码是 stale，权重恒 1.0、不带惩罚标记
+        assert pick["soft_weight"] == 1.0
+        assert pick["soft_penalized"] is False
         assert "stale" in pick["soft_reasons"]
-        # 只降权、不归零：金额仍 ≥ 每注最低金额
+        # 号码始终会列出，金额不再被软降权压低
         assert pick["amount"] >= MIN_BET_AMOUNT
+        assert pick["amount_reduced"] is False
     assert result["soft_weights"]["stale_picks"] == [p["number"] for p in stale]
+    assert result["soft_weights"]["penalized_picks"] == 0
     assert result["staked_total"] <= result["total_amount"]
 
+    # 改「冷号降权系数」不再改变选号与金额
+    baseline = {p["number"]: p["amount"] for p in result["picks"]}
+    for weight in (0.0, 0.3, 1.0):
+        again = recommend(
+            latest=37,
+            previous=44,
+            history_numbers=history,
+            settings={
+                **legacy_settings(
+                    pick_count=10,
+                    total_amount=100,
+                    amount_unit=5,
+                    include_repeat_number=False,
+                    repeat_zodiac_weight=1.0,
+                    stale_periods=60,
+                    avoid_cold_enabled=False,
+                    lattice_enabled=False,
+                ),
+                "stale_weight": weight,
+            },
+        )
+        assert {p["number"]: p["amount"] for p in again["picks"]} == baseline
 
-def test_recommend_lattice_puts_picks_inside_predicted_band():
-    """点阵开启时，出号优先落在预测波动带内（带内号足够时全部带内）。"""
+
+def test_recommend_lattice_defines_probability_not_a_sort_key():
+    """点阵已从「硬门控 / 排序键」改为「抽样概率分布」：开关**不再**决定取号顺序。
+
+    证明方式：钉住旧确定性名次口径（``legacy_settings`` → ``pick_sampling=ranked``），
+    点阵开 / 关两次号码集合必须**逐元素一致**（若它还当排序键，就会改变取号顺序）；
+    同时带内号码的抽样权重严格高于带外，说明它只改「谁更容易被抽到」。
+    """
     history = [18, 7, 33, 12, 41, 5, 26, 9, 44, 3, 17, 38, 11, 22, 6, 31, 15, 47]
-    result = recommend(
+    common = legacy_settings(
+        pick_count=10,
+        total_amount=100,
+        amount_unit=5,
+        lattice_window=30,
+    )
+    on = recommend(
         latest=18,
         previous=7,
         history_numbers=history,
-        settings=legacy_settings(
-            pick_count=10,
-            total_amount=100,
-            amount_unit=5,
-            lattice_enabled=True,
-            lattice_window=30,
-        ),
+        settings={**common, "lattice_enabled": True},
     )
-    lattice = result["lattice"]
+    off = recommend(
+        latest=18,
+        previous=7,
+        history_numbers=history,
+        settings={**common, "lattice_enabled": False},
+    )
+
+    lattice = on["lattice"]
     band = lattice["band"]
     assert band is not None
-    # 带宽 16~29 → 常规波动桶
+    # 带宽 16~29 → 常规波动桶（仅展示用）
     assert lattice["primary_wave"] == WAVE_NORMAL
     assert lattice["primary_wave_label"] == "常规波动"
-    picks = result["picks"]
-    assert len(picks) == 10
-    # 带内号码有 15 个（≥ 10 注）→ 全部落在带内
-    assert all(pick["in_lattice_band"] for pick in picks)
-    assert all(pick["lattice_weight"] == 1.0 for pick in picks)
-    assert all(
-        band["low"] <= pick["diff"] <= band["high"] for pick in picks
+
+    picks_on = [pick["number"] for pick in on["picks"]]
+    picks_off = [pick["number"] for pick in off["picks"]]
+    assert len(picks_on) == 10
+    assert len(set(picks_on)) == 10
+    # 关键：ranked 口径下点阵不再是排序键 → 开 / 关号码集合完全相同
+    assert picks_on == picks_off
+
+    # 每注的 in_lattice_band / lattice_weight 与带定义严格一致（诚实标记）
+    for pick in on["picks"]:
+        in_band = band["low"] <= pick["diff"] <= band["high"]
+        assert pick["in_lattice_band"] is in_band
+        assert pick["lattice_weight"] == (1.0 if in_band else pick["lattice_weight"])
+        assert 0.0 < pick["lattice_weight"] <= 1.0
+
+    # 概率语义（抽样权重）：同因子下带内权重 > 带外权重
+    in_band_num = next(
+        row["number"]
+        for row in lattice["numbers"]
+        if band["low"] <= row["diff"] <= band["high"]
     )
-    assert any("预测波动线已开启" in note for note in result["notes"])
+    out_band_num = next(
+        row["number"]
+        for row in lattice["numbers"]
+        if not (band["low"] <= row["diff"] <= band["high"])
+    )
+    scores = {row["number"]: row["lattice_weight"] for row in lattice["numbers"]}
+    assert bucket_sampling_weight(in_band_num, lattice_scores=scores) == pytest.approx(1.0)
+    assert bucket_sampling_weight(out_band_num, lattice_scores=scores) < 1.0
+    assert any("预测波动线已开启" in note for note in on["notes"])
 
 
 def test_recommend_lattice_disabled_matches_legacy_wave_round():

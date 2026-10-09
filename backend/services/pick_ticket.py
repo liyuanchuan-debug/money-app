@@ -263,6 +263,7 @@ def _engine_context(
     periods_since_last = compute_periods_since_last(history)
 
     latest_zodiac = zodiac_group(latest)
+    # 三类软降权：**已停用为权重**，只保留信息标签（soft_weights 恒 1.0）
     soft_weights: dict[int, float] = {}
     soft_reasons: dict[int, list[str]] = {}
     # 与 recommend() 同口径：sample_size 用完整 history 长度
@@ -357,7 +358,12 @@ def _engine_ranking(
     latest: int,
     ctx: dict[str, Any],
 ) -> list[int]:
-    """引擎候选排序展平为 1..49 的号码序列（点阵优先取号顺序在前）。"""
+    """引擎候选排序展平为 1..49 的号码序列（与 ``recommend()`` 同口径）。
+
+    **变更（点阵分布化）**：点阵不再决定取号顺序，因此展平顺序退回固定的
+    ``WAVE_ORDER``（小→常→大）。这里只是「1..49 的展示/候选名次」，
+    不代表线上选号顺序（线上是配额 + 期号种子随机）。
+    """
     pools = build_candidate_pools(
         latest,
         cfg["small_max"],
@@ -376,18 +382,10 @@ def _engine_ranking(
             avoid_cold_enabled=cold_enabled,
             avoid_cold_days=int(cfg["avoid_cold_days"]),
             days_since_last=ctx["days_since_last"],
-            lattice_scores=ctx["lattice_scores"],
-            penalties=ctx["soft_weights"],
         )
         for wave in WAVE_ORDER
     }
-    primary = ctx["lattice_primary"]
-    pass_order = (
-        [primary] + [wave for wave in WAVE_ORDER if wave != primary]
-        if primary
-        else list(WAVE_ORDER)
-    )
-    return [int(row["number"]) for wave in pass_order for row in ordered[wave]]
+    return [int(row["number"]) for wave in WAVE_ORDER for row in ordered[wave]]
 
 
 # --------------------------------------------------------------------------- #
@@ -421,7 +419,8 @@ def _row_from_number(
     """按引擎口径给一个号补全行字段（仅用于 ranking 路径）。"""
     diff = abs(int(number) - int(latest))
     wave_type = classify_wave(diff, cfg["small_max"], cfg["normal_max"])
-    soft = float(ctx["soft_weights"].get(number, 1.0))
+    # 「降权去除」：权重恒 1.0（命中标签只进 soft_reasons）
+    soft = 1.0
     zodiac_date = ctx["zodiac_date"]
     code = zodiac_of(int(number), zodiac_date) if zodiac_date is not None else None
     cold_enabled = bool(cfg["avoid_cold_enabled"])
@@ -519,10 +518,8 @@ def _allocate_ranking_rows(
     if cold_enabled:
         amounts, _ = apply_avoid_cold_amounts(amounts, cold_weights, amount_unit=unit)
     before_soft = list(amounts)
-    soft = [float(ctx["soft_weights"].get(row["number"], 1.0)) for row in rows]
-    amounts, _ = apply_soft_weights(
-        amounts, soft, amount_unit=unit, min_bet_amount=MIN_BET_AMOUNT
-    )
+    # 「降权去除」：不再对金额做软降权打折（apply_soft_weights 已从本路径移除）；
+    # amount_reduced 今天只可能来自避冷封顶。
     out: list[dict[str, Any]] = []
     for index, row in enumerate(rows):
         amount = int(amounts[index]) if index < len(amounts) else 0
@@ -965,7 +962,8 @@ def build_ticket(
         "within_budget": staked_total <= requested_budget,
         "note": (
             "每注金额均为注码粒度（amount_unit）的正整数倍；数额合计等于 staked。"
-            "被软降权/避冷加权省下的金额如实计入 unspent，绝不静默改配到其它注。"
+            "被避冷加权省下的金额如实计入 unspent，绝不静默改配到其它注。"
+            "（软降权已停用：重号 / 同肖 / 冷号只打标签，不再压低金额。）"
         ),
     }
 

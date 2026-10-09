@@ -16,6 +16,7 @@ from services.lottery import (
     ODDS_MIN,
     PICK_COUNT_MAX,
     PICK_COUNT_MIN,
+    PICK_SAMPLING_PATTERN,
     PICK_STRATEGY_PATTERN,
     ROLE_WEIGHT_MAX,
     ROLE_WEIGHT_MIN,
@@ -72,8 +73,10 @@ class SettingsOut(BaseModel):
     avoid_cold_days: int
     # 选号策略：wave_round|score_top
     pick_strategy: str
-    # 波动桶注数分配：balanced=非空桶均分 + 桶内最远点优先（默认）；drain=旧逐桶取满
+    # 波动桶注数分配：balanced=非空桶均分（默认）；drain=旧逐桶取满
     wave_alloc: str
+    # 桶内取号方式：seeded_random=期号种子随机加权抽样（默认）；ranked=旧确定性按名次
+    pick_sampling: str
     score_w_focus: float
     score_w_mid: float
     score_w_omit: float
@@ -186,8 +189,16 @@ class SettingsPatch(BaseModel):
         default=None,
         pattern=WAVE_ALLOC_PATTERN,
         description=(
-            "波动桶注数分配：balanced=非空波动桶均分 + 桶内最远点优先（默认）；"
+            "波动桶注数分配：balanced=非空波动桶均分（默认，防「一坨」）；"
             "drain=旧行为（按小→常→大逐桶取满，号码会挤在同一连续区段）"
+        ),
+    )
+    pick_sampling: str | None = Field(
+        default=None,
+        pattern=PICK_SAMPLING_PATTERN,
+        description=(
+            "桶内取号方式：seeded_random=期号种子随机加权抽样（默认，同期可复现）；"
+            "ranked=旧行为（按池内确定性名次取号）"
         ),
     )
     score_w_focus: float | None = Field(default=None, ge=-5, le=5)

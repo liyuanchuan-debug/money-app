@@ -65,6 +65,13 @@ export interface LotterySettings {
    * 只改下注形状，不改命中概率 / 期望值。
    */
   wave_alloc?: 'balanced' | 'drain'
+  /**
+   * 桶内取号方式（英文枚举）：
+   * seeded_random=期号种子随机加权抽样（默认，同一期可复现）；
+   * ranked=旧口径（按池内确定性名次取号）。
+   * 只改「抽哪些号」，不改命中概率 / 期望值（任意 10 个不同号命中率恒为 10/49）。
+   */
+  pick_sampling?: 'seeded_random' | 'ranked'
   score_w_focus?: number
   score_w_mid?: number
   score_w_omit?: number
@@ -100,6 +107,7 @@ export interface LotterySettingsPatch {
   avoid_cold_days?: number
   pick_strategy?: 'wave_round' | 'score_top'
   wave_alloc?: 'balanced' | 'drain'
+  pick_sampling?: 'seeded_random' | 'ranked'
   score_w_focus?: number
   score_w_mid?: number
   score_w_omit?: number
@@ -602,6 +610,26 @@ export interface WaveAllocOption {
 export const WAVE_ALLOC_OPTIONS: WaveAllocOption[] = [
   { value: 'balanced', label: '均衡分散' },
   { value: 'drain', label: '逐桶取满（旧）' },
+]
+
+/**
+ * 桶内取号方式；与后端 ``PICK_SAMPLING_*`` 一致。
+ * - ``seeded_random``（默认）：在 balanced 配额内按点阵概率做**期号种子随机**
+ *   加权抽样（同一期 + 同一组设置 → 逐字节一致；换期 → 换样本）；
+ * - ``ranked``（旧）：按池内确定性名次取号，供历史审计快照复现。
+ * 只改「抽哪些号」，不改命中概率 / 期望值。
+ */
+export type PickSampling = 'seeded_random' | 'ranked'
+
+export interface PickSamplingOption {
+  value: PickSampling
+  label: string
+}
+
+/** 桶内取号方式取值表（设置页持久化）；默认 seeded_random */
+export const PICK_SAMPLING_OPTIONS: PickSamplingOption[] = [
+  { value: 'seeded_random', label: '种子随机' },
+  { value: 'ranked', label: '按名次（旧）' },
 ]
 
 /**

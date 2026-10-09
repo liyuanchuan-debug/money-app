@@ -32,12 +32,20 @@ from scripts import forward_validate as FV
 from services import analytics as A
 from services import forward_ledger as FL
 from services import wave_study as WS
-from services.lottery import DEFAULT_SETTINGS
+from services.lottery import DEFAULT_SETTINGS, PICK_SAMPLING_RANKED
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
 # 测试配置：仓库默认设置 + 10 注（与线上回测口径一致 → 均匀基线 10/49）
 TEST_SETTINGS: dict[str, Any] = {**DEFAULT_SETTINGS, "pick_count": 10}
+# 独立性用例专用：钉回旧**确定性名次**口径。
+# 新默认 ``pick_sampling="seeded_random"`` 以**期号**为种子 → 同一前缀的 31 / 32 期会得到
+# 不同样本（这是设计目标）；而「同一前缀 → 同一注 → 重复登记」的独立性机制仍须测，
+# 因此这些用例显式钉住 ranked（同期号无关 → 同前缀同注）。
+IDENTICAL_PICK_SETTINGS: dict[str, Any] = {
+    **TEST_SETTINGS,
+    "pick_sampling": PICK_SAMPLING_RANKED,
+}
 FROZEN_AT = "2026-10-07T00:00:00+00:00"
 
 
@@ -319,7 +327,8 @@ def test_prediction_digest_is_stable_across_disk_round_trip_and_tracks_picks(
 def test_identical_picks_are_marked_non_independent_at_freeze_time() -> None:
     """同一前缀冻结两期 → 线上引擎同一注：第二条必须 independent=false + 指回第一期。"""
     draws = synthetic_draws(30)
-    ledger = freeze(draws, [31, 32])  # 故意一次冻结两期（会产生重复登记）
+    # 钉住确定性名次口径 → 同一前缀（30 期）下 31 / 32 期给出同一注（重复登记）
+    ledger = freeze(draws, [31, 32], settings=IDENTICAL_PICK_SETTINGS)
     first, second = ledger["records"]
 
     prod_first = _entry_of(first, FL.STRATEGY_PRODUCTION)
@@ -483,7 +492,7 @@ def test_zero_independent_rows_emit_no_p_value() -> None:
 def test_all_identical_scored_rows_collapse_to_one_observation() -> None:
     """所有已计分行都是同一注 → 有效独立 1 条：报观测值，但明确「不给显著性」。"""
     draws = synthetic_draws(30)
-    ledger = freeze(draws, [31, 32])  # 同前缀 → 线上引擎两期同一注
+    ledger = freeze(draws, [31, 32], settings=IDENTICAL_PICK_SETTINGS)  # 同前缀 → 线上引擎两期同一注
     extended = [
         *draws,
         {"period": 31, "draw_date": "2026-01-31", "special_number": 5},
@@ -513,6 +522,7 @@ def test_status_reports_raw_and_effective_sample_sizes() -> None:
         draws,
         [31, 32, 33],
         strategies=[FL.STRATEGY_PRODUCTION, FL.STRATEGY_UNIFORM, FL.STRATEGY_FIT_DEMO],
+        settings=IDENTICAL_PICK_SETTINGS,
     )  # 1 期后每期都是重复登记（共 9 条 = 5 独立 + 4 重复）
     payload = FL.status_payload(ledger, draws)
 
@@ -528,7 +538,7 @@ def test_status_reports_raw_and_effective_sample_sizes() -> None:
 def test_verify_catches_a_lied_about_independence_flag() -> None:
     """即使把整条链重新签名，谎报 independent=true 也必须被推导口径抓住。"""
     draws = synthetic_draws(30)
-    ledger = freeze(draws, [31, 32])
+    ledger = freeze(draws, [31, 32], settings=IDENTICAL_PICK_SETTINGS)
     lied = copy.deepcopy(ledger)
     entry = _entry_of(lied["records"][1], FL.STRATEGY_PRODUCTION)
     entry["independent"] = True

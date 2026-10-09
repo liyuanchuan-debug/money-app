@@ -286,7 +286,8 @@ def test_recommend_number_branch_uses_draws_history(client):
 
     # 本用例只证明「历史序列来自 draws」：关闭避冷加权与新增的软降权 / 点阵，
     # 否则刚出现过的 24 会按「非冷号优先」被直接选中（与空历史时的结果相同），
-    # 反而看不出历史对遗漏排序的影响。
+    # 反而看不出历史对遗漏排序的影响。同时钉回旧确定性名次口径（ranked），
+    # 因为断言的是「遗漏排序」结果，而非期号种子随机样本。
     client.put(
         "/api/settings",
         json={
@@ -296,6 +297,7 @@ def test_recommend_number_branch_uses_draws_history(client):
             "stale_weight": 1.0,
             "lattice_enabled": False,
             "include_repeat_number": False,
+            "pick_sampling": "ranked",
         },
     )
 
@@ -308,6 +310,12 @@ def test_recommend_number_branch_uses_draws_history(client):
 
 def test_recommend_number_branch_without_history_still_works(client):
     """没有任何 draws 时前瞻观察号也必须可用（previous=None，按平均分散）。"""
+    # 断言的是「无历史时按差值/号码确定性排序」→ 钉回旧名次口径；
+    # 并排除最新的重号（软降权已去除，diff=0 的 25 否则会抢先）
+    client.put(
+        "/api/settings",
+        json={"pick_sampling": "ranked", "include_repeat_number": False},
+    )
     body = client.post("/api/recommend", json={"number": 25, "mode": "single"}).json()
 
     assert body["previous"] is None

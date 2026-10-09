@@ -37,9 +37,11 @@ from services.analytics import (  # noqa: E402
     normalize_draws,
 )
 from services.lottery import (  # noqa: E402
+    DEFAULT_PICK_SAMPLING,
     DEFAULT_SETTINGS,
     DEFAULT_WAVE_ALLOC,
     MODES,
+    PICK_SAMPLINGS,
     PICK_STRATEGIES,
     TREND_BIASES,
     TREND_BIAS_EXPLICIT_KEY,
@@ -74,7 +76,10 @@ REAL_DRAWS_FILE = BACKEND_DIR / "data" / "draws_70_279.json"
 # 若 services/lottery 的选号或预算规则被无意改动，这些数字会一起变，测试立刻报警。
 SYNTHETIC_LENGTH = 64
 FROZEN_SYNTHETIC_HITS = 20
-FROZEN_LIVE_HITS = 38
+# 现场配置（LIVE_SETTINGS）快照：默认改口径后由 38 变成 52（同一批设置、同一批
+# 真实开奖，只是桶内抽样从「按名次」换成「期号种子随机」→ 抽到的号不同）。
+# 52/208 = 25.00%，仍在噪声内（零和期望 42.45，sd 5.81，偏离 1.64 SE）→ verdict=noise。
+FROZEN_LIVE_HITS = 52
 FROZEN_LIVE_EVALUATED = 208
 
 
@@ -84,8 +89,11 @@ FROZEN_LIVE_EVALUATED = 208
 def _synthetic_raw(length: int = SYNTHETIC_LENGTH) -> list[dict]:
     """确定性手工序列（升序；步长 17 与 49 互质，60+ 期后必然出现冷号）。
 
-    注意：本序列**相邻差值恒为 17**，因此所有依赖「差值分布」的规则
-    （预测波动带 / 点阵）在它上面是常量 —— 需要波动敏感的用例请用 ``_varied_raw``。
+    注意：本序列的相邻差值**不是常量** —— 步长 17 对 49 取模后回绕，因此
+    ``|Δ|`` 只取 ``{17, 32}`` 两档。预测波动带（P25~P75）因此稳定在 ``[17, 32]``，
+    只有当窗口小到只剩同向步时才会收窄；需要「波动带与窗口无关」的用例请用
+    ``_flat_band_raw``（单调 +1，带恒为 ``[1, 1]``）。需要「差值会变、波动带明显
+    随窗口移动」的用例请用 ``_varied_raw``。
     """
     start = date(2026, 3, 1)
     return [
@@ -93,6 +101,24 @@ def _synthetic_raw(length: int = SYNTHETIC_LENGTH) -> list[dict]:
             "period": 100 + index,
             "draw_date": (start + timedelta(days=index)).isoformat(),
             "special_number": ((index * 17) % 49) + 1,
+        }
+        for index in range(length)
+    ]
+
+
+def _flat_band_raw(length: int = SYNTHETIC_LENGTH) -> list[dict]:
+    """平带序列：特码每期 +1（1,2,…,49,1,2,…）。
+
+    相邻差值 62/63 为 1、只在一次回绕处出现一个 48 —— P25/P50/P75 在所有
+    窗口长度下都等于 1，因此**预测波动带与 ``lattice_window`` 无关**。这是
+    「窗口改不了波动带 ⇒ 就不该改号码」这条审计性质的干净夹具。
+    """
+    start = date(2026, 3, 1)
+    return [
+        {
+            "period": 300 + index,
+            "draw_date": (start + timedelta(days=index)).isoformat(),
+            "special_number": (index % 49) + 1,
         }
         for index in range(length)
     ]
@@ -123,6 +149,10 @@ def _series(length: int = SYNTHETIC_LENGTH) -> list[dict]:
 
 def _varied_series(length: int = SYNTHETIC_LENGTH) -> list[dict]:
     return normalize_draws(_varied_raw(length))
+
+
+def _flat_band_series(length: int = SYNTHETIC_LENGTH) -> list[dict]:
+    return normalize_draws(_flat_band_raw(length))
 
 
 def _hits(rows: list[dict]) -> int:
@@ -181,6 +211,35 @@ def test_sweep_detects_known_active_setting_lattice_enabled():
 
     cls, _reason = classify(effect, {}, "lattice_enabled")
     assert cls == CLASS_ACTIVE
+
+
+def test_pick_sampling_is_active_and_reproducible():
+    """``pick_sampling`` 是**真开关**：换档换号，且同档两次扰动逐字段一致。
+
+    默认 ``seeded_random``（期号种子随机）对现场配置的 208 期里每一期都改了号码
+    集合 —— 说明它不是「看起来像开关」的装饰字段。
+    """
+    series = _real_series()
+    first = evaluate_setting(
+        "pick_sampling", "live", LIVE_SETTINGS, series, ("ranked",)
+    )
+    second = evaluate_setting(
+        "pick_sampling", "live", LIVE_SETTINGS, series, ("ranked",)
+    )
+    assert first == second
+    assert first["numbers_changed"] is True
+    assert first["max_periods_picks_changed"] == FROZEN_LIVE_EVALUATED
+    assert first["alternatives"][0]["effective_value"] == "ranked"
+
+    cls, _reason = classify(first, {}, "pick_sampling")
+    assert cls == CLASS_ACTIVE
+
+
+def test_sweep_for_pick_sampling_excludes_current_value():
+    values = sweep_for("pick_sampling", DEFAULT_PICK_SAMPLING)
+    assert DEFAULT_PICK_SAMPLING not in values
+    assert set(values) <= set(PICK_SAMPLINGS)
+    assert values == ("ranked",)
 
 
 def test_dead_key_big_min_is_not_an_engine_input():
@@ -293,12 +352,25 @@ def test_perturbation_is_deterministic():
     assert first["hits_values"] == second["hits_values"]
 
 
-def test_constant_diff_series_makes_wave_window_inert():
-    """恒定相邻差值的序列上，预测波动带与窗口无关 → 这是夹具的已知性质，必须显式记录。"""
-    constant = evaluate_setting(
-        "lattice_window", "live", LIVE_SETTINGS, _series(), sweep_for("lattice_window", 30)
+def test_flat_band_series_makes_wave_window_inert():
+    """波动带不随窗口变的序列上，``lattice_window`` 必须**一个号码都改不动**。
+
+    这是一个「诚实性」护栏，而不是「夹具巧合」：平带序列（每期 +1）在任意窗口
+    下沉 P25/P50/P75 都等于 1，预测波动带恒为 ``[1, 1]`` ⇒ 每个号的抽样概率完全
+    不受窗口影响 ⇒ 抽样结果不得改变。若有人把 ``lattice_window`` 重新塞进
+    ``sampling_seed_key`` 的白名单，这条会立刻由 0 变正 —— 那正是把「惰性参数」
+    伪装成「敏感参数」的做法，必须挡住。
+    """
+    flat = evaluate_setting(
+        "lattice_window",
+        "live",
+        LIVE_SETTINGS,
+        _flat_band_series(),
+        sweep_for("lattice_window", 30),
     )
-    assert constant["max_periods_picks_changed"] == 0
+    assert flat["max_periods_picks_changed"] == 0
+    assert flat["numbers_changed"] is False
+    assert flat["hits_values"] == [flat["hits_base"]]
 
     varied = evaluate_setting(
         "lattice_window",
@@ -371,9 +443,10 @@ def test_audit_is_read_only_against_memory_store_and_restores_settings():
             )["hits"]
         )
 
-        # 默认已改为 lattice_enabled=False（2026-10-07）；为证明「改动确实生效」，
-        # 这里把开关拨到**非默认**的 True（否则改一个等于没改的值，断言失去意义）。
-        await store.update_settings({"lattice_enabled": True})
+        # 默认已改为 lattice_enabled=True（2026-10-09，点阵改口径为抽样概率分布）；
+        # 为证明「改动确实生效」，这里把开关拨到**非默认**的 False
+        # （否则改一个等于没改的值，断言失去意义）。
+        await store.update_settings({"lattice_enabled": False})
         toggled_hits = int(
             backtest_stats(
                 draws,
@@ -403,7 +476,7 @@ def test_audit_is_read_only_against_memory_store_and_restores_settings():
     # 备份票据：改动确实生效过（否则「还原」没有意义）
     toggled_hits = extra["toggled"]
     assert toggled_hits != baseline_hits or _hits(
-        walk_forward(series, {**original, "lattice_enabled": True})
+        walk_forward(series, {**original, "lattice_enabled": False})
     ) != _hits(walk_forward(series, original))
 
 
@@ -447,11 +520,12 @@ def test_power_report_matches_analytics_and_ev_is_invariant():
     assert power["evaluated"] == FROZEN_LIVE_EVALUATED
     assert power["picks_per_period"] == 10
     assert power["random_baseline_hit_rate"] == pytest.approx(10 / 49)
-    # 低于随机，且落在一个标准误内 → 与随机不可区分
-    assert power["hit_rate"] < power["random_baseline_hit_rate"]
+    # 52/208 = 25.00% **高于**随机基线 20.41%，但只高出 1.64 个标准误 → 与随机不可区分
+    assert power["hit_rate"] == pytest.approx(0.25)
+    assert power["hit_rate"] > power["random_baseline_hit_rate"]
     assert power["verdict"] == "noise"
     assert power["within_noise"] is True
-    assert power["binomial_p_two_sided"] == pytest.approx(0.4916, abs=5e-4)
+    assert power["binomial_p_two_sided"] == pytest.approx(0.1024, abs=5e-4)
     assert power["binomial_p_two_sided"] > 0.05
     assert power["minimum_detectable_delta"] == pytest.approx(0.0783, abs=1e-3)
     # 期望值与选号、权重、注数完全无关
@@ -484,6 +558,7 @@ def test_lottery_public_contract_unchanged():
         "avoid_cold_days",
         "pick_strategy",
         "wave_alloc",
+        "pick_sampling",
         "score_w_focus",
         "score_w_mid",
         "score_w_omit",
@@ -504,6 +579,8 @@ def test_lottery_public_contract_unchanged():
     assert PICK_STRATEGIES == ["wave_round", "score_top"]
     assert WAVE_ALLOCS == ["drain", "balanced"]
     assert DEFAULT_WAVE_ALLOC == WAVE_ALLOC_BALANCED
+    assert PICK_SAMPLINGS == ["seeded_random", "ranked"]
+    assert DEFAULT_PICK_SAMPLING == "seeded_random"
     assert TREND_BIASES == ["neutral", "hot", "cold", "mid"]
 
     # 号码范围 1..49 不得被改动
