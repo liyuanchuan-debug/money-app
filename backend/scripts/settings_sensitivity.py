@@ -311,8 +311,8 @@ SETTING_GATES: dict[str, str] = {
     "role_w_primary": "只进 allocate_amounts 的角色配额（distribute_units_by_role:1403）；无余量时不生效",
     "role_w_secondary": "只进 allocate_amounts 的角色配额（distribute_units_by_role:1403）；无余量时不生效",
     "role_w_defense": "只进 allocate_amounts 的角色配额（distribute_units_by_role:1403）；无余量时不生效",
-    "trend_bias": "order_pool:1126 排序前缀 + 角色带切分（_trend_sort_prefix:1108）",
-    "trend_window": "只在 trend_bias != neutral 时影响选号；neutral 下仅用于展示（recommend:2312）",
+    "trend_bias": "已停用：trend_sampling_weight 恒 1.0；order_pool 不吃走势前缀；读取侧恒 neutral",
+    "trend_window": "已停用为选号权重；仅影响 trend_distributions / number_frequency 展示",
     "avoid_cold_enabled": "避冷总开关（order_pool:1154 / take_from_role_band:1208 / 金额封顶:2238）",
     "avoid_cold_days": "仅在 avoid_cold_enabled=True 时读取",
     "pick_strategy": "wave_round / score_top 分支（recommend:2135）",
@@ -322,7 +322,7 @@ SETTING_GATES: dict[str, str] = {
     "score_w_mid": "只在 pick_strategy=score_top 时被 score_candidate:1743 读取",
     "score_w_omit": "只在 pick_strategy=score_top 时读取；且现场值 0.0 → 该项恒为 0（乘以零）",
     "score_w_diff": "只在 pick_strategy=score_top 时被 score_candidate:1743 读取",
-    TREND_BIAS_EXPLICIT_KEY: "存储读取口径：effective_trend_bias:490 非 True 时强制 neutral",
+    TREND_BIAS_EXPLICIT_KEY: "已停用：effective_trend_bias 恒回退 neutral（explicit 也无法恢复加权）",
     "big_min": "只读派生 = normal_max + 1；clamp_settings 忽略未知键，SettingsPatch 未声明",
 }
 

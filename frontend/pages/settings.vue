@@ -1052,10 +1052,17 @@ const readonlyInputClass
                 </p>
               </div>
 
-              <!-- 近期走势加权：默认不加权；财富密码页可临时预览 -->
+              <!-- 近期走势加权：已停用为选择权重；选项仅影响走势分布参考展示 -->
               <div class="space-y-2">
                 <p id="trend-bias-setting-label" class="text-sm font-medium text-slate-200">
-                  近期走势加权
+                  近期走势加权（已停用）
+                </p>
+                <p
+                  class="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-200"
+                >
+                  近期走势加权已停用：下面的热号 / 中频 / 冷号偏好与近窗档位
+                  <strong class="font-semibold">都不会改变推荐号码或金额</strong>，
+                  只用于「走势分布参考」对照阅读。选号只看波动配额 + 点阵概率 + 期号种子随机。
                 </p>
                 <div
                   role="radiogroup"
@@ -1085,22 +1092,12 @@ const readonlyInputClass
                     {{ option.label }}
                   </GlassButton>
                 </div>
-                <!-- 不加权时窗口档位对选号无影响：醒目提示，避免「选了档位就以为开启了加权」 -->
-                <p
-                  v-if="form.trend_bias === 'neutral'"
-                  class="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-200"
-                >
-                  当前是「不加权」：上面的近窗档位（近 20 / 30 / 60 / 100 / 全部）
-                  <strong class="font-semibold">不影响选号</strong>，只用于走势分布参考。
-                  要先选「热号偏好 / 中频优先 / 冷号偏好」并保存，近窗档位才会参与选号。
-                </p>
                 <p class="text-xs leading-relaxed text-slate-400">
-                  走势加权管「偏热 / 偏冷 / 中频」；避冷加权管「冷号排后 + 金额封顶」；两者独立，可同时生效。
+                  走势偏好键仍可保存（兼容旧配置），但引擎侧恒按「不加权」选号。
+                  避冷加权是另一套独立开关，仍可把冷号排后并压低金额。
                 </p>
                 <p class="text-xs leading-relaxed text-slate-500">
-                  没手动设置过时一律是「不加权」：等同旧的全历史遗漏优先，旧版本残留的「热号偏好」不会自动生效。
-                  选好热 / 中 / 冷号偏好后要点「保存设置」才生效；生效后各波动桶内按近窗出现频次切主推 / 次选 / 防守三段参与选号。
-                  这是样本内经验频率偏好，不承诺提高命中率。波浪买入法页可临时切换，不改这里的默认值。
+                  默认「不加权」。这是本池近窗经验频率的展示，不是真实概率，也不承诺提高命中率。
                 </p>
 
                 <!-- 避冷加权：本组内的**独立开关**（不是第 5 个走势加权选项，互不排斥） -->

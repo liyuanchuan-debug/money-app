@@ -489,16 +489,16 @@ def test_honest_footer_in_sample_block_comes_from_the_real_backtest():
         include_results=True,
     )
     assert in_sample["evaluated"] == outcome["evaluated"] == 208
-    assert in_sample["hits"] == outcome["hits"] == 52
+    assert in_sample["hits"] == outcome["hits"] == 45
     assert in_sample["hit_rate"] == pytest.approx(outcome["hit_rate"])
-    assert in_sample["hit_rate"] == pytest.approx(52 / 208)
+    assert in_sample["hit_rate"] == pytest.approx(45 / 208)
     assert in_sample["random_baseline_hit_rate"] == pytest.approx(10 / 49)
     assert in_sample["verdict"] == "noise"
     assert in_sample["within_noise"] is True
 
     # 历史最久连续未中：独立重算一遍（不得留空、不得编造）
-    # 2026-10-09 抽样换口径（种子随机）后由 17 期为 14 期 —— 同一份固定路径的
-    # 另一个随机样本，仍只是描述性统计，不构成任何边际声明。
+    # 2026-10-10 走势加权去掉后由 14 期回到 17 期 —— 同一份固定路径的
+    # 另一个确定性样本，仍只是描述性统计，不构成任何边际声明。
     worst = 0
     streak = 0
     for row in outcome["results"]:
@@ -507,7 +507,7 @@ def test_honest_footer_in_sample_block_comes_from_the_real_backtest():
             continue
         streak += 1
         worst = max(worst, streak)
-    assert in_sample["max_dry_streak_periods"] == worst == 14
+    assert in_sample["max_dry_streak_periods"] == worst == 17
 
 
 def test_simulate_reports_an_honest_distribution_for_the_ticket_shape():
@@ -749,12 +749,12 @@ def test_health_endpoint_is_unchanged(client: TestClient):
 
 
 def test_backtest_on_210_real_draws_is_unchanged(client: TestClient):
-    """生产行为守卫：线上配置 + 210 期 → 51/208、命中率 0.245192、verdict=noise。
+    """生产行为守卫：线上配置 + 210 期 → 45/208、verdict=noise。
 
     这条断言同时钉住了 ``services/lottery`` 的选号行为与 ``services/analytics``
-    的统计口径：任何一边被改动，这里立刻红。2026-10-09「降权去除 + 点阵分布化」
-    把旧锚点 38/208 换成了 52/208 —— 同一份固定路径上的另一个确定性样本，
-    两个数字都在零边均值 42.45 ± 5.81 内，verdict 仍是 noise。
+    的统计口径：任何一边被改动，这里立刻红。2026-10-10「近期走势加权去掉」
+    把旧锚点 52/208 换成了 45/208 —— ``trend_bias=mid`` 不再改抽样，
+    数字仍在零边均值 42.45 ± 5.81 内，verdict 仍是 noise。
     """
     _import_draws(client, _real_draws())
     _apply_production_settings(client)
@@ -763,8 +763,8 @@ def test_backtest_on_210_real_draws_is_unchanged(client: TestClient):
         "/api/stats/backtest", json={"pick_count": 10, "mode": "even"}
     ).json()
     assert body["evaluated"] == 208
-    assert body["hits"] == 52
-    assert body["hit_rate"] == pytest.approx(52 / 208)
+    assert body["hits"] == 45
+    assert body["hit_rate"] == pytest.approx(45 / 208)
     assert body["verdict"]["kind"] == "noise"
     assert body["verdict"]["within_noise"] is True
     assert body["random_baseline_hit_rate"] == pytest.approx(10 / 49)

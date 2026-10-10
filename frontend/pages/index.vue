@@ -299,8 +299,8 @@ const canUseRecommend = computed(() => hasRole('VIP'))
             <div>
               <h2 class="text-lg font-medium text-white">最近特码走势</h2>
               <p class="text-xs text-slate-500">
-                口径：{{ scope }}；旧 → 新排列，共画 {{ trend.count }} 期，
-                可左右滑动查看更早的期数（默认一屏 {{ TREND_WINDOW_DEFAULT }} 期）。
+                口径：{{ scope }}；旧 → 新排列，共画 {{ trend.count }} 期；
+                左右滑动移动号码光标（默认一屏 {{ TREND_WINDOW_DEFAULT }} 期）。
               </p>
             </div>
             <span class="num text-xs text-slate-500">{{ trend.count }} 期</span>

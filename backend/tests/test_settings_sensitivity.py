@@ -75,11 +75,11 @@ REAL_DRAWS_FILE = BACKEND_DIR / "data" / "draws_70_279.json"
 # 冻结的走步回测快照（合成序列 + 现场配置）：
 # 若 services/lottery 的选号或预算规则被无意改动，这些数字会一起变，测试立刻报警。
 SYNTHETIC_LENGTH = 64
-FROZEN_SYNTHETIC_HITS = 20
-# 现场配置（LIVE_SETTINGS）快照：默认改口径后由 38 变成 52（同一批设置、同一批
-# 真实开奖，只是桶内抽样从「按名次」换成「期号种子随机」→ 抽到的号不同）。
-# 52/208 = 25.00%，仍在噪声内（零和期望 42.45，sd 5.81，偏离 1.64 SE）→ verdict=noise。
-FROZEN_LIVE_HITS = 52
+FROZEN_SYNTHETIC_HITS = 25
+# 现场配置（LIVE_SETTINGS）快照：2026-10-10「近期走势加权去掉」后由 52 变成 45
+# （``trend_bias=mid`` 不再改变抽样；其余键不变）。45/208 ≈ 21.63%，贴近随机基线
+# 20.41%，仍在噪声内（零和期望 42.45，sd 5.81）→ verdict=noise。
+FROZEN_LIVE_HITS = 45
 FROZEN_LIVE_EVALUATED = 208
 
 
@@ -520,12 +520,11 @@ def test_power_report_matches_analytics_and_ev_is_invariant():
     assert power["evaluated"] == FROZEN_LIVE_EVALUATED
     assert power["picks_per_period"] == 10
     assert power["random_baseline_hit_rate"] == pytest.approx(10 / 49)
-    # 52/208 = 25.00% **高于**随机基线 20.41%，但只高出 1.64 个标准误 → 与随机不可区分
-    assert power["hit_rate"] == pytest.approx(0.25)
-    assert power["hit_rate"] > power["random_baseline_hit_rate"]
+    # 45/208 ≈ 21.63%，贴近随机基线 20.41% → 与随机不可区分
+    assert power["hit_rate"] == pytest.approx(45 / 208)
     assert power["verdict"] == "noise"
     assert power["within_noise"] is True
-    assert power["binomial_p_two_sided"] == pytest.approx(0.1024, abs=5e-4)
+    assert power["binomial_p_two_sided"] == pytest.approx(0.6671, abs=5e-4)
     assert power["binomial_p_two_sided"] > 0.05
     assert power["minimum_detectable_delta"] == pytest.approx(0.0783, abs=1e-3)
     # 期望值与选号、权重、注数完全无关

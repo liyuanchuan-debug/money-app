@@ -1113,9 +1113,9 @@ def test_trend_distributions_split_three_role_bands():
     hot_min = min(item["count"] for item in small["primary"])
     cold_max = max(item["count"] for item in small["defense"])
     assert hot_min >= cold_max
-    assert result["trend_bias"] == "hot"
+    assert result["trend_bias"] == "hot"  # 请求回显；选号侧已停用
     assert all("trend_count" in pick for pick in result["picks"])
-    assert any("经验频率" in note or "加权" in note for note in result["notes"])
+    assert any("走势加权已停用" in note for note in result["notes"])
     # 诚实口径：允许出现「不承诺提高命中率」，禁止正向宣称可提高命中
     joined = "；".join(result["notes"])
     assert "不承诺提高命中率" in joined
@@ -1185,29 +1185,36 @@ def test_days_since_last_calendar_and_never_seen():
     assert never["days_since_last"] is None
 
 
-def test_trend_bias_neutral_matches_legacy_omission_order():
-    """neutral 关闭加权后，池内仍按全历史遗漏优先（与旧行为一致）。"""
+def test_trend_bias_is_inert_for_picks():
+    """「近期走势加权去掉」：hot/cold/mid/neutral 选号与金额逐字节一致。"""
     latest = 25
-    # 全历史里 24 从未出现、26 出现很多次 → neutral 应优先 24
     history = [25, 26, 26, 26, 26, 26, 10, 40]
-    legacyish = recommend(
-        latest=latest,
-        previous=10,
-        history_numbers=history,
-        settings={"pick_count": 3, "trend_bias": "neutral", "trend_window": 30},
-    )
-    hot = recommend(
-        latest=latest,
-        previous=10,
-        history_numbers=history,
-        settings={"pick_count": 3, "trend_bias": "hot", "trend_window": 30},
-    )
-    legacy_nums = [p["number"] for p in legacyish["picks"]]
-    hot_nums = [p["number"] for p in hot["picks"]]
-    # 同一最新号下，开关应能产生可解释差异（至少号码集合或顺序不同）
-    assert legacy_nums != hot_nums or set(legacy_nums) != set(hot_nums)
-    assert legacyish["trend_bias"] == "neutral"
-    assert any("不加权" in note or "旧" in note for note in legacyish["notes"])
+    payloads = []
+    for bias in ("neutral", "hot", "cold", "mid"):
+        result = recommend(
+            latest=latest,
+            previous=10,
+            history_numbers=history,
+            period=279,
+            settings={
+                "pick_count": 6,
+                "trend_bias": bias,
+                "trend_bias_explicit": True,
+                "trend_window": 30,
+                "avoid_cold_enabled": False,
+                "lattice_enabled": True,
+                "pick_sampling": "seeded_random",
+                "wave_alloc": "balanced",
+            },
+        )
+        payloads.append(
+            (
+                [(p["number"], p["amount"], p["role"]) for p in result["picks"]],
+                result["total_amount"],
+            )
+        )
+        assert any("走势加权已停用" in note for note in result["notes"])
+    assert len(set(str(p) for p in payloads)) == 1
 
 
 def test_default_trend_bias_is_neutral():
@@ -1296,6 +1303,7 @@ def test_bet_count_override_changes_pick_length():
 
 
 def test_settings_api_trend_bias_roundtrip():
+    """走势加权键仍可写入 trend_window；trend_bias 读取侧恒 resolve 成 neutral。"""
     from fastapi.testclient import TestClient
 
     from main import app
@@ -1309,9 +1317,11 @@ def test_settings_api_trend_bias_roundtrip():
             "/api/settings",
             json={"trend_bias": "hot", "trend_window": 60},
         ).json()
-        assert updated["trend_bias"] == "hot"
+        # 读取口径：走势加权已停用 → PUT/GET 都回显 neutral（无法悄悄恢复）
+        assert updated["trend_bias"] == "neutral"
         assert updated["trend_window"] == 60
-        assert client.get("/api/settings").json()["trend_bias"] == "hot"
+        assert client.get("/api/settings").json()["trend_bias"] == "neutral"
+        assert client.get("/api/settings").json()["trend_window"] == 60
 
         restored = client.put(
             "/api/settings",
@@ -1324,37 +1334,33 @@ def test_settings_api_trend_bias_roundtrip():
 
 
 # --------------------------------------------------------------------------- #
-# 13. 「近期走势加权」读取口径：没手动设置过就不加权（存量旧默认 hot 不生效）
+# 13. 「近期走势加权去掉」：读取口径恒 neutral，写标记也无法恢复
 # --------------------------------------------------------------------------- #
-def test_effective_trend_bias_requires_explicit_marker():
-    """只有「手动设置过」的标记为真，才按存值生效；否则一律 neutral。"""
+def test_effective_trend_bias_always_neutral():
+    """走势加权已停用：explicit 标记也无法让 hot/cold/mid 生效。"""
     from services.lottery import effective_trend_bias
 
-    # 存量旧默认 hot（无标记）→ 不加权
     assert effective_trend_bias({"trend_bias": "hot"}) == "neutral"
     assert effective_trend_bias({"trend_bias": "cold"}) == "neutral"
-    # 标记为真 → 按用户选择生效
     assert (
         effective_trend_bias({"trend_bias": "hot", "trend_bias_explicit": True})
-        == "hot"
+        == "neutral"
     )
-    # 脏值 / 字符串真值同样按 coerce_bool 处理
     assert (
         effective_trend_bias({"trend_bias": "mid", "trend_bias_explicit": "true"})
-        == "mid"
+        == "neutral"
     )
     assert (
         effective_trend_bias({"trend_bias": "mid", "trend_bias_explicit": False})
         == "neutral"
     )
-    # 非法 bias 永远回退 neutral
     assert (
         effective_trend_bias({"trend_bias": "bogus", "trend_bias_explicit": True})
         == "neutral"
     )
 
 
-def test_resolve_trend_bias_forces_neutral_on_legacy_hot():
+def test_resolve_trend_bias_forces_neutral_even_when_explicit():
     from services.lottery import resolve_trend_bias
 
     cfg = clamp_settings({"trend_bias": "hot", "trend_window": 60})
@@ -1366,11 +1372,11 @@ def test_resolve_trend_bias_forces_neutral_on_legacy_hot():
     explicit = resolve_trend_bias(
         clamp_settings({"trend_bias": "hot", "trend_bias_explicit": True})
     )
-    assert explicit["trend_bias"] == "hot"
+    assert explicit["trend_bias"] == "neutral"
 
 
 def test_recommend_uses_resolved_neutral_for_legacy_hot():
-    """recommend 的入参默认来自 get_settings（已解析）→ 存量 hot 不该再加权。"""
+    """recommend 的入参默认来自 get_settings（已解析）→ 恒不加权。"""
     from services.lottery import resolve_trend_bias
 
     history = [25, 26, 26, 26, 10, 40]
@@ -1378,10 +1384,10 @@ def test_recommend_uses_resolved_neutral_for_legacy_hot():
     result = recommend(latest=25, previous=10, history_numbers=history,
                        settings=settings)
     assert result["trend_bias"] == "neutral"
-    assert any("不加权" in note or "旧" in note for note in result["notes"])
+    assert any("走势加权已停用" in note for note in result["notes"])
 
 
-def test_memory_store_legacy_hot_reads_neutral_and_self_heals():
+def test_memory_store_legacy_hot_reads_neutral_and_stays_off():
     from repository import MemoryStore
     from services.auth import GLOBAL_SETTINGS_USER_ID
 
@@ -1393,23 +1399,22 @@ def test_memory_store_legacy_hot_reads_neutral_and_self_heals():
 
     assert asyncio.run(store.get_settings())["trend_bias"] == "neutral"
 
-    # 只改别的设置项：不得把存量 hot 当成加权，落库也自然收敛成 neutral
+    # 只改别的设置项：不得把存量 hot 当成加权
     saved = asyncio.run(store.update_settings({"small_max": 9}))
     assert saved["trend_bias"] == "neutral"
     assert saved["small_max"] == 9
     assert asyncio.run(store.get_settings())["trend_bias"] == "neutral"
 
-    # 用户手动选择热号偏好 → 打上标记，此后按用户选择生效
+    # 用户手动选择热号偏好 → 读取侧仍恒 neutral（无法恢复加权）
     manual = asyncio.run(store.update_settings({"trend_bias": "hot"}))
-    assert manual["trend_bias"] == "hot"
-    assert asyncio.run(store.get_settings())["trend_bias"] == "hot"
-    # 之后再改别的设置项，手动选择的偏好必须保留
+    assert manual["trend_bias"] == "neutral"
+    assert asyncio.run(store.get_settings())["trend_bias"] == "neutral"
     kept = asyncio.run(store.update_settings({"small_max": 12}))
-    assert kept["trend_bias"] == "hot"
-    assert asyncio.run(store.get_settings())["trend_bias"] == "hot"
+    assert kept["trend_bias"] == "neutral"
+    assert asyncio.run(store.get_settings())["trend_bias"] == "neutral"
 
 
-def test_settings_api_legacy_hot_reads_neutral_until_manually_set():
+def test_settings_api_legacy_hot_reads_neutral_and_cannot_reenable():
     import repository
     from fastapi.testclient import TestClient
     from services.auth import GLOBAL_SETTINGS_USER_ID
@@ -1426,17 +1431,15 @@ def test_settings_api_legacy_hot_reads_neutral_until_manually_set():
         body = client.get("/api/settings").json()
         assert body["trend_bias"] == "neutral"
         assert "trend_bias_explicit" not in body
-        # 只改其它设置项也不会让它生效
         assert client.put(
             "/api/settings", json={"normal_max": 28}
         ).json()["trend_bias"] == "neutral"
         assert client.get("/api/settings").json()["trend_bias"] == "neutral"
-        # 手动选择后才生效
+        # 手动选择 hot 也无法恢复加权（读取侧恒 neutral）
         assert client.put(
             "/api/settings", json={"trend_bias": "hot"}
-        ).json()["trend_bias"] == "hot"
-        assert client.get("/api/settings").json()["trend_bias"] == "hot"
-        # 还原，避免影响其它用例（每个用例独立 store，这里只是幂等收尾）
+        ).json()["trend_bias"] == "neutral"
+        assert client.get("/api/settings").json()["trend_bias"] == "neutral"
         client.put("/api/settings", json={"trend_bias": "neutral"})
 
 
@@ -2033,18 +2036,9 @@ def test_trend_bias_direction_changes_role_bands():
     assert all("主推=" in rule for rule in (hot_rule, cold_rule, mid_rule))
 
 
-def test_trend_window_ignored_for_selection_when_neutral():
-    """不加权时 trend_window **不影响选号**，只影响「走势分布参考」的展示。
-
-    回归：用户反馈「窗口从 60 改到 100，号码没变化」。neutral 走 ``ordered_pools``，
-    排序键是**全历史**遗漏计数，``_trend_sort_prefix`` 返回空元组 ——
-    近窗统计（``trend_counts``）根本没有进入选号排序键，窗口只在展示里出现。
-
-    本用例断言的是**旧确定性名次口径**（`pick_sampling=ranked`）下的排序结果；
-    新的期号种子随机口径下「窗口是否换样本」由 ``sampling_seed_key`` 决定，另有专门用例覆盖。
-    """
+def test_trend_window_and_bias_inert_for_selection():
+    """走势加权去掉后：任意 bias × window 都不改选号；窗口仍改展示。"""
     latest, previous = 25, 10
-    # 近 3 期最热是 26；全样本最热是 24 —— 让「窗口不同 → 频次不同 → 角色带不同」
     history = [25, 26, 26, 26, 24, 24, 24, 24, 23, 27]
 
     def run(bias: str, window: int) -> dict:
@@ -2052,9 +2046,11 @@ def test_trend_window_ignored_for_selection_when_neutral():
             latest=latest,
             previous=previous,
             history_numbers=history,
+            period=279,
             settings={
                 "pick_count": 3,
                 "trend_bias": bias,
+                "trend_bias_explicit": True,
                 "trend_window": window,
                 "avoid_cold_enabled": False,
                 "small_max": 10,
@@ -2066,16 +2062,14 @@ def test_trend_window_ignored_for_selection_when_neutral():
     def picks(bias: str, window: int) -> list[int]:
         return [p["number"] for p in run(bias, window)["picks"]]
 
-    # neutral：窗口 3 / 10（全部）选号逐元素一致
-    assert picks("neutral", 3) == picks("neutral", 10)
-    # 但展示口径确实随窗口变（诚实：不是「完全没变」，是选号没变）
-    assert run("neutral", 3)["trend_distributions"]["used_window"] == 3
-    assert run("neutral", 10)["trend_distributions"]["used_window"] == 10
-
-    # 开启偏好后，窗口才会改变选号（近 3 期最热的 26 vs 全样本最热的 24）
-    assert picks("hot", 3) != picks("hot", 10)
-    assert picks("hot", 3)[0] == 26
-    assert picks("hot", 10)[0] == 24
+    anchor = picks("neutral", 3)
+    for bias in ("neutral", "hot", "cold", "mid"):
+        for window in (0, 3, 5, 10, 60, 100):
+            assert picks(bias, window) == anchor, (bias, window)
+    # 展示口径仍随窗口变
+    assert run("hot", 3)["trend_distributions"]["used_window"] == 3
+    assert run("hot", 10)["trend_distributions"]["used_window"] == 10
+    assert run("hot", 3)["trend_distributions"]["bias"] == "hot"
 
 
 @pytest.mark.parametrize("bias", ["neutral", "hot", "cold", "mid"])
@@ -2286,6 +2280,19 @@ def test_compute_periods_since_last_counts_draws_not_days():
     assert result[9] == 3
     assert result[5] is None
     assert set(result) == set(range(1, 50))
+
+
+def test_trend_sampling_weight_is_inert():
+    """「近期走势加权去掉」：``trend_sampling_weight`` 恒返回 1.0。"""
+    counts = Counter({24: 5, 26: 2, 23: 0})
+    for bias in ("neutral", "hot", "cold", "mid", "bogus"):
+        for number in (24, 26, 23, 1):
+            assert (
+                trend_sampling_weight(
+                    number, bias=bias, trend_counts=counts, mid_target=2.0
+                )
+                == 1.0
+            )
 
 
 def test_soft_penalty_weight_is_inert_but_keeps_flags():

@@ -24,7 +24,8 @@ import {
   type TrendNumberStat,
   type TrendWaveRoles,
 } from '~/composables/useApi'
-import { normalizeDraws, scopeLabel, zodiacText } from '~/composables/useDraws'
+import { normalizeDraws, periodText, scopeLabel, zodiacText } from '~/composables/useDraws'
+import { STATS_SAMPLE_LIMIT_OPTIONS } from '~/composables/useStats'
 
 definePageMeta({ role: 'VIP' })
 
@@ -339,8 +340,77 @@ const sampleSize = computed(() => normalizeDraws(rawDraws.value).length)
 const scope = computed(() => scopeLabel(sampleSize.value))
 const truncated = computed(() => sampleSize.value >= SAMPLE_LIMIT)
 
+/* ---------------- 01 - 49 出现热度（与开奖页同一口径：只数本池已导入样本） ---------------- */
+
+/**
+ * 数据源复用本页已抓取的样本（`draws-sample` = GET /api/draws），**不新增请求**。
+ * 口径与开奖页一致：只统计「本池已导入」记录里特码的出现次数，不涉及任何全市场 / 预测语义。
+ *
+ * 「统计期数」窗口只是本页展示状态：默认取最大档（= 本页一次能加载的全部样本），
+ * 切换只重算热度网格，不写库、不进任何请求体（api.recommend 的参数完全不受影响）。
+ */
+const heatWindowOptions = STATS_SAMPLE_LIMIT_OPTIONS.filter(
+  option => Number.isFinite(option) && option <= SAMPLE_LIMIT,
+)
+/** 默认档 = 最大可选档（= 单次加载上限）：首屏等同「统计全部已加载样本」，行为与改动前一致 */
+const HEAT_WINDOW_DEFAULT = heatWindowOptions[heatWindowOptions.length - 1] ?? SAMPLE_LIMIT
+/** 最小档：本池比它还短时，说明文案要如实交代「全部统计」 */
+const heatMinOption = heatWindowOptions[0] ?? SAMPLE_LIMIT
+const heatWindow = ref(HEAT_WINDOW_DEFAULT)
+
+/** 实际参与统计的期数：本池更少时以全部期数为准（min 保证任何 slice 都不越界） */
+const heatWindowEffective = computed(() => Math.min(heatWindow.value, sampleSize.value))
+
+/**
+ * 窗口内开奖记录。listDraws 返回**新→旧**（同类页面一致约定：本池最新一期在 [0]），
+ * 所以「最近 N 期」= slice(0, N)；本池不足 N 期时切片天然返回全部，无需特判。
+ */
+const heatWindowDraws = computed(() => {
+  const newestFirst = normalizeDraws(rawDraws.value)
+  return newestFirst.slice(0, heatWindowEffective.value)
+})
+
+const heatCounts = computed(() => {
+  const map = new Map<number, number>()
+  for (const draw of heatWindowDraws.value) {
+    map.set(draw.special_number, (map.get(draw.special_number) ?? 0) + 1)
+  }
+  return map
+})
+
+/** 01 - 49 固定 49 格；一次都没出现过的号码给 0（组件按零值档渲染中性灰） */
+const heatCells = computed(() =>
+  Array.from({ length: 49 }, (_, index) => {
+    const number = index + 1
+    return {
+      number: pad(number),
+      value: heatCounts.value.get(number) ?? 0,
+      hint: '所选期数内特码出现次数',
+    }
+  }),
+)
+
+/** 图例口径随所选窗口走，保证图例与格子永不打架（只描述样本内计数，无预测含义） */
+const heatScope = computed(() => scopeLabel(heatWindowEffective.value))
+
+/** 诚实说明：只统计本池样本内的计数；本池更少时如实说「全部统计」 */
+const heatWindowCaption = computed(() => {
+  if (sampleSize.value === 0) {
+    return '本池暂无已导入期数；补录开奖后再按所选期数统计。'
+  }
+  if (sampleSize.value < heatMinOption) {
+    return `本池仅 ${sampleSize.value} 期，全部统计。`
+  }
+  return `只统计本池最近 ${heatWindow.value} 期；若本池期数更少，则以全部期数为准。`
+})
+
+/** 本池最新一期特码（仅用于在热度网格上高亮这一格，样本为空时 null） */
+const latestSampleNumber = computed(
+  () => normalizeDraws(rawDraws.value)[0]?.special_number ?? null,
+)
+
 const {
-  data: result,
+  data: rawResult,
   refresh,
   pending,
   error,
@@ -353,6 +423,46 @@ const {
     trend_window: trendWindow.value,
   }),
 )
+
+/**
+ * 展示层归一化：把 recommend payload 里「模板按数组用」的字段补齐为数组。
+ *
+ * 为什么必须做：`RecommendResult` 的字段类型只是**编译期**约定，运行时不校验 ——
+ * 只要响应里缺 `notes` / `picks` 等数组字段（旧版 / 部分 / 被代理截断的 payload），
+ * 模板里 `result.notes.length`、`result.picks.length` 就会在渲染期抛
+ * `Cannot read properties of undefined (reading 'length')`（本页历史崩溃点即
+ * `result.notes.length`）。这里只在拿到对象时补齐缺失数组（缺字段按「无内容」展示，
+ * 不编造），拿不到数据（undefined / null / 非对象）时原样返回 undefined，
+ * 因此 `!result` 与 error 分支的语义完全不变。
+ */
+function normalizeRecommendResult(raw: unknown): RecommendResult | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const source = raw as Partial<RecommendResult>
+  const asArray = <T>(value: T[] | null | undefined): T[] =>
+    Array.isArray(value) ? value : []
+  const soft = source.soft_weights
+  return {
+    ...(source as RecommendResult),
+    picks: asArray(source.picks),
+    notes: asArray(source.notes),
+    missing_waves: asArray(source.missing_waves),
+    focus_order: asArray(source.focus_order),
+    latest_zodiac: asArray(source.latest_zodiac),
+    ...(soft
+      ? {
+          soft_weights: {
+            ...soft,
+            repeat_number_picks: asArray(soft.repeat_number_picks),
+            repeat_zodiac_picks: asArray(soft.repeat_zodiac_picks),
+            stale_picks: asArray(soft.stale_picks),
+          },
+        }
+      : {}),
+  }
+}
+
+/** 模板统一读这个归一化后的对象（`result.value` 语义不变，只是数组字段一定存在） */
+const result = computed(() => normalizeRecommendResult(rawResult.value))
 
 /** 各注金额（随机分配下通常不等，如实展示，不做任何美化） */
 const amounts = computed(() => result.value?.picks.map(pick => pick.amount) ?? [])
@@ -529,7 +639,7 @@ function pickSoftReasons(pick: Pick): string[] {
 const softSummary = computed(() => result.value?.soft_weights ?? null)
 
 /* ---------------------------------------------------------------------- */
-/* 预测波动线 · 1~49 号码点阵                                              */
+/* 预测波动线 · 折线（同首页「最近特码走势」）+ 1~49 号码点阵                 */
 /* ---------------------------------------------------------------------- */
 
 /** 点阵块（仅展示；enabled=false 时只画不带内优先） */
@@ -546,6 +656,136 @@ const pickedNumbers = computed(
 /** 本期推荐里落在预测带内的注数 */
 const pickedInBandCount = computed(
   () => (result.value?.picks ?? []).filter(pick => pick.in_lattice_band).length)
+
+/** 预测波动折线一屏期数（与首页特码走势同一档位习惯） */
+const WAVE_TREND_WINDOW_DEFAULT = 30
+const WAVE_TREND_WINDOW_OPTIONS = [30, 60, 100, 0]
+const waveTrendWindow = ref(WAVE_TREND_WINDOW_DEFAULT)
+
+/**
+ * 预测波动折线数据（前端用本池开奖样本按**特码原值 1–49** 画一条线，带宽取 recommend.lattice.band）。
+ * - 未开启：不编造曲线
+ * - 已开启但 band 为空：数据不足
+ * - 有 band：实线只连本池各期真实特码点，不做任何外推（不画预测点 / 虚线尾段）。
+ * - 纵轴口径：阴影带（预测带宽）本身在「相邻差值 |Δ|」空间取 P25~P75（low=P25 / high=P75），
+ *   这里按基准 = 最新特码换算到特码轴：from = clamp(最新 − high)、to = clamp(最新 − low)，
+ *   超出 1–49 按边界截断。它是**差值区间的换算**，不是独立的特码分布（页面文案必须写清）。
+ * - 有 picks：把候选号码从「最新一期真实特码点」拉出**多条虚线扇形**，末端按
+ *   **真实特码值 1–49** 落在同一竖列 x 上（LineChart 的 candidateColumn + candidateColumnByValue）。
+ *   每条虚线一个号、末端一个点；因为纵轴本身就是特码 1–49，末端自然排成一列
+ *   **点阵分布**（哪几段号码密、哪几段空，一眼可见）。号码升序排列（确定性），纵向位置即真实取值。
+ *   不是未来路径，也非真实开奖。
+ * - 标注：把本池**最新一期的特码原值**（1–49）写在最右的真实点上，供核对「最新一期 = 特码 N」。
+ */
+const waveTrendChart = computed(() => {
+  type ColumnCandidate = {
+    /** 候选号码原值（1–49）：纵轴即特码原值，末端按真实值定位 → 形成一列取值分布 */
+    value: number
+    label: string
+    tone: 'emerald' | 'bloom'
+  }
+  /** 图上数据点标注：把最新一期的特码原值写在最右真实点上（纵轴已是特码原值） */
+  type Annotation = {
+    index: number
+    value: number
+    label: string
+    tone: 'slate'
+  }
+  const empty = {
+    series: [] as Array<{
+      name: string
+      values: Array<number | null>
+      tone?: 'aqua' | 'amber'
+    }>,
+    labels: [] as string[],
+    bands: [] as Array<{ from: number; to: number; label: string }>,
+    candidateColumn: [] as ColumnCandidate[],
+    /** 扇形起点 = 最新真实特码点下标；无候选 / 无数据时 null（只画列或不画） */
+    candidateColumnFromIndex: null as number | null,
+    annotations: [] as Annotation[],
+    pointCount: 0,
+  }
+  const meta = lattice.value
+  const band = latticeBand.value
+  if (!meta?.enabled || !band) return empty
+  // listDraws 新→旧；与后端 predict_wave_band(history[:window]) 同一窗口
+  const newestFirst = normalizeDraws(rawDraws.value)
+  const window = typeof meta.window === 'number' ? meta.window : 0
+  const windowed = window > 0 ? newestFirst.slice(0, window) : newestFirst
+  const ordered = windowed.slice().reverse()
+  if (ordered.length < 2) return empty
+  // 主线 = 每期特码原值（1–49），一个点一期
+  const specialValues: number[] = []
+  const labels: string[] = []
+  for (let i = 0; i < ordered.length; i += 1) {
+    specialValues.push(ordered[i].special_number)
+    labels.push(periodText(ordered[i]) || ordered[i].draw_date || `第${i + 1}点`)
+  }
+  const low = Number(band.low)
+  const high = Number(band.high)
+  // 差值带 → 特码轴换算：基准 = 最新一期真实特码，from = clamp(最新 − high)、to = clamp(最新 − low)，夹在 1–49。
+  // 只取「下降分支」（最新 − Δ），口径在页面文案里写清；它仍是差值区间的换算，不是独立特码分布。
+  const clampToLane = (value: number) => Math.min(49, Math.max(1, Math.round(value)))
+  const newestDraw = ordered[ordered.length - 1]
+  // 基准 = 最新一期真实特码：既是图上最右真实点，也是阴影带的锚点
+  const newestValue = newestDraw.special_number
+  const newestValid = Number.isFinite(newestValue)
+  // 主线只画真实开奖点（specialValues），不做外推，也不画虚线尾段。
+  const bandValid = newestValid && Number.isFinite(low) && Number.isFinite(high)
+  const bandFrom = bandValid ? clampToLane(newestValue - high) : null
+  const bandTo = bandValid ? clampToLane(newestValue - low) : null
+  // 财富密码 = 下期候选集合：从「最新一期真实特码点」拉出多条虚线扇形，
+  // 末端按**真实特码值 1–49** 落在同一竖列 x 上（LineChart 的 candidateColumn + candidateColumnByValue）。
+  // 因为纵轴就是特码原值，末端自然排成一列**点阵分布**：哪几段号码密、哪几段空，一眼可见。
+  // 号码**升序**排列（确定性），纵向位置由真实取值决定（大号在上、小号在下，与纵轴同向）。
+  const candidateColumn: ColumnCandidate[] = []
+  for (const pick of result.value?.picks ?? []) {
+    const num = Number(pick.number)
+    if (!Number.isFinite(num)) continue
+    candidateColumn.push({
+      value: num,
+      label: pad(num),
+      tone: pick.in_lattice_band ? 'emerald' : 'bloom',
+    })
+  }
+  candidateColumn.sort((a, b) => Number(a.label) - Number(b.label))
+  // 候选竖列整列只占**一个** x 槽位（排在所有序列点之后）：labels 补一个空串，
+  // 否则 x 刻度回落到「序号」会在右端多出一道无名刻度。
+  labels.push('')
+
+  // 标注：把本池最新一期的特码原值挂在最右真实点上，方便核对「最新一期 = 特码 N」。
+  // 纵轴已是特码原值，这里不再承担「另一个单位」的消歧作用，只把「最新一期」点出来。
+  const annotations: Annotation[] = []
+  if (newestDraw && typeof newestValue === 'number' && Number.isFinite(newestValue)) {
+    annotations.push({
+      index: specialValues.length - 1,
+      value: newestValue,
+      label: `最新一期 ${periodText(newestDraw)} · 特码 ${pad(newestValue)}`,
+      tone: 'slate',
+    })
+  }
+
+  return {
+    series: [
+      {
+        name: '特码走势',
+        values: specialValues,
+        tone: 'aqua' as const,
+      },
+    ],
+    labels,
+    bands: bandFrom !== null && bandTo !== null
+      ? [{ from: bandFrom, to: bandTo, label: '预测带（最新 − 差值区间）' }]
+      : [],
+    candidateColumn,
+    // 扇形起点 = 最新一期真实特码点（specialValues 的最后一个）
+    candidateColumnFromIndex: candidateColumn.length
+      ? specialValues.length - 1
+      : null,
+    annotations,
+    pointCount: specialValues.length,
+  }
+})
 
 /**
  * 点阵单元格透明度：带内 lattice_weight=1.0 最实，带外按距离衰减变淡。
@@ -1009,12 +1249,12 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
           </GlassPanel>
         </MotionReveal>
 
-        <!-- 走势加权：临时预览 -->
+        <!-- 走势加权：已停用；切换仅改走势分布参考展示 -->
         <MotionReveal :index="4">
           <GlassPanel padding="lg" rounded="3xl" class="space-y-3">
             <div class="flex flex-wrap items-center justify-between gap-2">
-              <h2 id="trend-bias-label" class="text-lg font-medium text-white">近期走势加权</h2>
-              <StatChip tone="neutral" size="sm">临时预览 · 不写入默认值</StatChip>
+              <h2 id="trend-bias-label" class="text-lg font-medium text-white">近期走势加权（已停用）</h2>
+              <StatChip tone="neutral" size="sm">仅展示 · 不改号码</StatChip>
             </div>
 
             <div
@@ -1049,24 +1289,17 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
 
             <div class="flex flex-wrap items-center gap-2">
               <StatChip tone="aqua" size="sm">
-                {{ result.trend_bias_label || '走势加权' }}
+                {{ result.trend_bias_label || '走势加权已停用' }}
               </StatChip>
               <StatChip tone="neutral" size="sm">{{ trendWindowLabel }}</StatChip>
             </div>
 
-            <!-- 不加权时窗口对选号无影响：必须醒目提示，否则会被误解成「选了视窗就开启了加权」 -->
             <p
-              v-if="trendBias === 'neutral'"
               class="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-200"
             >
-              当前是「不加权」：近窗档位（{{ trendWindowLabel }}）只影响下方走势分布参考的展示，
-              <strong class="font-semibold">不影响选出的号码</strong>。
-              要让它参与选号，请选「热号偏好 / 中频优先 / 冷号偏好」任一。
-            </p>
-            <p v-else class="text-xs leading-relaxed text-slate-500">
-              已按本池近窗特码出现频次，在各波动桶内按该偏好切出主推 / 次选 / 防守三段：
-              热号偏好取最热段为主推，冷号偏好取最冷段为主推，中频优先取最接近中频段为主推。
-              这是样本内经验频率加权偏好，不是真实概率，也不承诺提高命中率。
+              近期走势加权已停用：切换热号 / 中频 / 冷号或近窗档位
+              <strong class="font-semibold">不会改变推荐号码或金额</strong>，
+              只影响下方走势分布参考的展示。
             </p>
           </GlassPanel>
         </MotionReveal>
@@ -1267,32 +1500,41 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
           </div>
         </section>
 
-        <!-- 预测波动线 · 1~49 号码点阵：带内优先参与选号（口径：经验分布，非概率） -->
+        <!-- 预测波动线 · 折线 + 1~49 号码点阵：带内优先参与选号（口径：经验分布，非概率） -->
         <MotionReveal v-if="lattice" :index="6">
           <GlassPanel padding="lg" rounded="3xl" class="space-y-3">
             <div class="flex flex-wrap items-start justify-between gap-2">
               <div class="space-y-1">
                 <h2 class="text-lg font-medium text-white">预测波动线 · 号码点阵</h2>
                 <p class="text-xs leading-relaxed text-slate-500">
-                  按本池最近特码的相邻差值估一条波动线（中心 = 中位数、带宽 = P25~P75），
-                  1~49 全号点阵中落在带内的高亮、并优先参与选号。口径：样本内经验分布，非概率 / 非预测。
+                  折线按本池各期特码原值（1–49）绘制；阴影带由相邻差值波动区间 P25~P75 换算到特码轴
+                  （基准 = 最新特码，即 [最新−P75, 最新−P25]，超出 1–49 按边界截断）—— 是差值区间
+                  的换算，不是独立的特码分布。下方点阵标出带内号码。口径：样本内经验分布，非概率。
                 </p>
               </div>
               <StatChip :tone="lattice.enabled ? 'aqua' : 'neutral'" size="sm">
-                {{ lattice.enabled ? '已参与选号' : '仅展示 · 未参与选号' }}
+                {{ lattice.enabled ? '已参与选号' : '未开启' }}
               </StatChip>
             </div>
 
-            <template v-if="latticeBand">
+            <!-- 未开启：诚实空态，不画假线 -->
+            <p
+              v-if="!lattice.enabled"
+              class="text-xs leading-relaxed text-slate-500"
+            >
+              预测波动线未开启：当前设置未启用点阵取样，本页不绘制预测线路。可在设置页打开「预测波动线 · 号码点阵」。
+            </p>
+
+            <template v-else-if="latticeBand">
               <div class="flex flex-wrap items-center gap-2">
                 <StatChip tone="aqua" size="sm" dot>
                   带内 {{ inBandCount }} / {{ latticeNumbers.length }} 号
                 </StatChip>
                 <StatChip :tone="waveTones[latticeBand.wave_type] ?? 'neutral'" size="sm">
-                  预测中心 |{{ latticeBand.center_number }}| · {{ latticeBand.wave_label }}
+                  差值中心 |{{ latticeBand.center_number }}| · {{ latticeBand.wave_label }}
                 </StatChip>
                 <StatChip tone="neutral" size="sm">
-                  带宽 |{{ latticeBand.low }}| ~ |{{ latticeBand.high }}|
+                  差值带 |{{ latticeBand.low }}| ~ |{{ latticeBand.high }}| → 换算到特码轴
                 </StatChip>
                 <StatChip tone="neutral" size="sm">
                   样本 {{ latticeBand.samples }} 对差值 · 近 {{ latticeBand.used_window }} 对
@@ -1303,6 +1545,74 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 <StatChip v-if="result.picks.length" tone="bloom" size="sm">
                   本次推荐落带内 {{ pickedInBandCount }} / {{ result.picks.length }} 注
                 </StatChip>
+              </div>
+
+              <!-- 预测波动折线：与首页「最近特码走势」同组件 / 同交互（号码光标） -->
+              <div class="space-y-2">
+                <div class="flex flex-wrap items-end justify-between gap-2">
+                  <div>
+                    <h3 class="text-sm font-medium text-slate-100">预测波动线</h3>
+                    <p class="text-[11px] text-slate-500">
+                      纵轴为特码原值（1–49）；实线 = 本池各期特码（只画真实开奖点，不做外推）；
+                      阴影带 = 由相邻差值波动区间 P25~P75 换算到特码轴（基准 = 最新特码，即 [最新−P75, 最新−P25]，
+                      超出 1–49 按边界截断）—— 是差值区间的换算，不是独立的特码分布。
+                      本期候选：从最新一期拉出的多条虚线，末端按真实特码值（1–49）排成一列 ——
+                      看点就是这几注在号码轴上的分布（疏 / 密），点色：绿 = 预测带内 / 粉 = 带外；
+                      非真实开奖。左右滑动移动光标。
+                    </p>
+                  </div>
+                  <span class="num text-[11px] text-slate-500">
+                    {{ waveTrendChart.pointCount }} 期
+                  </span>
+                </div>
+                <LineChart
+                  :series="waveTrendChart.series"
+                  :labels="waveTrendChart.labels"
+                  :bands="waveTrendChart.bands"
+                  :candidate-column="waveTrendChart.candidateColumn"
+                  :candidate-column-from-index="waveTrendChart.candidateColumnFromIndex"
+                  :candidate-column-by-value="true"
+                  :annotations="waveTrendChart.annotations"
+                  :height="220"
+                  :y-min="1"
+                  :y-max="49"
+                  scrollable
+                  v-model:window-size="waveTrendWindow"
+                  :window-options="WAVE_TREND_WINDOW_OPTIONS"
+                  axis-hint="纵轴为特码原值 1–49；实线只画本池各期真实特码；阴影带由相邻差值区间换算到特码轴（基准 = 最新特码，即 [最新−P75, 最新−P25]）。"
+                  empty-text="数据不足"
+                  empty-hint="本池至少要 2 期开奖记录才能连成预测波动线"
+                />
+                <!-- 图例：实线=各期特码；灰点=本池最新一期特码；虚线扇形+竖列点=本期候选（末端按真实特码值排布，非真实开奖） -->
+                <p class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-500">
+                  <span class="inline-flex items-center gap-1.5">
+                    <span class="h-0.5 w-4 rounded-full bg-aqua-300/80" aria-hidden="true" />
+                    实线 · 各期特码（1–49）
+                  </span>
+                  <span
+                    v-if="waveTrendChart.annotations.length"
+                    class="inline-flex items-center gap-1.5"
+                  >
+                    <span
+                      class="h-1.5 w-1.5 rounded-full bg-slate-300/90 ring-2 ring-slate-300/20"
+                      aria-hidden="true"
+                    />
+                    灰点 · 本池最新一期特码（纵轴即特码原值）
+                  </span>
+                  <span
+                    v-if="waveTrendChart.candidateColumn.length"
+                    class="inline-flex items-center gap-1.5"
+                  >
+                    <span
+                      class="h-0 w-4 border-t-2 border-dashed border-emerald-400/80"
+                      aria-hidden="true"
+                    />
+                    虚线扇形 · 本期候选（从最新一期拉出，末端按真实特码值 1–49 竖列排布；点色：绿=带内 / 粉=带外；非真实开奖）
+                  </span>
+                  <span v-else class="text-slate-600">
+                    生成财富密码后，候选号码会从最新一期拉出多条虚线，末端按真实特码值（1–49）竖列排成一列，看点就是分布（绿=带内 / 粉=带外）
+                  </span>
+                </p>
               </div>
 
               <div
@@ -1343,18 +1653,62 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               <p class="text-[11px] leading-relaxed text-slate-500">
                 {{ latticeBand.rule }}
                 高亮 = 带内；右上红点 = 本期推荐；左上金点 = 本池最新一期号码。
-                带外号码不会被排除，只是排序靠后、金额可能被降权压低。
+                带外号码不会被排除，只是抽样概率更低。
               </p>
             </template>
 
             <p v-else class="text-xs leading-relaxed text-slate-500">
-              数据不足：本池不足两期，无法估算预测波动线（按「无预测」处理，不编造中心与带宽）。
+              数据不足：本池不足两期，无法估算预测波动线（按「无预测」处理，不编造带宽）。
             </p>
           </GlassPanel>
         </MotionReveal>
 
+        <!-- 01 - 49 出现热度：本页为单列手机版式，直接整幅铺开（不用开奖页的 lg:grid-cols-3 / col-span-2 栅格） -->
+        <MotionReveal :index="7">
+          <GlassPanel padding="lg" rounded="3xl">
+            <div class="mb-4">
+              <h2 class="text-lg font-medium text-white">01 - 49 出现热度</h2>
+              <p class="text-xs text-slate-500">
+                同一个青色系里，颜色越深表示在所选期数里出现越多；
+                中性灰格表示暂时没有出现过。下方色阶标出每一档对应的出现次数。
+              </p>
+            </div>
+
+            <!-- 统计期数：仅本页展示状态，切换只重算下方网格，不写库、不改任何请求 -->
+            <div class="mb-4 space-y-2">
+              <div class="flex flex-wrap gap-2" role="group" aria-label="热度统计期数">
+                <button
+                  v-for="option in heatWindowOptions"
+                  :key="option"
+                  type="button"
+                  class="num min-h-[44px] min-w-[64px] rounded-xl border px-4 text-base font-medium transition-colors duration-200 select-none active:scale-[0.98]"
+                  :class="option === heatWindow
+                    ? 'border-aqua-400/60 bg-aqua-400/15 text-aqua-100'
+                    : 'border-white/10 bg-white/5 text-slate-300 active:bg-white/15'"
+                  :aria-pressed="option === heatWindow"
+                  @click="heatWindow = option"
+                >
+                  {{ option }}
+                </button>
+              </div>
+              <p class="text-[11px] leading-relaxed text-slate-500">{{ heatWindowCaption }}</p>
+            </div>
+
+            <HeatGrid
+              :cells="heatCells"
+              :columns="7"
+              tone="aqua"
+              :highlight="latestSampleNumber === null ? [] : [pad(latestSampleNumber)]"
+              legend
+              value-unit="次"
+              :legend-scope="heatScope"
+              empty-text="数据不足"
+            />
+          </GlassPanel>
+        </MotionReveal>
+
         <!-- 走势分布参考：默认折叠，完整三档仍可展开查阅（与卡片内点阵互补） -->
-        <MotionReveal v-if="result.trend_distributions" :index="7">
+        <MotionReveal v-if="result.trend_distributions" :index="8">
           <GlassPanel padding="lg" rounded="3xl" class="space-y-3">
             <button
               type="button"
@@ -1444,7 +1798,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
         </MotionReveal>
 
         <!-- 复制投注串 -->
-        <MotionReveal :index="8">
+        <MotionReveal :index="9">
           <GlassPanel padding="lg" rounded="3xl" class="space-y-3">
             <div class="flex flex-wrap items-center justify-between gap-2">
               <h2 class="text-lg font-medium text-white">投注串</h2>
@@ -1477,7 +1831,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
         </MotionReveal>
 
         <!-- 出票单（选号工具）：花费控制 · 号码卫生 · 覆盖透明 · 留痕复现 · 诚实披露 -->
-        <MotionReveal :index="9">
+        <MotionReveal :index="10">
           <GlassPanel variant="strong" padding="lg" rounded="3xl" class="space-y-4">
             <div class="flex flex-wrap items-center justify-between gap-2">
               <h2 class="text-lg font-medium text-white">出票单</h2>
@@ -1868,9 +2222,9 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
         </MotionReveal>
 
         <!-- 说明 -->
-        <MotionReveal v-if="result.notes.length" :index="10">
+        <MotionReveal v-if="(result.notes ?? []).length" :index="11">
           <GlassPanel variant="soft" padding="lg" rounded="3xl" class="space-y-1.5">
-            <p v-for="note in result.notes" :key="note" class="text-xs leading-relaxed text-slate-400">
+            <p v-for="note in (result.notes ?? [])" :key="note" class="text-xs leading-relaxed text-slate-400">
               · {{ note }}
             </p>
           </GlassPanel>

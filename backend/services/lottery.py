@@ -176,8 +176,23 @@ LATTICE_BAND_HIGH_Q = 0.75
 # 带外衰减尺度：离带边缘 d 个号位 → 权重 1 / (1 + d / LATTICE_DECAY_SCALE)
 LATTICE_DECAY_SCALE = 6.0
 
-# 近期走势加权（软偏好）。口径：本池近 W 期经验频率，不是真实概率；
-# 回测未证实相对随机有优势 —— notes / UI 禁止写「提高命中率」。
+# --------------------------------------------------------------------------- #
+# 近期走势加权（**已停用为选择权重**，仅保留展示 / 兼容）
+#
+# 变更（本版）：「近期走势加权去掉」。``trend_bias`` / ``trend_window`` /
+# ``trend_bias_explicit`` **继续被接受、继续被 clamp**（向后兼容旧配置与旧审计
+# 快照），但对选号 / 抽样 / 排序 / 金额**没有任何影响**（inert）—— 与三类软降权
+# 同一模式。选号只由 波浪配额(balanced) + 点阵概率分布 + 期号种子随机 决定。
+#
+# 仍然保留、仍然产出的是**展示字段**：``trend_distributions``（波动×角色频次带）、
+# ``trend_count`` / ``trend_note`` / ``number_frequency`` / ``trend_bias_label``。
+# ``trend_sampling_weight`` 恒返回 1.0；``order_pool`` 不再吃走势前缀；
+# 取号路径恒走「池首 / 配额内加权抽样」的 neutral 口径；
+# ``effective_trend_bias`` / ``resolve_trend_bias`` 恒回退 ``neutral``，
+# 写任何 ``trend_bias_explicit=True`` 都无法悄悄恢复加权。
+#
+# 口径提醒：近窗频次是本池经验频率，不是真实概率；notes / UI 禁止写「提高命中率」。
+# --------------------------------------------------------------------------- #
 TREND_BIAS_NEUTRAL = "neutral"
 TREND_BIAS_HOT = "hot"
 TREND_BIAS_COLD = "cold"
@@ -189,26 +204,26 @@ TREND_BIASES = [
     TREND_BIAS_MID,
 ]
 TREND_BIAS_LABELS = {
-    TREND_BIAS_NEUTRAL: "不加权（旧排序）",
-    TREND_BIAS_HOT: "近期频次加权（热号偏好）",
-    TREND_BIAS_COLD: "近期频次加权（冷号偏好）",
-    TREND_BIAS_MID: "近期频次加权（中频优先）",
+    TREND_BIAS_NEUTRAL: "不加权（已停用）",
+    TREND_BIAS_HOT: "热号偏好（已停用，仅展示）",
+    TREND_BIAS_COLD: "冷号偏好（已停用，仅展示）",
+    TREND_BIAS_MID: "中频优先（已停用，仅展示）",
 }
 # 角色带方向的白话说明（notes / 推送用）；必须与 _band_rank_prefix 的实际排序一致
+# （展示切片仍按偏好方向切；选号不再消费这些带）
 _BAND_ORDER_NOTE = {
     TREND_BIAS_HOT: "主推=最热段、次选=中段、防守=最冷段",
     TREND_BIAS_COLD: "主推=最冷段、次选=中段、防守=最热段",
     TREND_BIAS_MID: "主推=最接近中频段、次选=次接近段、防守=离中频最远段",
 }
 TREND_BIAS_PATTERN = "^(" + "|".join(TREND_BIASES) + ")$"
-# 0 = 用全部样本；默认 20（本池 6 注对照常用近窗，设置页首档）
+# 0 = 用全部样本；默认 20（仅影响走势分布参考展示，不影响选号）
 DEFAULT_TREND_WINDOW = 20
 TREND_WINDOW_MIN = 0
 TREND_WINDOW_MAX = 500
 # 「是否由用户**手动设置过**走势加权」的内部元数据键（落在 settings 表里）。
-# 背景：旧版本默认值是 TREND_BIAS_HOT，存量库里可能残留「不是用户主动选择」的 hot。
-# 读取时只有该标记为 True 才按存值生效；否则一律回退 neutral（不加权）。
-# 该键是内部标记，不进入对外设置契约（SettingsOut / 前端类型）。
+# 「走势加权去掉」后：``effective_trend_bias`` 恒回退 neutral，该标记不再能恢复加权；
+# 键仍被接受 / 写入（幂等兼容），不进入对外设置契约（SettingsOut / 前端类型）。
 TREND_BIAS_EXPLICIT_KEY = "trend_bias_explicit"
 
 # 选号策略：wave_round = 旧「每波动桶轮流取号」；score_top = 全候选打分取 Top-N。
@@ -419,7 +434,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "odds": DEFAULT_ODDS,
     # 避开重肖：默认关闭（同肖号可以入选）；旧数据缺失该字段时也回退为 False
     "exclude_repeat_zodiac": False,
-    # 走势加权：默认不加权；neutral=关闭，等同旧池内排序
+    # 走势加权：已停用为选择权重；默认 neutral，窗口仅影响展示
     "trend_bias": TREND_BIAS_NEUTRAL,
     "trend_window": DEFAULT_TREND_WINDOW,
     # 避冷加权（按**自然日**，会把冷号排到队尾 + 金额归 0）：默认关闭 ——
@@ -689,39 +704,34 @@ def clamp_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def effective_trend_bias(cfg: dict[str, Any] | None) -> str:
-    """**读取口径**：没手动设置过走势加权就不加权。
+    """**读取口径**：走势加权已停用 → 恒返回 ``neutral``。
 
-    存量库里存的 ``hot`` 是旧版本的默认值，并不代表用户主动选择；只要缺少
-    ``trend_bias_explicit=True``（用户在设置页手动改过才会写），不论存的是
-    hot/cold/mid 都按 ``neutral``（不加权，等同旧池内排序）生效。
-    取值非法同样回退 ``neutral``。
+    「近期走势加权去掉」后，不论库里存的是 hot/cold/mid、也不论
+    ``trend_bias_explicit`` 是否为 True，读取侧一律回退 ``neutral``。
+    参数被有意忽略 —— 结构上无法通过写库悄悄恢复加权（与
+    ``soft_penalty_weight`` 恒返回 1.0 同模式）。
     """
-    raw = cfg if isinstance(cfg, dict) else {}
-    bias = str(raw.get("trend_bias") or "").strip().lower()
-    if bias not in TREND_BIASES:
-        return TREND_BIAS_NEUTRAL
-    if not coerce_bool(raw.get(TREND_BIAS_EXPLICIT_KEY), default=False):
-        return TREND_BIAS_NEUTRAL
-    return bias
+    _ = cfg  # 显式忽略：任何存值 / 标记都无法恢复加权
+    return TREND_BIAS_NEUTRAL
 
 
 def resolve_trend_bias(cfg: dict[str, Any]) -> dict[str, Any]:
-    """对配置应用读取口径（只改 ``trend_bias``，其余字段原样返回）。"""
+    """对配置应用读取口径（只改 ``trend_bias`` → 恒 ``neutral``，其余字段原样）。"""
     return {**cfg, "trend_bias": effective_trend_bias(cfg)}
 
 
 def merge_settings_patch(
     current: dict[str, Any], patch: dict[str, Any]
 ) -> dict[str, Any]:
-    """把可写 patch 叠加到当前配置，并维护「手动设置过走势加权」标记。
+    """把可写 patch 叠加到当前配置，并维护走势加权兼容标记。
 
     - 只接受 ``DEFAULT_SETTINGS`` 里的键（``big_min`` 等派生字段永远写不进去）；
       避冷加权两项（``avoid_cold_enabled`` / ``avoid_cold_days``）同在
       ``DEFAULT_SETTINGS`` 内，因此由下面的通用循环原样接收（无需特殊分支）；
-    - 本次**显式提交** ``trend_bias``（非 None）→ 打上
-      ``trend_bias_explicit=True``，此后按用户选择生效；
-    - 未提交则沿用当前值：``current`` 已按读取口径解析过，存量遗留的 hot
-      在这里自然会落成 neutral（幂等自愈）。
+    - 本次**显式提交** ``trend_bias``（非 None）→ 仍打上
+      ``trend_bias_explicit=True``（兼容旧审计），但读取侧
+      ``effective_trend_bias`` 恒回退 neutral，**无法恢复加权**；
+    - 未提交则沿用当前值：``current`` 已按读取口径解析过，恒为 neutral。
     """
     merged = dict(current)
     for key, value in (patch or {}).items():
@@ -1362,17 +1372,17 @@ def order_pool(
 
     1. **避冷加权**（``avoid_cold_enabled``）：把 ``days_since_last`` 超过
        ``avoid_cold_days``（含从未出现 = ``None``）的号整体排到队列末尾。
-    2. 走势偏好（``trend_bias``）：``neutral`` 时为全历史遗漏优先（旧行为）。
-    3. 回落键：``(出现次数, 差值, 号码)``。
+    2. 回落键：``(出现次数, 差值, 号码)``（全历史遗漏优先）。
 
-    **变更（降权去除 + 点阵分布化）**：
-    - 不再接收 ``lattice_scores``：点阵已降级为**抽样概率分布**，不再当排序键
-      （它不再决定「谁先被取到」，只决定「谁更容易被抽到」）；
+    **变更（走势加权去掉 + 降权去除 + 点阵分布化）**：
+    - ``trend_bias`` / ``trend_counts`` / ``mid_target`` **被有意忽略**——
+      走势前缀不再进入排序键（与 ``trend_sampling_weight`` 恒 1.0 同模式）；
+      参数保留只为兼容旧调用方签名；
+    - 不再接收 ``lattice_scores``：点阵已降级为**抽样概率分布**，不再当排序键；
     - 不再接收 ``penalties``：三类软降权已降级为**信息标签**，
       且 ``soft_penalty_weight`` 恒返回 1.0 —— 结构与数值双重保证无法恢复降权。
     """
-    counts = trend_counts or Counter()
-    bias = trend_bias if trend_bias in TREND_BIASES else TREND_BIAS_NEUTRAL
+    _ = (trend_bias, trend_counts, mid_target)  # 走势加权已停用：显式忽略
     cold_enabled = bool(avoid_cold_enabled)
     cold_limit = _clamp_avoid_cold_days(avoid_cold_days)
     days_map = days_since_last or {}
@@ -1388,18 +1398,12 @@ def order_pool(
                 )
                 else 0,
             )
-        prefix = _trend_sort_prefix(
-            number,
-            bias=bias,
-            trend_counts=counts,
-            mid_target=mid_target,
-        )
         baseline = (
             history_counts.get(number, 0),
             item["diff"],
             item["number"],
         )
-        return (*cold_prefix, *prefix, *baseline)
+        return (*cold_prefix, *baseline)
 
     return sorted(pool, key=sort_key)
 
@@ -1546,27 +1550,15 @@ def trend_sampling_weight(
     trend_counts: Mapping[int, Any] | None,
     mid_target: float = 0.0,
 ) -> float:
-    """走势偏好 → **抽样概率倍数**（连续化；``neutral`` = 1.0）。
+    """**已停用**：恒返回 ``1.0`` —— 走势偏好参数被有意忽略。
 
-    与角色带同方向，但用于「加权抽样」而不是「确定性排序」：
-
-    - ``hot``：出现次数越多倍数越大 → ``1 + count``；
-    - ``cold``：出现次数越少倍数越大 → ``1 + (max_count − count)``；
-    - ``mid``：越接近中频倍数越大 → ``1 + 1 / (1 + |count − mid_target|)``。
-
-    这是**样本内偏好倍数**，不是概率，也不承诺提高命中率；倍数只取比值，
-    因此整体缩放不影响结果。``neutral`` / 未知取值一律 1.0（默认口径）。
+    「近期走势加权去掉」后，``hot`` / ``cold`` / ``mid`` 不再改变桶内抽样概率。
+    函数与签名保留只为兼容旧调用方与旧审计脚本；``bias`` / ``trend_counts`` /
+    ``mid_target`` / ``number`` 全部被显式忽略，因此写任何设置都无法悄悄恢复
+    走势加权（与 ``soft_penalty_weight`` 同模式）。
     """
-    if bias not in (TREND_BIAS_HOT, TREND_BIAS_COLD, TREND_BIAS_MID):
-        return 1.0
-    counts = trend_counts or {}
-    count = float(counts.get(int(number), 0))
-    if bias == TREND_BIAS_HOT:
-        return 1.0 + count
-    if bias == TREND_BIAS_COLD:
-        max_count = max((float(value) for value in counts.values()), default=0.0)
-        return 1.0 + max(0.0, max_count - count)
-    return 1.0 + 1.0 / (1.0 + abs(count - float(mid_target)))
+    _ = (number, bias, trend_counts, mid_target)
+    return 1.0
 
 
 def bucket_sampling_weight(
@@ -2351,14 +2343,11 @@ def recommend(
       同时用于生肖：参照日取 ``history_dates[0]``（本池最新一期开奖日）→ 农历年 →
       生肖表，给每注补上 ``zodiac`` / ``zodiac_label``（缺失则落 null，不猜年份）。
 
-    走势加权（``trend_bias`` / ``trend_window``）：
-    - 先按差值把候选分进小波动 / 常规 / 大跳三桶（阈值来自设置）；
-    - 每桶内按**该偏好**的近窗频次排序键切主推/次选/防守三段
-      （见 ``split_pool_into_role_bands``）：``hot`` → 主推=最热段，
-      ``cold`` → 主推=最冷段，``mid`` → 主推=最接近中频段；
-    - 选号时：该波动在侧重顺序里对应的角色，优先从该桶对应角色带取号；
-    - ``neutral`` 关闭加权，池内排序回退为旧的「全历史遗漏优先」，
-      且**不读** ``trend_window``（窗口只影响展示，不影响选号）。
+    走势加权（``trend_bias`` / ``trend_window``）—— **已停用为选择权重**：
+    - 设置键仍接受 / 回显；``trend_distributions`` / ``trend_count`` 等仍产出供对照；
+    - 选号 / 抽样 / 排序**恒按不加权口径**（``trend_sampling_weight`` 恒 1.0，
+      ``order_pool`` 不吃走势前缀，取号不走角色带偏好）；
+    - ``trend_window`` 只影响走势分布参考展示，不影响选号。
 
     避冷加权（``avoid_cold_enabled`` / ``avoid_cold_days``，与 ``trend_bias`` 独立）：
     - 候选池排序把冷号（``days_since_last`` 超过阈值，或样本内从未出现）整体排到队尾；
@@ -2467,15 +2456,8 @@ def recommend(
     cold_enabled = bool(cfg["avoid_cold_enabled"])
     cold_days = int(cfg["avoid_cold_days"])
 
-    def _is_cold_number(number: int) -> bool:
-        """该号是否为冷号（间隔 > 阈值，或样本内从未出现）。"""
-        return is_avoid_cold_number(
-            days_since_last.get(int(number)), enabled=True, threshold=cold_days
-        )
-
-    # 仅在开启时把判定函数交给取号逻辑（关闭时传 None → 严格 no-op）
-    cold_predicate: Any = _is_cold_number if cold_enabled else None
     # 中频目标：近窗内「出现过的号码」的平均次数；全空则 0
+    # （仅供走势分布参考 / score_top 遗留打分；seeded_random 默认路径不消费）
     mid_target = (
         sum(trend_counts.values()) / max(1, len(set(trend_counts)))
         if trend_counts
@@ -2508,6 +2490,8 @@ def recommend(
 
     # 走势分布参考：按**同一偏好**切频次三段（供 UI 分块展示；
     # 变更后与选号不再共用「点阵 / 软降权」前缀，点阵只作抽样概率分布）
+    # 走势分布参考（**仅展示**）：按设置里的偏好切频次三段，供 UI 分块对照；
+    # 「近期走势加权去掉」后不再参与取号（选号恒走 ordered_pools / 种子抽样）。
     trend_distributions = build_trend_distributions(
         pools,
         trend_counts,
@@ -2517,19 +2501,6 @@ def recommend(
         days_since_last=days_since_last,
         mid_target=mid_target,
     )
-    wave_bands = {
-        wave: split_pool_into_role_bands(
-            pools[wave],
-            trend_counts,
-            used_window,
-            days_since_last,
-            # 角色带按 trend_bias 定向：hot→最热段主推，cold→最冷段主推，
-            # mid→最接近中频段主推；neutral 不消费角色带
-            bias=trend_bias,
-            mid_target=mid_target,
-        )
-        for wave in WAVE_ORDER
-    }
 
     ordered_pools = {
         w: order_pool(
@@ -2618,66 +2589,26 @@ def recommend(
         def _take_one(wave: str, preferred_role: str | None = None) -> bool:
             """从该波动桶取一个号（返回是否取到）。
 
-            ``trend_bias`` 关闭时直接取池内第一个（池已按「避冷 → 遗漏」排好）；
-            开启时优先走指定角色对应的频次带，带内无可取号才回退池首。
+            「近期走势加权去掉」后恒取池内第一个（池已按「避冷 → 遗漏」排好）；
+            ``preferred_role`` / 角色带不再参与选号（参数保留仅兼容旧调用形）。
             """
+            _ = preferred_role  # 走势加权已停用：角色带偏好不再取号
             if not ordered_pools[wave]:
                 return False
-            if trend_bias == TREND_BIAS_NEUTRAL:
-                _annex_pick(wave, ordered_pools[wave][0])
-                return True
-            role = (
-                preferred_role
-                if preferred_role
-                else role_for_focus_rank(focus.index(wave))
-            )
-            band_item = take_from_role_band(
-                wave_bands[wave], role, used_numbers, is_cold=cold_predicate
-            )
-            if band_item is None:
-                _annex_pick(wave, ordered_pools[wave][0])
-                return True
-            _annex_pick(wave, band_item)
+            _annex_pick(wave, ordered_pools[wave][0])
             return True
 
         def _take_spread_one(wave: str, preferred_role: str | None = None) -> bool:
             """均衡分配 + ranked 专用：从该波动桶取**离已选号码最远**的一个号。
 
-            候选顺序与 ``_take_one`` 完全一致（``neutral`` = 池内既有排序；
-            加权时 = 偏好角色带优先，同带内同样按池内排序回落），只把
-            「取池首」换成「取最分散的一个」；并列时取池内靠前者，
-            因此仍然确定、可复现。``used_numbers`` 为空时等价于取池首。
+            「近期走势加权去掉」后候选恒为池内既有排序；只把「取池首」换成
+            「取最分散的一个」；并列时取池内靠前者，因此仍然确定、可复现。
+            ``used_numbers`` 为空时等价于取池首。``preferred_role`` 被忽略。
             """
+            _ = preferred_role  # 走势加权已停用：角色带偏好不再取号
             if not ordered_pools[wave]:
                 return False
-            if trend_bias == TREND_BIAS_NEUTRAL:
-                candidates = list(ordered_pools[wave])
-            else:
-                role = (
-                    preferred_role
-                    if preferred_role
-                    else role_for_focus_rank(focus.index(wave))
-                )
-                candidates = []
-                for role_name in [role] + [
-                    name for name in ROLE_ORDER if name != role
-                ]:
-                    group = [
-                        item
-                        for item in wave_bands[wave].get(role_name, [])
-                        if int(item["number"]) not in used_numbers
-                    ]
-                    if cold_predicate is not None and group:
-                        # 与 take_from_role_band 同口径：先在带内挑非冷号
-                        warm = [
-                            item for item in group if not cold_predicate(int(item["number"]))
-                        ]
-                        group = warm or group
-                    if group:
-                        candidates = group
-                        break
-                if not candidates:
-                    candidates = list(ordered_pools[wave])
+            candidates = list(ordered_pools[wave])
             index = pick_most_spread(
                 [int(item["number"]) for item in candidates], used_numbers
             )
@@ -2886,24 +2817,14 @@ def recommend(
     for item in missing_waves:
         notes.append(item["note"])
 
-    if trend_bias == TREND_BIAS_NEUTRAL:
-        notes.append(
-            "走势加权已关闭：池内仍按本池全历史遗漏优先排序（旧行为）；"
-            "下方「走势分布参考」仅供对照，未参与选号。"
-        )
-    else:
-        window_text = (
-            f"近{used_window}期"
-            if trend_window and trend_window > 0
-            else f"本池全部{used_window}期"
-        )
-        notes.append(
-            f"已按本池样本内{window_text}特码出现频次做"
-            f"「{TREND_BIAS_LABELS[trend_bias]}」："
-            f"各波动桶内按该偏好切主推/次选/防守三段"
-            f"（{_BAND_ORDER_NOTE.get(trend_bias, _BAND_ORDER_NOTE[TREND_BIAS_HOT])}）；"
-            "这是样本内加权偏好，不是真实概率，也不承诺提高命中率。"
-        )
+    # 近期走势加权：**已去除**，如实说明「只保留展示、不产生权重」
+    notes.append(
+        "近期走势加权已停用：``trend_bias`` / ``trend_window`` 不再改变选号、抽样或金额"
+        "（写入热号 / 冷号 / 中频偏好也不会恢复加权）；"
+        "池内排序仍按本池全历史遗漏优先（可叠加避冷排后）；"
+        "下方「走势分布参考」与每注 ``trend_count`` 仅供对照阅读。"
+        "这是样本内经验频率展示，不是真实概率，也不承诺提高命中率。"
+    )
 
     # 避冷加权：如实说明「选号排后 + 金额压顶」两条规则与口径，不做任何收益承诺
     if cold_enabled:

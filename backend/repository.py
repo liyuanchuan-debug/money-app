@@ -1037,7 +1037,8 @@ class PostgresStore(Store):
                         key,
                         json.dumps(merged[key]),
                     )
-        return merged
+        # 「近期走势加权去掉」：落库可暂存用户偏好键，读取侧恒 resolve 成 neutral
+        return resolve_trend_bias(merged)
 
     async def upsert_recommend_round(
         self, round_row: dict[str, Any]
@@ -1502,7 +1503,8 @@ class MemoryStore(Store):
         # 仅接受可写设置项；用户显式提交 trend_bias 时打上「手动设置过」标记
         merged = merge_settings_patch(current, patch)
         self._settings[target] = dict(merged)
-        return dict(merged)
+        # 与 PostgresStore 同口径：读取侧恒 resolve 成 neutral（走势加权已停用）
+        return resolve_trend_bias(merged)
 
     async def upsert_recommend_round(
         self, round_row: dict[str, Any]

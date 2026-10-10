@@ -1,18 +1,34 @@
 # 设置敏感度审计：这 30 个旋钮到底改变了什么
 
+## 近期走势加权去掉（2026-10-10）
+
+> 本节记录 **2026-10-10「近期走势加权去掉」**：与三类软降权同一模式——设置键保留、选号侧恒惰性。
+
+| 项 | 口径 |
+|---|---|
+| 停用键 | `trend_bias` / `trend_window` / `trend_bias_explicit` |
+| 选号影响 | **无**。`trend_sampling_weight` 恒 `1.0`；`order_pool` 不吃走势前缀；取号恒走池首 / 配额内点阵抽样；`effective_trend_bias` / `resolve_trend_bias` 恒回退 `neutral`（写 `explicit=True` 也无法恢复） |
+| 仍产出（仅展示） | `trend_distributions`（波动×角色频次带）、每注 `trend_count` / `trend_note`、`number_frequency`、`trend_bias_label` |
+| EV | **不变**（任意 K 个不同号命中概率仍为 K/49；单注期望仍 −2.0408 元/期） |
+| 默认 | 新用户 / `clamp_settings` → `trend_bias=neutral`，`trend_window=20`（窗口只改展示） |
+| 仍生效的权重 | 避冷加权（默认关）、角色金额配额（3:2:1）、波动桶配额、点阵抽样概率 |
+
+旧敏感度表里把 `trend_bias` / `trend_window` 标成 `ACTIVE` 的行**已作废**；需要刷新表格请重跑 `--markdown`。
+
 ## 种子随机 + 点阵分布：去降权后的新选号口径（2026-10-09）
 
 > 本节记录 **2026-10-09「降权去除 + 点阵分布化 + 期号种子随机」** 这一次选号口径变更；
 > 标题以下的表格是 **2026-10-07 旧口径** 的实测快照，用于对照。旧口径里被判为
 > `ACTIVE` 的 `repeat_number_weight` / `repeat_zodiac_weight` / `stale_weight`
 > 三行**已经作废**（现在三者恒为惰性），`lattice_window` 也不再单独换号（见下文）。
+> **2026-10-10 起** `trend_bias` / `trend_window` 同样恒为惰性（见上一节）。
 > 需要刷新表格请重跑 `--markdown`（注意：脚本只生成表格段，文末的手写分析需保留）。
 
 ### 1. 三处改动
 
 | # | 改动 | 具体口径 |
 |---|---|---|
-| 1 | **降权去除** | `repeat_number_weight` / `repeat_zodiac_weight` / `stale_weight` **不再参与任何排序、抽样与金额**。键仍被 `clamp_settings` 接受并原样回显（向后兼容），`soft_weight` 恒 `1.0`、`soft_penalized` 恒 `false`；`is_repeat_number` / `is_repeat_zodiac` / `is_stale` / `soft_reasons` / `periods_since_last` 与前端徽章**照旧如实产出**。保留的权重只有：走势加权、避冷加权、角色金额配额（3:2:1）与波动桶配额。 |
+| 1 | **降权去除** | `repeat_number_weight` / `repeat_zodiac_weight` / `stale_weight` **不再参与任何排序、抽样与金额**。键仍被 `clamp_settings` 接受并原样回显（向后兼容），`soft_weight` 恒 `1.0`、`soft_penalized` 恒 `false`；`is_repeat_number` / `is_repeat_zodiac` / `is_stale` / `soft_reasons` / `periods_since_last` 与前端徽章**照旧如实产出**。保留的权重（当时）：走势加权、避冷加权、角色金额配额（3:2:1）与波动桶配额。—— **2026-10-10 起走势加权亦已停用**。 |
 | 2 | **点阵只定义抽样概率** | `lattice_enabled` 默认重新开启（`DEFAULT_LATTICE_ENABLED = True`）。带内（`low ≤ \|n − latest\| ≤ high`）权重 `1.0`，带外 `1 / (1 + 距离/6)`。点阵**不再是排序键**：`wave_pass_order` 里以 `lattice_primary` 打头的门控路径已从 `recommend` 移除，`lattice_primary` 只剩展示用途。 |
 | 3 | **期号种子随机抽样** | 新增设置 `pick_sampling`（英文枚举）：`seeded_random`（默认，标签「种子随机（推荐：期号确定性抽样）」）｜ `ranked`（旧口径，标签「按名次（旧：确定性排序取号）」）。`wave_alloc="balanced"` 仍是形状骨架（非空桶按最大余数均分，10 注 → 4/3/3），随机只发生在**每个桶的配额之内**。`wave_alloc="drain"` 保留为历史审计复现路径。 |
 

@@ -40,11 +40,10 @@ export interface LotterySettings {
   role_w_defense: number
   /**
    * 近期走势加权：neutral|hot|cold|mid。
-   * 读取口径：没在设置页手动设置过就是 neutral（不加权），
-   * 旧版本残留的 hot 也不会自动生效。
+   * 已停用为选择权重：读取侧恒按 neutral 选号；键仍可保存，仅影响走势分布参考展示。
    */
   trend_bias: TrendBias
-  /** 近窗期数；0=全部样本；默认 30 */
+  /** 近窗期数；0=全部样本；默认 20；仅影响走势分布参考展示 */
   trend_window: number
   /**
    * 避冷加权：True=距上次出现超过 avoid_cold_days 天的号权重递减、金额递减；
@@ -731,12 +730,12 @@ function evenUnits(units: number, count: number): number[] {
   return Array.from({ length: noteCount }, (_, i) => base + (i < rem ? 1 : 0))
 }
 
-/** 走势加权取值表（设置页持久化；财富密码页可临时预览）；默认 neutral */
+/** 走势加权取值表（已停用为选择权重；仅影响走势分布参考展示）；默认 neutral */
 export const TREND_BIAS_OPTIONS: TrendBiasOption[] = [
   { value: 'neutral', label: '不加权' },
-  { value: 'hot', label: '热号偏好' },
-  { value: 'mid', label: '中频优先' },
-  { value: 'cold', label: '冷号偏好' },
+  { value: 'hot', label: '热号（仅展示）' },
+  { value: 'mid', label: '中频（仅展示）' },
+  { value: 'cold', label: '冷号（仅展示）' },
 ]
 
 /** 走势近窗档位（0 = 全部）；含近 20 期（本池 6 注对照常用档） */
