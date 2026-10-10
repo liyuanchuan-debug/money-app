@@ -192,6 +192,27 @@ def test_add_draw_rejects_period_conflict(monkeypatch):
         asyncio.run(scenario())
 
 
+def test_add_draw_same_day_cannot_change_period(monkeypatch):
+    """同一天再报**另一个**期号必须报错：否则那一天的旧期号会被静默顶掉。
+
+    回归线上「首页走势少了一期 282」：2026-10-10 那一行先是 282（特码 23），
+    再报 283（特码 18）时被改成 283 —— ``draws`` 只对 ``draw_date`` 建了唯一索引，
+    被覆盖的 282 在库里不留任何痕迹，走势图上就直接少一期。
+    """
+    monkeypatch.setattr(repository, "today_local", lambda: FIXED_TODAY)
+    store = _seed_store(periods_dates=[(281, FIXED_TODAY)], specials=[10])
+
+    async def scenario():
+        await store.add_draw(23, period=282, draw_date=FIXED_TODAY)
+
+    with pytest.raises(ValueError, match="期号 282"):
+        asyncio.run(scenario())
+
+    draws = asyncio.run(store.list_draws())
+    assert [draw["period"] for draw in draws] == [281]  # 旧期号没被顶掉
+    assert draws[0]["special_number"] == 10
+
+
 # --------------------------------------------------------------------------- #
 # 3. HTTP：快捷录入
 # --------------------------------------------------------------------------- #

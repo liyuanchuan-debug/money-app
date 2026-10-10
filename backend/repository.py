@@ -510,7 +510,9 @@ def plan_quick_draw(
 
     - ``draw_date`` 缺省 → 今天（UTC+8）；``period`` 缺省 → max(period) + 1；
     - **日期是主键**：同一天重复提交视为「修正」，只更新那一行，且不打乱它的期号
-      （用户连点两次保存不会变成两期，也不会把期号 +1）；
+      （用户连点两次保存不会变成两期，也不会把期号 +1）；同一天若显式给了**另一个**
+      期号则视为冲突并抛 ``ValueError`` —— 否则会把这一天原有的那一期静默顶掉
+      （旧版正是这样丢掉期号的：282 被 283 覆盖，走势图上就少了一期）；
     - 日期没命中、但显式给了期号且该期号已存在 → 同样视为修正（更新那一行）；
       此时若调用方**没有**指定日期，保留那一期原有的日期（不把历史开奖搬成今天）；
     - 都没命中 → 新增；
@@ -530,9 +532,19 @@ def plan_quick_draw(
     )
     if date_row is not None:
         target = date_row
-        resolved_period = (
-            explicit_period if explicit_period is not None else int(date_row["period"])
-        )
+        existing_period = int(date_row["period"])
+        if explicit_period is not None and explicit_period != existing_period:
+            # 日期是主键：同一天已有一期时不得再改它的期号。
+            # 旧版会照着 explicit_period 去 UPDATE，等于把这一天原有的那一期
+            # 「改名」抹掉（draws 只对 draw_date 建了唯一索引，被覆盖的期号不留痕）——
+            # 用户投诉的「首页走势少了一期 282」就是这样发生的：282 被 283 顶掉。
+            # 这里如实报冲突，交由用户先删除 / 修正该日期的那一期，绝不静默换号。
+            raise ValueError(
+                f"期号 {explicit_period} 与日期 {resolved_date} 上已有的第 "
+                f"{existing_period} 期冲突：同一天不能改期号（会丢掉第 "
+                f"{existing_period} 期）"
+            )
+        resolved_period = existing_period
     elif explicit_period is not None:
         target = next((r for r in rows if int(r["period"]) == explicit_period), None)
         resolved_period = explicit_period
