@@ -24,6 +24,12 @@ export default defineNuxtConfig({
   compatibilityDate: '2024-11-01',
   devtools: { enabled: true },
 
+  // 默认有时只听 ::1，浏览器访问 127.0.0.1:3000 会失败；显式绑 IPv4 本机
+  devServer: {
+    host: '127.0.0.1',
+    port: 3000,
+  },
+
   modules: ['@nuxtjs/tailwindcss'],
 
   // 组件命名：不按目录加前缀，这样 components/charts/LineChart.vue 直接是 <LineChart>

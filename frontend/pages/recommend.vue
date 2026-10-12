@@ -111,6 +111,59 @@ if (typeof settings.value?.trend_window === 'number') {
   trendWindow.value = settings.value.trend_window
 }
 
+/** 热度网格生肖：农历年映射与本池最新一期开奖日同源（只读表，不写库） */
+const zodiacTableDate = computed(
+  () => normalizeDraws(rawDraws.value)[0]?.draw_date ?? '',
+)
+const { data: heatZodiacTable } = await useAsyncData(
+  () => `recommend-heat-zodiac-${zodiacTableDate.value}`,
+  () =>
+    zodiacTableDate.value
+      ? api.zodiacTable(zodiacTableDate.value)
+      : Promise.resolve(null),
+  { watch: [zodiacTableDate] },
+)
+
+function parseDrawDayUtc(iso: string): number | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso).trim())
+  if (!match) return null
+  return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]))
+}
+
+/** 本池已加载样本内：各号距最近一次出现的自然日（最新一期开奖日为锚点） */
+const heatDaysSinceLastByNumber = computed(() => {
+  const newestFirst = normalizeDraws(rawDraws.value)
+  const map = new Map<number, number | null>()
+  for (let n = 1; n <= 49; n += 1) map.set(n, null)
+  const anchorMs = newestFirst[0]?.draw_date
+    ? parseDrawDayUtc(newestFirst[0].draw_date)
+    : null
+  if (anchorMs == null) return map
+  for (let i = 0; i < newestFirst.length; i += 1) {
+    const num = newestFirst[i].special_number
+    if (map.get(num) !== null) continue
+    const dayMs = parseDrawDayUtc(newestFirst[i].draw_date ?? '')
+    if (dayMs == null) continue
+    map.set(num, Math.max(0, Math.round((anchorMs - dayMs) / 86_400_000)))
+  }
+  return map
+})
+
+function heatDaysSinceShort(days: number | null | undefined): string {
+  if (days == null || !Number.isFinite(days)) return '未出'
+  if (days <= 0) return '今日'
+  return `${Math.trunc(days)} 天`
+}
+
+const heatZodiacLabelByNumber = computed(() => {
+  const map = new Map<number, string>()
+  for (const row of heatZodiacTable.value?.numbers ?? []) {
+    const label = row.zodiac_label?.trim()
+    if (label) map.set(row.number, label)
+  }
+  return map
+})
+
 /* ---------------------------------------------------------------------- */
 /* 出票单（选号工具）的状态                                              */
 /*                                                                        */
@@ -378,16 +431,39 @@ const heatCounts = computed(() => {
   return map
 })
 
-/** 01 - 49 固定 49 格；一次都没出现过的号码给 0（组件按零值档渲染中性灰） */
-const heatCells = computed(() =>
-  Array.from({ length: 49 }, (_, index) => {
+/** 01 - 49 固定 49 格；格内附带生肖、距上次出现；本期推荐号码由 HeatGrid marked 角标「预」标识 */
+const heatCells = computed(() => {
+  const lat = result.value?.lattice
+  const bandSet = new Set(
+    lat?.enabled && lat.band
+      ? (lat.numbers ?? []).filter(row => row.in_band).map(row => pad(row.number))
+      : [],
+  )
+  return Array.from({ length: 49 }, (_, index) => {
     const number = index + 1
+    const padded = pad(number)
+    const count = heatCounts.value.get(number) ?? 0
+    const zodiac = heatZodiacLabelByNumber.value.get(number) ?? ''
+    const days = heatDaysSinceLastByNumber.value.get(number)
+    const omitShort = heatDaysSinceShort(days)
+    const inBand = bandSet.has(padded)
+    let hint = `所选期数内特码出现 ${count} 次`
+    if (zodiac) hint += ` · 生肖 ${zodiac}`
+    hint += ` · 距上次 ${avoidColdDaysText(days)}`
+    if (inBand) hint += ' · 预测波动带内'
     return {
-      number: pad(number),
-      value: heatCounts.value.get(number) ?? 0,
-      hint: '所选期数内特码出现次数',
+      number: padded,
+      value: count,
+      label: zodiac || undefined,
+      sublabel: omitShort,
+      hint,
     }
-  }),
+  })
+})
+
+/** 本期推荐号码（热度网格角标「预」；与 result.picks 一致，约 bet_count 注） */
+const heatPickMarkedNumbers = computed(() =>
+  (result.value?.picks ?? []).map(pick => pad(pick.number)),
 )
 
 /** 图例口径随所选窗口走，保证图例与格子永不打架（只描述样本内计数，无预测含义） */
@@ -650,9 +726,6 @@ const latticeBand = computed(() => lattice.value?.band ?? null)
 const latticeNumbers = computed(() => lattice.value?.numbers ?? [])
 /** 落在预测带内的号数（带内 / 合计分开计数，如实展示） */
 const inBandCount = computed(() => latticeNumbers.value.filter(cell => cell.in_band).length)
-/** 本期推荐号码集合（点阵上打标用；不参与任何选号判定） */
-const pickedNumbers = computed(
-  () => new Set((result.value?.picks ?? []).map(pick => pick.number)))
 /** 本期推荐里落在预测带内的注数 */
 const pickedInBandCount = computed(
   () => (result.value?.picks ?? []).filter(pick => pick.in_lattice_band).length)
@@ -786,16 +859,6 @@ const waveTrendChart = computed(() => {
     pointCount: specialValues.length,
   }
 })
-
-/**
- * 点阵单元格透明度：带内 lattice_weight=1.0 最实，带外按距离衰减变淡。
- * 只影响观感，不改变任何口径。
- */
-function latticeCellStyle(cell: { lattice_weight?: number }): Record<string, string> {
-  const weight = cell.lattice_weight ?? 1
-  const opacity = 0.4 + Math.max(0, Math.min(1, weight)) * 0.6
-  return { opacity: opacity.toFixed(2) }
-}
 
 /**
  * 切换筹码模式 / 注数 / 走势加权 = 只重算本页（临时预览）。
@@ -1509,7 +1572,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 <p class="text-xs leading-relaxed text-slate-500">
                   折线按本池各期特码原值（1–49）绘制；阴影带由相邻差值波动区间 P25~P75 换算到特码轴
                   （基准 = 最新特码，即 [最新−P75, 最新−P25]，超出 1–49 按边界截断）—— 是差值区间
-                  的换算，不是独立的特码分布。下方点阵标出带内号码。口径：样本内经验分布，非概率。
+                  的换算，不是独立的特码分布。口径：样本内经验分布，非概率。
                 </p>
               </div>
               <StatChip :tone="lattice.enabled ? 'aqua' : 'neutral'" size="sm">
@@ -1614,47 +1677,6 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   </span>
                 </p>
               </div>
-
-              <div
-                class="grid grid-cols-7 gap-1.5 sm:gap-2"
-                role="list"
-                aria-label="1 到 49 号码点阵"
-              >
-                <div
-                  v-for="cell in latticeNumbers"
-                  :key="cell.number"
-                  role="listitem"
-                  class="relative flex flex-col items-center justify-center rounded-xl px-1 py-1.5 text-center ring-1"
-                  :class="cell.in_band
-                    ? 'bg-aqua-400/15 text-aqua-100 ring-aqua-300/50'
-                    : 'bg-white/[0.04] text-slate-300 ring-white/10'"
-                  :style="latticeCellStyle(cell)"
-                  :title="`${pad(cell.number)} · 差值 |${cell.diff}| · ${cell.wave_label}${cell.in_band ? ' · 预测带内' : ' · 预测带外'}`"
-                >
-                  <span class="num text-[13px] font-semibold tabular-nums">
-                    {{ pad(cell.number) }}
-                  </span>
-                  <span class="num text-[9px] tabular-nums opacity-70">|{{ cell.diff }}|</span>
-                  <!-- 右上角：本期推荐号码（不参与任何判定，只是打标） -->
-                  <span
-                    v-if="pickedNumbers.has(cell.number)"
-                    class="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-bloom-400 ring-2 ring-slate-950"
-                    aria-hidden="true"
-                  />
-                  <!-- 左上角：本池最新一期号码 -->
-                  <span
-                    v-if="cell.is_latest"
-                    class="absolute -left-1 -top-1 h-2 w-2 rounded-full bg-amber-300 ring-2 ring-slate-950"
-                    aria-hidden="true"
-                  />
-                </div>
-              </div>
-
-              <p class="text-[11px] leading-relaxed text-slate-500">
-                {{ latticeBand.rule }}
-                高亮 = 带内；右上红点 = 本期推荐；左上金点 = 本池最新一期号码。
-                带外号码不会被排除，只是抽样概率更低。
-              </p>
             </template>
 
             <p v-else class="text-xs leading-relaxed text-slate-500">
@@ -1670,7 +1692,9 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               <h2 class="text-lg font-medium text-white">01 - 49 出现热度</h2>
               <p class="text-xs text-slate-500">
                 同一个青色系里，颜色越深表示在所选期数里出现越多；
-                中性灰格表示暂时没有出现过。下方色阶标出每一档对应的出现次数。
+                中性灰格表示暂时没有出现过。格内第二行是生肖、第三行是距上次出现天数（本池已加载样本）；
+                绿色描边与右上角「预」角标表示本期推荐号码（约 {{ result.picks.length }} 注），与上方候选列表一致。
+                最亮 aqua 圈仍为最新一期特码。下方色阶标出每一档对应的出现次数。
               </p>
             </div>
 
@@ -1698,7 +1722,9 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               :cells="heatCells"
               :columns="7"
               tone="aqua"
+              show-labels
               :highlight="latestSampleNumber === null ? [] : [pad(latestSampleNumber)]"
+              :marked="heatPickMarkedNumbers"
               legend
               value-unit="次"
               :legend-scope="heatScope"

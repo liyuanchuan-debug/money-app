@@ -38,6 +38,8 @@ interface HeatCell {
   value: number
   /** 次级标签（可放生肖等） */
   label?: string
+  /** 第三行短文案（如距上次出现天数） */
+  sublabel?: string
   /** 悬停 / 点按提示里的补充说明 */
   hint?: string
 }
@@ -56,6 +58,8 @@ const props = withDefaults(
     showLabels?: boolean
     /** 高亮某几格（如最新一期） */
     highlight?: Array<number | string>
+    /** 次要标识（如本期预测号码；角标「预」+ 绿色描边，与最新一期 aqua 高亮可并存） */
+    marked?: Array<number | string>
     /** 格子间距（viewBox 单位） */
     gap?: number
     /** 是否显示色阶图例（含点按读数）；默认关，避免影响未打开它的调用方布局 */
@@ -75,6 +79,7 @@ const props = withDefaults(
     showNumbers: true,
     showLabels: false,
     highlight: () => [],
+    marked: () => [],
     gap: 6,
     legend: false,
     valueUnit: '',
@@ -145,13 +150,37 @@ interface Cell {
   y: number
   number: number | string
   label?: string
+  sublabel?: string
+  /** 生肖 · 天数，单行副标 */
+  caption: string
   hint?: string
   value: number
   level: number
   isTop: boolean
   isHighlighted: boolean
-  showLabel: boolean
+  isMarked: boolean
+  showMeta: boolean
 }
+
+/**
+ * 格内排版：号码是唯一主视觉；生肖 + 天数合成一行副标，避免三行硬堆。
+ * 字号随格子等比，但刻意留白（号码约 26%），比「撑满格子」更干净。
+ */
+const FONT_STACK =
+  'ui-sans-serif, system-ui, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Noto Sans SC", sans-serif'
+
+const typeScale = computed(() => {
+  const size = cellSize.value
+  return {
+    number: Math.max(15, Math.round(size * 0.26)),
+    caption: Math.max(9, Math.round(size * 0.125)),
+    badgeW: Math.max(24, Math.round(size * 0.28)),
+    badgeH: Math.max(19, Math.round(size * 0.22)),
+    badgeFont: Math.max(11, Math.round(size * 0.155)),
+    padX: size * 0.12,
+    ruleY: size * 0.58,
+  }
+})
 
 const layout = computed<Cell[]>(() =>
   props.cells.map((cell, index) => {
@@ -159,18 +188,25 @@ const layout = computed<Cell[]>(() =>
     const row = Math.floor(index / columnCount.value)
     const value = values.value[index] ?? 0
     const level = heatBinLevel(scale.value, value)
+    const showMeta = props.showLabels && cellSize.value >= 34
+    const label = cell.label?.trim() || ''
+    const sublabel = cell.sublabel?.trim() || ''
+    const caption = [label, sublabel].filter(Boolean).join(' · ')
     return {
       index,
       x: column * (cellSize.value + gap.value),
       y: row * (cellSize.value + gap.value),
       number: cell.number,
-      label: cell.label,
+      label,
+      sublabel,
+      caption,
       hint: cell.hint,
       value,
       level,
       isTop: level > 0 && level === maxLevel.value,
       isHighlighted: props.highlight.some(item => String(item) === String(cell.number)),
-      showLabel: props.showLabels && cellSize.value >= 34,
+      isMarked: props.marked.some(item => String(item) === String(cell.number)),
+      showMeta: showMeta && Boolean(caption),
     }
   }),
 )
@@ -181,7 +217,20 @@ function cellFill(cell: Cell) {
 }
 
 function cellText(cell: Cell) {
-  return (binByLevel.value.get(cell.level) ?? bins.value[0])?.text ?? 'rgba(148, 163, 184, 0.6)'
+  return (binByLevel.value.get(cell.level) ?? bins.value[0])?.text ?? 'rgba(226, 232, 240, 0.88)'
+}
+
+/** 亮档号码用深墨（#05060f）；副标 / 分隔线随同一套明暗走，不另起色相 */
+function usesDarkInk(cell: Cell) {
+  return cellText(cell) === '#05060f'
+}
+
+function captionFill(cell: Cell) {
+  return usesDarkInk(cell) ? 'rgba(5, 6, 15, 0.75)' : 'rgba(241, 245, 249, 0.88)'
+}
+
+function ruleStroke(cell: Cell) {
+  return usesDarkInk(cell) ? 'rgba(5, 6, 15, 0.12)' : 'rgba(255, 255, 255, 0.12)'
 }
 
 /**
@@ -191,7 +240,25 @@ function cellText(cell: Cell) {
  */
 function cellStroke(cell: Cell) {
   if (cell.isHighlighted) return 'rgba(161, 241, 255, 0.95)'
+  if (cell.isMarked) return 'rgba(52, 211, 153, 0.88)'
   return (binByLevel.value.get(cell.level) ?? bins.value[0])?.stroke ?? 'rgba(255, 255, 255, 0.10)'
+}
+
+function cellStrokeWidth(cell: Cell) {
+  if (cell.isHighlighted) return 2.2
+  if (cell.isMarked) return 2
+  if (focusIndex.value === cell.index) return 2.2
+  return 1.1
+}
+
+function numberTextY(cell: Cell) {
+  const size = cellSize.value
+  if (!cell.showMeta) return cell.y + size * 0.52
+  return cell.y + size * 0.36
+}
+
+function captionTextY(cell: Cell) {
+  return cell.y + cellSize.value * 0.76
 }
 
 /** 悬停（桌面）：只影响提示气泡 */
@@ -216,6 +283,7 @@ const hoverInfo = computed(() => {
     number: cell.number,
     value: cell.value,
     label: cell.label,
+    sublabel: cell.sublabel,
     hint: cell.hint,
   }
 })
@@ -265,8 +333,33 @@ const gridLabel = computed(
             rx="8"
             :fill="cellFill(cell)"
             :stroke="cellStroke(cell)"
-            :stroke-width="focusIndex === cell.index || cell.isHighlighted ? 2.2 : 1.1"
+            :stroke-width="cellStrokeWidth(cell)"
           />
+          <!-- 本期预测：右上角「预」角标（与最新一期 aqua 整圈高亮可同时存在） -->
+          <g v-if="cell.isMarked">
+            <rect
+              :x="cell.x + cellSize - typeScale.badgeW"
+              :y="cell.y"
+              :width="typeScale.badgeW"
+              :height="typeScale.badgeH"
+              rx="4"
+              fill="rgba(52, 211, 153, 0.94)"
+              stroke="rgba(6, 18, 28, 0.38)"
+              stroke-width="0.85"
+            />
+            <text
+              :x="cell.x + cellSize - typeScale.badgeW / 2"
+              :y="cell.y + typeScale.badgeH / 2"
+              text-anchor="middle"
+              dominant-baseline="middle"
+              :font-family="FONT_STACK"
+              font-weight="700"
+              :font-size="typeScale.badgeFont"
+              fill="rgba(6, 18, 28, 0.92)"
+            >
+              预
+            </text>
+          </g>
           <!-- 顶部内高光：琉璃格 -->
           <rect
             :x="cell.x + 2"
@@ -276,26 +369,45 @@ const gridLabel = computed(
             rx="0.6"
             fill="rgba(255, 255, 255, 0.22)"
           />
+          <!-- 号码 / 副标分隔细线：有副标时才画，避免三行硬堆 -->
+          <line
+            v-if="cell.showMeta"
+            :x1="cell.x + typeScale.padX"
+            :y1="cell.y + typeScale.ruleY"
+            :x2="cell.x + cellSize - typeScale.padX"
+            :y2="cell.y + typeScale.ruleY"
+            :stroke="ruleStroke(cell)"
+            stroke-width="1"
+            stroke-linecap="round"
+          />
           <text
             v-if="props.showNumbers"
             :x="cell.x + cellSize / 2"
-            :y="cell.y + cellSize / 2 + (cell.showLabel ? -1 : 4)"
+            :y="numberTextY(cell)"
             text-anchor="middle"
-            font-size="12"
+            dominant-baseline="middle"
+            :font-family="FONT_STACK"
+            font-weight="600"
+            letter-spacing="0.04em"
+            :font-size="typeScale.number"
             :fill="cellText(cell)"
-            class="num"
+            style="font-variant-numeric: tabular-nums"
           >
             {{ cell.number }}
           </text>
           <text
-            v-if="cell.showLabel && cell.label"
+            v-if="cell.showMeta"
             :x="cell.x + cellSize / 2"
-            :y="cell.y + cellSize / 2 + 12"
+            :y="captionTextY(cell)"
             text-anchor="middle"
-            font-size="8.5"
-            fill="rgba(203, 213, 225, 0.6)"
+            dominant-baseline="middle"
+            :font-family="FONT_STACK"
+            font-weight="500"
+            letter-spacing="0.02em"
+            :font-size="typeScale.caption"
+            :fill="captionFill(cell)"
           >
-            {{ cell.label }}
+            {{ cell.caption }}
           </text>
           <rect
             :x="cell.x"
@@ -319,6 +431,7 @@ const gridLabel = computed(
         <p class="text-slate-400">
           {{ hoverInfo.number }}
           <span v-if="hoverInfo.label">· {{ hoverInfo.label }}</span>
+          <span v-if="hoverInfo.sublabel">· {{ hoverInfo.sublabel }}</span>
         </p>
         <p class="num text-sm text-slate-100">{{ hoverInfo.value }}{{ props.valueUnit }}</p>
         <p v-if="hoverInfo.hint" class="mt-0.5 text-[10px] text-slate-500">{{ hoverInfo.hint }}</p>
