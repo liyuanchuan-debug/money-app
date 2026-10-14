@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS draws (
 );
 
 CREATE INDEX IF NOT EXISTS idx_draws_draw_date ON draws (draw_date DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_draws_period ON draws (period);
 
 -- 财富密码采用快照：每用户每目标期一条；开奖后回填 hit / 兑付 / 盈亏
 -- stake_mode：SIMULATED（模拟买入，默认）| REAL（真实买入）| SKIPPED（未买）

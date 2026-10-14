@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import logging
 from abc import ABC, abstractmethod
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from db import database_url, init_pool
@@ -139,6 +139,8 @@ SCHEMA_STATEMENTS = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_draws_draw_date ON draws (draw_date DESC)",
+    # 期号也必须唯一：同一天录入下一期时不得「改名」覆盖旧期号
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_draws_period ON draws (period)",
     # 农历年生肖边界表（生肖随农历年轮转，01 号所属生肖每年不同）
     """
     CREATE TABLE IF NOT EXISTS zodiac_years (
@@ -277,6 +279,11 @@ class Store(ABC):
         ...
 
     @abstractmethod
+    async def suggest_next_draw_date(self) -> date:
+        """建议的下一期开奖日：今天起第一个尚未占用的日期（UTC+8）。"""
+        ...
+
+    @abstractmethod
     async def add_draw(
         self,
         special_number: int,
@@ -289,8 +296,8 @@ class Store(ABC):
         - 先按 ``draw_date`` 找同一条（同一天的重复提交 = 修正），
           没找到再按显式给出的 ``period`` 找，都没有才 INSERT。命中即 UPDATE，
           因此用户改错号码 / 期号不会产生重复行。
-        - 唯一约束只有 ``draws.draw_date``；为防歧义，本方法额外保证期号不重复，
-          冲突时抛 ``ValueError``（路由转 400）。
+        - ``draws.draw_date`` 与 ``period`` 均唯一；同一天再录**新期号**时自动顺延
+          到下一个空闲日期并 INSERT，绝不把旧期号改名顶掉。
         """
         ...
 
@@ -498,6 +505,17 @@ def next_period_from_draws(draws: list[dict[str, Any]]) -> int:
     return max(periods) + 1 if periods else 1
 
 
+def next_free_draw_date(
+    draws: list[dict[str, Any]], start: date | None = None
+) -> date:
+    """从 ``start``（默认今天 UTC+8）起找第一个尚未被占用的开奖日。"""
+    used = {_as_date(row["draw_date"]) for row in draws if row.get("draw_date") is not None}
+    candidate = start if start is not None else today_local()
+    while candidate in used:
+        candidate += timedelta(days=1)
+    return candidate
+
+
 def plan_quick_draw(
     rows: list[dict[str, Any]],
     special_number: Any,
@@ -509,15 +527,15 @@ def plan_quick_draw(
     语义（与用户约定一致，两种存储行为完全一致）：
 
     - ``draw_date`` 缺省 → 今天（UTC+8）；``period`` 缺省 → max(period) + 1；
-    - **日期是主键**：同一天重复提交视为「修正」，只更新那一行，且不打乱它的期号
-      （用户连点两次保存不会变成两期，也不会把期号 +1）；同一天若显式给了**另一个**
-      期号则视为冲突并抛 ``ValueError`` —— 否则会把这一天原有的那一期静默顶掉
-      （旧版正是这样丢掉期号的：282 被 283 覆盖，走势图上就少了一期）；
+    - **同一天重复提交（同日期、未要求换期号）**视为「修正」：只更新那一行的特码，
+      不打乱期号（连点两次保存不会变成两期）；
+    - **同一天再录另一个期号**（录入页保存后预填下一期再继续录）→ **绝不覆盖**：
+      自动顺延到下一个空闲日期并 INSERT。旧版会 UPDATE 把旧期号改名抹掉
+      （例：285/特码19 被改成 286/特码24，上一期号码从库里消失）；
     - 日期没命中、但显式给了期号且该期号已存在 → 同样视为修正（更新那一行）；
       此时若调用方**没有**指定日期，保留那一期原有的日期（不把历史开奖搬成今天）；
     - 都没命中 → 新增；
-    - 期号在此强制唯一（DB 只对 ``draw_date`` 建了唯一索引），否则「按日期 /
-      按期号修正」会产生歧义；冲突时抛 ``ValueError``（路由转 400）。
+    - 期号 / 日期均强制唯一；冲突时抛 ``ValueError``（路由转 400）。
     """
     special = int(special_number)
     if not 1 <= special <= 49:
@@ -531,20 +549,25 @@ def plan_quick_draw(
         (r for r in rows if _as_date(r["draw_date"]) == resolved_date), None
     )
     if date_row is not None:
-        target = date_row
         existing_period = int(date_row["period"])
         if explicit_period is not None and explicit_period != existing_period:
-            # 日期是主键：同一天已有一期时不得再改它的期号。
-            # 旧版会照着 explicit_period 去 UPDATE，等于把这一天原有的那一期
-            # 「改名」抹掉（draws 只对 draw_date 建了唯一索引，被覆盖的期号不留痕）——
-            # 用户投诉的「首页走势少了一期 282」就是这样发生的：282 被 283 顶掉。
-            # 这里如实报冲突，交由用户先删除 / 修正该日期的那一期，绝不静默换号。
-            raise ValueError(
-                f"期号 {explicit_period} 与日期 {resolved_date} 上已有的第 "
-                f"{existing_period} 期冲突：同一天不能改期号（会丢掉第 "
-                f"{existing_period} 期）"
+            period_row = next(
+                (r for r in rows if int(r["period"]) == explicit_period), None
             )
-        resolved_period = existing_period
+            if period_row is not None:
+                raise ValueError(
+                    f"期号 {explicit_period} 已被 {_as_date(period_row['draw_date'])} "
+                    f"占用；日期 {resolved_date} 已被第 {existing_period} 期占用"
+                )
+            # 新期号撞上已有日期：顺延日期后 INSERT，保留旧期（含其特码）
+            target = None
+            resolved_period = explicit_period
+            resolved_date = next_free_draw_date(
+                rows, resolved_date + timedelta(days=1)
+            )
+        else:
+            target = date_row
+            resolved_period = existing_period
     elif explicit_period is not None:
         target = next((r for r in rows if int(r["period"]) == explicit_period), None)
         resolved_period = explicit_period
@@ -757,6 +780,11 @@ class PostgresStore(Store):
         async with self._pool.acquire() as conn:
             value = await conn.fetchval("SELECT MAX(period) FROM draws")
         return int(value) + 1 if value is not None else 1
+
+    async def suggest_next_draw_date(self) -> date:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("SELECT draw_date FROM draws")
+        return next_free_draw_date([dict(row) for row in rows], today_local())
 
     async def add_draw(
         self,
@@ -1285,6 +1313,9 @@ class MemoryStore(Store):
 
     async def suggest_next_period(self) -> int:
         return next_period_from_draws(self._draws)
+
+    async def suggest_next_draw_date(self) -> date:
+        return next_free_draw_date(self._draws, today_local())
 
     async def add_draw(
         self,

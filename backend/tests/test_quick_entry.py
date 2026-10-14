@@ -192,25 +192,37 @@ def test_add_draw_rejects_period_conflict(monkeypatch):
         asyncio.run(scenario())
 
 
-def test_add_draw_same_day_cannot_change_period(monkeypatch):
-    """同一天再报**另一个**期号必须报错：否则那一天的旧期号会被静默顶掉。
+def test_add_draw_same_day_new_period_bumps_date(monkeypatch):
+    """同一天再报**另一个**期号：旧期保留，新期顺延到下一个空闲日。
 
-    回归线上「首页走势少了一期 282」：2026-10-10 那一行先是 282（特码 23），
-    再报 283（特码 18）时被改成 283 —— ``draws`` 只对 ``draw_date`` 建了唯一索引，
-    被覆盖的 282 在库里不留任何痕迹，走势图上就直接少一期。
+    回归线上「录 24 后上一期 19 丢失」：先在今天写入 285/特码19，再以预填的
+    286 + 今天写入特码24。旧版按 ``draw_date`` 唯一键 UPDATE，把 285 改名成 286，
+    特码19从 ``draws`` 消失；现在必须 INSERT 到次日并保留 285/19。
     """
     monkeypatch.setattr(repository, "today_local", lambda: FIXED_TODAY)
-    store = _seed_store(periods_dates=[(281, FIXED_TODAY)], specials=[10])
+    store = _seed_store(periods_dates=[(285, FIXED_TODAY)], specials=[19])
 
     async def scenario():
-        await store.add_draw(23, period=282, draw_date=FIXED_TODAY)
+        created = await store.add_draw(24, period=286, draw_date=FIXED_TODAY)
+        return created, await store.list_draws()
 
-    with pytest.raises(ValueError, match="期号 282"):
-        asyncio.run(scenario())
+    created, draws = asyncio.run(scenario())
 
-    draws = asyncio.run(store.list_draws())
-    assert [draw["period"] for draw in draws] == [281]  # 旧期号没被顶掉
-    assert draws[0]["special_number"] == 10
+    assert created["period"] == 286
+    assert created["special_number"] == 24
+    assert created["draw_date"] == FIXED_TODAY + timedelta(days=1)
+    by_period = {int(draw["period"]): draw for draw in draws}
+    assert set(by_period) == {285, 286}
+    assert by_period[285]["special_number"] == 19
+    assert by_period[285]["draw_date"] == FIXED_TODAY
+    assert by_period[286]["special_number"] == 24
+
+
+def test_suggest_next_draw_date_skips_occupied_day(monkeypatch):
+    monkeypatch.setattr(repository, "today_local", lambda: FIXED_TODAY)
+    store = _seed_store(periods_dates=[(285, FIXED_TODAY)], specials=[19])
+
+    assert asyncio.run(store.suggest_next_draw_date()) == FIXED_TODAY + timedelta(days=1)
 
 
 # --------------------------------------------------------------------------- #
@@ -264,8 +276,8 @@ def test_quick_endpoint_validates_special_number(client, payload):
 
 
 def test_next_period_endpoint_prefills_form(client, monkeypatch):
-    # routers.draws 直接 import 了 today_local，因此要 patch 该模块的引用
-    monkeypatch.setattr("routers.draws.today_local", lambda: FIXED_TODAY)
+    # 预填日期走 store.suggest_next_draw_date → repository.today_local
+    monkeypatch.setattr(repository, "today_local", lambda: FIXED_TODAY)
 
     empty = client.get("/api/draws/next-period").json()
     assert empty["suggested_period"] == 1
@@ -284,6 +296,23 @@ def test_next_period_endpoint_prefills_form(client, monkeypatch):
     assert body["has_draws"] is True
     assert body["latest_draw"]["special_number"] == 22
     assert body["latest_draw"]["zodiac_label"] == "鸡"
+    # 今天尚未占用 → 仍建议今天
+    assert body["suggested_draw_date"] == FIXED_TODAY.isoformat()
+
+    client.post(
+        "/api/draws/quick",
+        json={
+            "special_number": 19,
+            "period": 270,
+            "draw_date": FIXED_TODAY.isoformat(),
+        },
+    )
+    after_today = client.get("/api/draws/next-period").json()
+    assert after_today["suggested_period"] == 271
+    # 今天已被 270 占用 → 预填顺延，避免再录时顶掉上一期
+    assert after_today["suggested_draw_date"] == (
+        FIXED_TODAY + timedelta(days=1)
+    ).isoformat()
 
 
 # --------------------------------------------------------------------------- #

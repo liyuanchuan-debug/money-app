@@ -29,7 +29,6 @@ from services.mark_six import (
     decorate_draw,
     parse_draw_lines,
     resolve_draws,
-    today_local,
 )
 
 logger = logging.getLogger(__name__)
@@ -171,7 +170,8 @@ async def get_next_period(_actor=Depends(require_actor)):
     latest = await store.get_latest_draw()
     return {
         "suggested_period": await store.suggest_next_period(),
-        "suggested_draw_date": today_local(),
+        # 今天已被占用时顺延到下一个空闲日，避免连续录入时预填撞车再覆盖旧期
+        "suggested_draw_date": await store.suggest_next_draw_date(),
         "timezone": APP_TIMEZONE_NAME,
         "has_draws": latest is not None,
         "latest_draw": decorate_draw(latest),
@@ -182,9 +182,9 @@ async def get_next_period(_actor=Depends(require_actor)):
 async def quick_add_draw(payload: DrawQuickIn, _admin=Depends(require_admin)):
     """快捷录入一期特码，直接写进唯一事实来源 ``draws``。
 
-    - 期号 / 日期留空则自动补（期号 = max(period)+1；日期 = 今天 UTC+8）；
-    - 同一日期（或显式给出的同一期号）已存在 → 覆盖修正，不产生重复行；
-    - 同一天若再报**另一个**期号 → 返回 400（否则那一天的旧期号会被静默顶掉）；
+    - 期号 / 日期留空则自动补（期号 = max(period)+1；日期 = 今天起第一个空闲日）；
+    - 同一日期且未换期号（或显式同一期号）已存在 → 覆盖修正，不产生重复行；
+    - 同一天再报**另一个**期号 → 自动顺延到下一个空闲日期并新增（绝不改名顶掉旧期）；
     - 返回补好生肖的一期，前端可直接展示「最新特码 / 生肖」。
 
     返回 200（而非 201）：本接口是 upsert，可能只是更新既有的一期。

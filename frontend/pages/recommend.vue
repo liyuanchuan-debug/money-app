@@ -726,9 +726,19 @@ const latticeBand = computed(() => lattice.value?.band ?? null)
 const latticeNumbers = computed(() => lattice.value?.numbers ?? [])
 /** 落在预测带内的号数（带内 / 合计分开计数，如实展示） */
 const inBandCount = computed(() => latticeNumbers.value.filter(cell => cell.in_band).length)
+/** 本期推荐号码集合（点阵上打标用；不参与任何选号判定） */
+const pickedNumbers = computed(
+  () => new Set((result.value?.picks ?? []).map(pick => pick.number)))
 /** 本期推荐里落在预测带内的注数 */
 const pickedInBandCount = computed(
   () => (result.value?.picks ?? []).filter(pick => pick.in_lattice_band).length)
+
+/** 点阵格透明度：按 lattice_weight 映射，带内更实、带外更淡（只影响观感） */
+function latticeCellStyle(cell: { lattice_weight?: number }): Record<string, string> {
+  const weight = cell.lattice_weight ?? 1
+  const opacity = 0.4 + Math.max(0, Math.min(1, weight)) * 0.6
+  return { opacity: opacity.toFixed(2) }
+}
 
 /** 预测波动折线一屏期数（与首页特码走势同一档位习惯） */
 const WAVE_TREND_WINDOW_DEFAULT = 30
@@ -1677,6 +1687,46 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   </span>
                 </p>
               </div>
+
+              <!-- 1~49 号码点阵：带内高亮；与上方折线同源 band（只展示，不另算） -->
+              <div
+                class="grid grid-cols-7 gap-1.5 sm:gap-2"
+                role="list"
+                aria-label="1 到 49 号码点阵"
+              >
+                <div
+                  v-for="cell in latticeNumbers"
+                  :key="cell.number"
+                  role="listitem"
+                  class="relative flex flex-col items-center justify-center rounded-xl px-1 py-1.5 text-center ring-1"
+                  :class="cell.in_band
+                    ? 'bg-aqua-400/15 text-aqua-100 ring-aqua-300/50'
+                    : 'bg-white/[0.04] text-slate-300 ring-white/10'"
+                  :style="latticeCellStyle(cell)"
+                  :title="`${pad(cell.number)} · 差值 |${cell.diff}| · ${cell.wave_label}${cell.in_band ? ' · 预测带内' : ' · 预测带外'}`"
+                >
+                  <span class="num text-[13px] font-semibold tabular-nums">
+                    {{ pad(cell.number) }}
+                  </span>
+                  <span class="num text-[9px] tabular-nums opacity-70">|{{ cell.diff }}|</span>
+                  <span
+                    v-if="pickedNumbers.has(cell.number)"
+                    class="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-bloom-400 ring-2 ring-slate-950"
+                    aria-hidden="true"
+                  />
+                  <span
+                    v-if="cell.is_latest"
+                    class="absolute -left-1 -top-1 h-2 w-2 rounded-full bg-amber-300 ring-2 ring-slate-950"
+                    aria-hidden="true"
+                  />
+                </div>
+              </div>
+
+              <p class="text-[11px] leading-relaxed text-slate-500">
+                {{ latticeBand.rule }}
+                高亮 = 带内；右上红点 = 本期推荐；左上金点 = 本池最新一期号码。
+                带外号码不会被排除，只是抽样概率更低。
+              </p>
             </template>
 
             <p v-else class="text-xs leading-relaxed text-slate-500">
