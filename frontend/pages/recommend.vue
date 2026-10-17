@@ -409,8 +409,6 @@ const heatWindowOptions = STATS_SAMPLE_LIMIT_OPTIONS.filter(
 const HEAT_WINDOW_DEFAULT = heatWindowOptions.includes(100)
   ? 100
   : (heatWindowOptions[heatWindowOptions.length - 1] ?? SAMPLE_LIMIT)
-/** 最小档：本池比它还短时，说明文案要如实交代「全部统计」 */
-const heatMinOption = heatWindowOptions[0] ?? SAMPLE_LIMIT
 const heatWindow = ref(HEAT_WINDOW_DEFAULT)
 
 /** 实际参与统计的期数：本池更少时以全部期数为准（min 保证任何 slice 都不越界） */
@@ -470,17 +468,6 @@ const heatPickMarkedNumbers = computed(() =>
 
 /** 图例口径随所选窗口走，保证图例与格子永不打架（只描述样本内计数，无预测含义） */
 const heatScope = computed(() => scopeLabel(heatWindowEffective.value))
-
-/** 诚实说明：只统计本池样本内的计数；本池更少时如实说「全部统计」 */
-const heatWindowCaption = computed(() => {
-  if (sampleSize.value === 0) {
-    return '本池暂无已导入期数；补录开奖后再按所选期数统计。'
-  }
-  if (sampleSize.value < heatMinOption) {
-    return `本池仅 ${sampleSize.value} 期，全部统计。`
-  }
-  return `只统计本池最近 ${heatWindow.value} 期；若本池期数更少，则以全部期数为准。`
-})
 
 /** 本池最新一期特码（仅用于在热度网格上高亮这一格，样本为空时 null） */
 const latestSampleNumber = computed(
@@ -1558,26 +1545,15 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
 
         <!-- 01 - 49 出现热度：本页为单列手机版式，直接整幅铺开（不用开奖页的 lg:grid-cols-3 / col-span-2 栅格） -->
         <MotionReveal :index="7">
-          <GlassPanel padding="lg" rounded="3xl">
-            <div class="mb-4">
-              <h2 class="text-lg font-medium text-white">01 - 49 出现热度</h2>
-              <p class="text-xs text-slate-500">
-                同一个青色系里，颜色越深表示在所选期数里出现越多；
-                中性灰格表示暂时没有出现过。格内第二行是生肖、第三行是距上次出现天数（本池已加载样本）；
-                绿色描边与右上角「预」角标表示本期推荐号码（约 {{ result.picks.length }} 注），与上方候选列表一致。
-                最亮 aqua 圈仍为最新一期特码。下方色阶标出每一档对应的出现次数。
-                本池满 100 期时，最近 100 期一次都没出现的号码不会进入上方财富密码。
-              </p>
-            </div>
-
-            <!-- 统计期数：仅本页展示状态，切换只重算下方网格，不写库、不改任何请求 -->
-            <div class="mb-4 space-y-2">
-              <div class="flex flex-wrap gap-2" role="group" aria-label="热度统计期数">
+          <GlassPanel padding="md" rounded="3xl">
+            <div class="mb-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5">
+              <h2 class="text-base font-medium text-white">01 - 49 出现热度</h2>
+              <div class="flex flex-wrap gap-1" role="group" aria-label="热度统计期数">
                 <button
                   v-for="option in heatWindowOptions"
                   :key="option"
                   type="button"
-                  class="num min-h-[44px] min-w-[64px] rounded-xl border px-4 text-base font-medium transition-colors duration-200 select-none active:scale-[0.98]"
+                  class="num inline-flex min-h-[32px] min-w-[44px] items-center justify-center rounded-lg border px-2.5 text-xs font-medium transition-colors duration-200 select-none active:scale-[0.98]"
                   :class="option === heatWindow
                     ? 'border-aqua-400/60 bg-aqua-400/15 text-aqua-100'
                     : 'border-white/10 bg-white/5 text-slate-300 active:bg-white/15'"
@@ -1587,12 +1563,12 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   {{ option }}
                 </button>
               </div>
-              <p class="text-[11px] leading-relaxed text-slate-500">{{ heatWindowCaption }}</p>
             </div>
 
             <HeatGrid
               :cells="heatCells"
               :columns="7"
+              :row-scale="0.72"
               tone="aqua"
               show-labels
               :highlight="latestSampleNumber === null ? [] : [pad(latestSampleNumber)]"

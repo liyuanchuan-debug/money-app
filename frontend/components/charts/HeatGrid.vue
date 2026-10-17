@@ -68,6 +68,10 @@ const props = withDefaults(
     valueUnit?: string
     /** 图例里的口径说明（调用方传「本池已导入 N 期数据内」这类原话） */
     legendScope?: string
+    /**
+     * 格子高宽比。1 是正方形；小于 1 时格子变扁、整表变矮，宽度仍铺满容器。
+     */
+    rowScale?: number
     emptyText?: string
     emptyHint?: string
   }>(),
@@ -84,6 +88,7 @@ const props = withDefaults(
     legend: false,
     valueUnit: '',
     legendScope: '',
+    rowScale: 1,
     emptyText: '数据不足',
     emptyHint: '',
   },
@@ -98,8 +103,14 @@ const gap = computed(() => Math.max(0, props.gap))
 const cellSize = computed(
   () => (VB_WIDTH - gap.value * (columnCount.value - 1)) / columnCount.value,
 )
+const rowScale = computed(() => {
+  const raw = Number(props.rowScale)
+  if (!Number.isFinite(raw) || raw <= 0) return 1
+  return Math.min(1, raw)
+})
+const cellHeight = computed(() => cellSize.value * rowScale.value)
 const vbHeight = computed(
-  () => rowCount.value * cellSize.value + Math.max(0, rowCount.value - 1) * gap.value + CAPTION_SPACE,
+  () => rowCount.value * cellHeight.value + Math.max(0, rowCount.value - 1) * gap.value + CAPTION_SPACE,
 )
 
 const hasData = computed(() => props.cells.length > 0)
@@ -171,14 +182,15 @@ const FONT_STACK =
 
 const typeScale = computed(() => {
   const size = cellSize.value
+  const height = cellHeight.value
   return {
-    number: Math.max(15, Math.round(size * 0.26)),
-    caption: Math.max(9, Math.round(size * 0.125)),
+    number: Math.max(15, Math.round(Math.min(size * 0.26, height * 0.46))),
+    caption: Math.max(9, Math.round(Math.min(size * 0.125, height * 0.24))),
     badgeW: Math.max(24, Math.round(size * 0.28)),
-    badgeH: Math.max(19, Math.round(size * 0.22)),
-    badgeFont: Math.max(11, Math.round(size * 0.155)),
+    badgeH: Math.max(16, Math.round(Math.min(size * 0.22, height * 0.36))),
+    badgeFont: Math.max(11, Math.round(Math.min(size * 0.155, height * 0.26))),
     padX: size * 0.12,
-    ruleY: size * 0.58,
+    ruleY: height * 0.58,
   }
 })
 
@@ -188,14 +200,14 @@ const layout = computed<Cell[]>(() =>
     const row = Math.floor(index / columnCount.value)
     const value = values.value[index] ?? 0
     const level = heatBinLevel(scale.value, value)
-    const showMeta = props.showLabels && cellSize.value >= 34
+    const showMeta = props.showLabels && cellHeight.value >= 28
     const label = cell.label?.trim() || ''
     const sublabel = cell.sublabel?.trim() || ''
     const caption = [label, sublabel].filter(Boolean).join(' · ')
     return {
       index,
       x: column * (cellSize.value + gap.value),
-      y: row * (cellSize.value + gap.value),
+      y: row * (cellHeight.value + gap.value),
       number: cell.number,
       label,
       sublabel,
@@ -252,13 +264,13 @@ function cellStrokeWidth(cell: Cell) {
 }
 
 function numberTextY(cell: Cell) {
-  const size = cellSize.value
-  if (!cell.showMeta) return cell.y + size * 0.52
-  return cell.y + size * 0.36
+  const height = cellHeight.value
+  if (!cell.showMeta) return cell.y + height * 0.52
+  return cell.y + height * 0.36
 }
 
 function captionTextY(cell: Cell) {
-  return cell.y + cellSize.value * 0.76
+  return cell.y + cellHeight.value * 0.78
 }
 
 /** 悬停（桌面）：只影响提示气泡 */
@@ -329,7 +341,7 @@ const gridLabel = computed(
             :x="cell.x"
             :y="cell.y"
             :width="cellSize"
-            :height="cellSize"
+            :height="cellHeight"
             rx="8"
             :fill="cellFill(cell)"
             :stroke="cellStroke(cell)"
@@ -413,7 +425,7 @@ const gridLabel = computed(
             :x="cell.x"
             :y="cell.y"
             :width="cellSize"
-            :height="cellSize"
+            :height="cellHeight"
             rx="8"
             fill="transparent"
             @pointerenter="hoverIndex = cell.index"
@@ -438,7 +450,7 @@ const gridLabel = computed(
       </div>
 
       <!-- 图例 + 点按读数：档位区间和图例色块都来自同一份分档结果 -->
-      <div v-if="props.legend" class="mt-3 space-y-2">
+      <div v-if="props.legend" class="mt-2 space-y-1.5">
         <p class="flex min-h-[18px] flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[11px]" aria-live="polite">
           <template v-if="readout">
             <span class="num font-semibold text-slate-100">{{ readout.number }}</span>
