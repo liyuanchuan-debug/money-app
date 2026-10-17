@@ -99,6 +99,7 @@ const form = reactive({
   amount_unit: 5,
   odds: 47,
   mode: 'even' as ChipMode,
+  stake_top: 15 as 15 | 20,
   exclude_repeat_zodiac: false,
   trend_bias: 'neutral' as TrendBias,
   trend_window: TREND_WINDOW_DEFAULT,
@@ -123,6 +124,8 @@ const form = reactive({
   role_w_secondary: ROLE_WEIGHT_SECONDARY_DEFAULT,
   role_w_defense: ROLE_WEIGHT_DEFENSE_DEFAULT,
 })
+
+const stakeTopOptions = [15, 20] as const
 
 const derivedBigMin = computed(() => form.normal_max + 1)
 
@@ -254,6 +257,7 @@ async function load() {
       : ROLE_WEIGHT_DEFENSE_DEFAULT
     // 只在后端返回合法枚举时覆盖，避免把状态搞成取值之外的脏值
     if (isChipMode(settings.mode)) form.mode = settings.mode
+    form.stake_top = settings.stake_top === 20 ? 20 : 15
     if (isTrendBias(settings.trend_bias)) form.trend_bias = settings.trend_bias
     if (typeof settings.trend_window === 'number') form.trend_window = settings.trend_window
     // 缺字段 / 旧后端 → 默认关闭避冷（与 DEFAULT_SETTINGS 一致），阈值回退 60
@@ -379,6 +383,7 @@ async function save() {
       amount_unit: form.amount_unit,
       odds: form.odds,
       mode: form.mode,
+      stake_top: form.stake_top,
       exclude_repeat_zodiac: form.exclude_repeat_zodiac,
       include_repeat_number: form.include_repeat_number,
       repeat_number_weight: form.repeat_number_weight,
@@ -434,6 +439,7 @@ async function save() {
       ? settings.role_w_defense
       : ROLE_WEIGHT_DEFENSE_DEFAULT
     if (isChipMode(settings.mode)) form.mode = settings.mode
+    form.stake_top = settings.stake_top === 20 ? 20 : 15
     if (isTrendBias(settings.trend_bias)) form.trend_bias = settings.trend_bias
     if (typeof settings.trend_window === 'number') form.trend_window = settings.trend_window
     form.avoid_cold_enabled = settings.avoid_cold_enabled === true
@@ -556,9 +562,23 @@ const readonlyInputClass
                   均注：各注先保底 1 个单位，余量按下方「角色配额」分给主推 / 次选 / 防守（1:1:1 即严格均分）。
                   侧重：主推约占 4/6 单位，其余均分；单挑：只出 1 注（整份最大投注
                   押在一个号上）；随机分配：按最小单位随机拆给各注。四种模式的每一注金额都是最小单位的正整数倍。
+                  档位固定 8 码：尖刀主攻 15 或 20 元、另一注主攻 10 元、常规 3 注各 5 元、防守 3 注各 3 元，合计随各注相加。
                   保存后作为默认值：生成财富密码时按此模式分配筹码；在「波浪买入法」页面里临时切换只影响当次，
                   不改这里的默认值。
                 </p>
+                <div v-if="form.mode === 'ladder'" class="flex flex-wrap gap-2" role="group" aria-label="尖刀金额">
+                  <GlassButton
+                    v-for="top in stakeTopOptions"
+                    :key="top"
+                    type="button"
+                    class="min-h-[44px] px-4 text-base"
+                    :variant="form.stake_top === top ? 'primary' : 'glass'"
+                    :aria-pressed="form.stake_top === top"
+                    @click="form.stake_top = top"
+                  >
+                    尖刀 {{ top }} 元
+                  </GlassButton>
+                </div>
               </div>
 
               <div class="space-y-2">
@@ -802,11 +822,11 @@ const readonlyInputClass
                     号码标签（不再降权）
                   </p>
                   <p class="text-xs leading-relaxed text-slate-500">
-                    三类号码（重号 / 同肖 / 冷号）<span class="text-slate-300">不会</span>被剔除出候选池，
-                    也<span class="text-slate-300">不再</span>影响排序或金额 —— 选号只看点阵概率 + 期号种子随机。
-                    命中时仍会在推荐卡片上标出对应徽章（信息诚实保留）。
-                    下面三项系数与冷号口径仅用于生成徽章，改它们不会再改变推荐号码或金额。
-                    这是本池样本内的标签，不是概率，也不承诺提高命中率。
+                    三类号码（重号 / 同肖 / 冷号）的系数<span class="text-slate-300">不再</span>影响排序或金额，
+                    命中时仍会在推荐卡片上标出对应徽章。
+                    另有一条固定规则：本池满 100 期时，最近 100 期一次都没出现的号码会从财富密码里剔除。
+                    下面三项系数与冷号口径只生成徽章，改它们不会改变这条 100 期规则。
+                    这是本池样本内的筛选，不是概率，也不承诺提高命中率。
                   </p>
                 </div>
 

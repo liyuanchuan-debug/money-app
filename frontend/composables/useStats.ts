@@ -44,13 +44,13 @@ export const STATS_STATUS_INSUFFICIENT = 'INSUFFICIENT'
 
 /**
  * 「样本期数」控件可选项。
- * 本池目前共 200 期，所以默认取 200（= 全量样本）；500 留作本池继续导入后的余量。
+ * 默认取最近 100 期；50 / 200 / 500 仍可手选。本池更短时以全部期数为准。
  * 注意：后端 GET /openapi.json 实测 limit 上限是 1000（routers/stats.py 的 LIMIT_MAX），
  * 不是 500 —— 这里给到 500 只是控件粒度，不构成上限声明。
  */
 export const STATS_SAMPLE_LIMIT_OPTIONS: number[] = [50, 100, 200, 500]
-/** 默认样本期数（与全站 convention 一致：一次取最近 200 期） */
-export const STATS_DEFAULT_SAMPLE_LIMIT = 200
+/** 默认样本期数：最近 100 期 */
+export const STATS_DEFAULT_SAMPLE_LIMIT = 100
 
 /** 是否处于「数据不足」态（响应体缺失时按数据不足处理，宁可不给结论） */
 export function isInsufficient(envelope: StatsEnvelope | null | undefined): boolean {

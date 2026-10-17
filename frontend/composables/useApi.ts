@@ -11,6 +11,8 @@ export interface LotterySettings {
   bet_unit: number
   mode: string
   pick_count: number
+  /** 档位尖刀金额：15 或 20 */
+  stake_top?: number
   /** 特码兑付倍数（用户设定；默认 47，不是收益承诺） */
   odds: number
   /** 避开重肖：true=候选池排除最新同肖；默认 false */
@@ -87,6 +89,8 @@ export interface LotterySettingsPatch {
   amount_unit?: number
   mode?: ChipMode
   pick_count?: number
+  /** 档位尖刀金额：15 或 20 */
+  stake_top?: number
   odds?: number
   exclude_repeat_zodiac?: boolean
   include_repeat_number?: boolean
@@ -250,6 +254,16 @@ export interface RecommendResult {
   amount_unit: number
   /** 实际分配到各注的合计（避冷加权压低后可能 < total_amount） */
   staked_total?: number
+  /**
+   * 出现热度硬排除：最近 `window` 期次数为 0 的号不进入财富密码。
+   * `applied=false` 表示本池样本短于窗口，这条规则未启用。
+   */
+  heat_absent?: {
+    window: number
+    applied: boolean
+    excluded_count: number
+    excluded_numbers: number[]
+  }
   /** 避冷加权本次生效摘要（只增不改；penalized_picks=0 表示未压低任何注） */
   avoid_cold?: {
     enabled: boolean
@@ -577,7 +591,7 @@ export interface FreezeResult {
  * ``MODE_WEIGHTED`` / ``MODE_SINGLE`` / ``MODE_RANDOM`` 一致
  * （``PUT /api/settings`` 与 ``POST /api/recommend`` 都按 `^(even|weighted|single|random)$` 校验）。
  */
-export type ChipMode = 'even' | 'weighted' | 'single' | 'random'
+export type ChipMode = 'even' | 'weighted' | 'single' | 'random' | 'ladder'
 
 /** 走势加权偏好；与后端 TREND_BIAS_* 一致 */
 export type TrendBias = 'neutral' | 'hot' | 'cold' | 'mid'
@@ -640,6 +654,7 @@ export const CHIP_MODE_OPTIONS: ChipModeOption[] = [
   { value: 'weighted', label: '侧重' },
   { value: 'single', label: '单挑' },
   { value: 'random', label: '随机分配' },
+  { value: 'ladder', label: '档位' },
 ]
 
 /**
@@ -747,7 +762,7 @@ export const TREND_WINDOW_OPTIONS = [
   { value: 0, label: '全部样本' },
 ] as const
 /** 近期走势近窗默认档（与后端 DEFAULT_TREND_WINDOW 对齐） */
-export const TREND_WINDOW_DEFAULT = 20
+export const TREND_WINDOW_DEFAULT = 100
 
 /* ---------------------------------------------------------------------- */
 /* 避冷加权（冷号排后 + 金额封顶，只降不升）                                */
@@ -841,7 +856,7 @@ export const ROLE_WEIGHT_PRESETS = [
   { value: '1:1:1', label: '1 : 1 : 1', primary: 1, secondary: 1, defense: 1, note: '严格均分（旧行为）' },
 ] as const
 /** 预测波动线取样期数默认值 / 范围（0 = 本池全部） */
-export const LATTICE_WINDOW_DEFAULT = 30
+export const LATTICE_WINDOW_DEFAULT = 100
 export const LATTICE_WINDOW_MIN = 0
 export const LATTICE_WINDOW_MAX = 500
 
@@ -1137,6 +1152,7 @@ export function useApi() {
         amount_unit?: number
         trend_bias?: TrendBias
         trend_window?: number
+        stake_top?: number
       } = {},
     ) =>
       apiFetch<RecommendResult>('/api/recommend', {

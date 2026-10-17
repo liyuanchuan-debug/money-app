@@ -752,9 +752,8 @@ def test_backtest_on_210_real_draws_is_unchanged(client: TestClient):
     """生产行为守卫：线上配置 + 210 期 → 45/208、verdict=noise。
 
     这条断言同时钉住了 ``services/lottery`` 的选号行为与 ``services/analytics``
-    的统计口径：任何一边被改动，这里立刻红。2026-10-10「近期走势加权去掉」
-    把旧锚点 52/208 换成了 45/208 —— ``trend_bias=mid`` 不再改抽样，
-    数字仍在零边均值 42.45 ± 5.81 内，verdict 仍是 noise。
+    的统计口径：任何一边被改动，这里立刻红。选号样本改为最近 100 期后，
+    锚点是 45/208，仍落在抽样噪声里。
     """
     _import_draws(client, _real_draws())
     _apply_production_settings(client)

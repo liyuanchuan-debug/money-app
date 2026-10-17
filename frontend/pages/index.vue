@@ -13,11 +13,11 @@ const { ensureLoaded, isLoggedIn, hasRole, loaded } = useAuth()
 await ensureLoaded()
 
 /** 一次取回本池最近 N 期：既用于统计口径，也够画走势（后端 limit 上限 500） */
-const SAMPLE_LIMIT = 200
+const SAMPLE_LIMIT = 100
 /** 均值 / 差值窗口：样本速览里写明了「近 N 期」，与走势的滑动窗口无关 */
-const STATS_WINDOW = 30
+const STATS_WINDOW = 100
 /** 走势默认一屏显示多少期；可以左右滑动看更早的期数 */
-const TREND_WINDOW_DEFAULT = 30
+const TREND_WINDOW_DEFAULT = 100
 /** 走势「一屏多少期」档位（0 = 全部），直接透传给 LineChart 的 window-options */
 const TREND_WINDOW_OPTIONS = [30, 60, 100, 0]
 

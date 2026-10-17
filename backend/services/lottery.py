@@ -48,13 +48,16 @@ MODE_WEIGHTED = "weighted"
 MODE_SINGLE = "single"
 # 随机分配：把最大投注金额按金额最小单位随机拆给各注（各注金额允许不等）。
 MODE_RANDOM = "random"
+# 档位：8 码金额按角色写死，合计是各注相加，不从总预算反拆
+MODE_LADDER = "ladder"
 MODE_LABELS = {
     MODE_EVEN: "均注",
     MODE_WEIGHTED: "侧重",
     MODE_SINGLE: "单挑",
     MODE_RANDOM: "随机分配",
+    MODE_LADDER: "档位",
 }
-MODES = [MODE_EVEN, MODE_WEIGHTED, MODE_SINGLE, MODE_RANDOM]
+MODES = [MODE_EVEN, MODE_WEIGHTED, MODE_SINGLE, MODE_RANDOM, MODE_LADDER]
 # 供 Pydantic / 前端复用的枚举正则（唯一取值表就是上面的 MODES）
 MODE_PATTERN = "^(" + "|".join(MODES) + ")$"
 
@@ -74,6 +77,20 @@ TOTAL_AMOUNT_MIN = 5
 TOTAL_AMOUNT_MAX = 100
 DEFAULT_TOTAL_AMOUNT = 50
 DEFAULT_PICK_COUNT = 6
+# 8 码档位（mode=ladder）：金额先按角色定，合计 = 各注之和，不锁死总预算。
+# 主攻 2 注：尖刀默认 15（可改 20），另一注 10；常规 3 注各 5；防守 3 注各 3。
+STAKE_TOP_DEFAULT = 15
+STAKE_TOP_CHOICES = (15, 20)
+STAKE_ATTACK_SECOND = 10
+STAKE_REGULAR = 5
+STAKE_REGULAR_COUNT = 3
+STAKE_DEFENSE = 3
+STAKE_DEFENSE_COUNT = 3
+LADDER_ROLE_LABELS = {
+    ROLE_PRIMARY: "主攻",
+    ROLE_SECONDARY: "常规",
+    ROLE_DEFENSE: "防守",
+}
 # 特码兑付倍数（用户设定；默认 47，不是收益承诺）
 DEFAULT_ODDS = 47
 ODDS_MIN = 1
@@ -122,6 +139,11 @@ DEFAULT_STALE_PERIODS = 60
 STALE_PERIODS_MIN = 1
 STALE_PERIODS_MAX = 999
 DEFAULT_STALE_WEIGHT = 0.3
+# 出现热度：最近 N 期一次都没出现的号码从财富密码候选池剔除（硬排除，不是打折）。
+# 只在本池样本 ≥ N 时生效；更短的样本证明不了「N 期没出现」。
+# 近期样本默认长度：选号历史、出现热度剔除、预测波动线、走势近窗都用这一档。
+RECENT_SAMPLE_WINDOW = 100
+HEAT_ABSENT_WINDOW = RECENT_SAMPLE_WINDOW
 # 权重取值范围（1.0 = 不降权）
 SOFT_WEIGHT_MIN = 0.0
 SOFT_WEIGHT_MAX = 1.0
@@ -167,7 +189,7 @@ ROLE_WEIGHT_SETTING_KEYS = {
 # `pick_sampling="ranked"` + `wave_alloc="drain"` 复现，仅用于历史审计对照。
 # --------------------------------------------------------------------------- #
 DEFAULT_LATTICE_ENABLED = True
-DEFAULT_LATTICE_WINDOW = 30
+DEFAULT_LATTICE_WINDOW = RECENT_SAMPLE_WINDOW
 LATTICE_WINDOW_MIN = 0
 LATTICE_WINDOW_MAX = 500
 # 带宽分位（下/上）：0.25 / 0.75 → 覆盖近窗约一半的差值样本
@@ -217,8 +239,8 @@ _BAND_ORDER_NOTE = {
     TREND_BIAS_MID: "主推=最接近中频段、次选=次接近段、防守=离中频最远段",
 }
 TREND_BIAS_PATTERN = "^(" + "|".join(TREND_BIASES) + ")$"
-# 0 = 用全部样本；默认 20（仅影响走势分布参考展示，不影响选号）
-DEFAULT_TREND_WINDOW = 20
+# 0 = 用全部样本；默认最近 100 期（仅影响走势分布参考展示，不影响选号）
+DEFAULT_TREND_WINDOW = RECENT_SAMPLE_WINDOW
 TREND_WINDOW_MIN = 0
 TREND_WINDOW_MAX = 500
 # 「是否由用户**手动设置过**走势加权」的内部元数据键（落在 settings 表里）。
@@ -430,6 +452,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "amount_unit": DEFAULT_AMOUNT_UNIT,
     "mode": MODE_EVEN,
     "pick_count": DEFAULT_PICK_COUNT,
+    # 档位尖刀金额：只允许 15 或 20；档位模式以外不参与分配
+    "stake_top": STAKE_TOP_DEFAULT,
     # 特码兑付倍数（用户设定；默认 47）
     "odds": DEFAULT_ODDS,
     # 避开重肖：默认关闭（同肖号可以入选）；旧数据缺失该字段时也回退为 False
@@ -700,6 +724,14 @@ def clamp_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         except (TypeError, ValueError):
             role_weight = float(default)
         merged[setting_key] = min(ROLE_WEIGHT_MAX, max(ROLE_WEIGHT_MIN, role_weight))
+
+    try:
+        stake_top = int(merged.get("stake_top", STAKE_TOP_DEFAULT))
+    except (TypeError, ValueError):
+        stake_top = STAKE_TOP_DEFAULT
+    if stake_top not in STAKE_TOP_CHOICES:
+        stake_top = STAKE_TOP_DEFAULT
+    merged["stake_top"] = stake_top
     return merged
 
 
@@ -921,6 +953,30 @@ def compute_periods_since_last(
         if NUMBER_MIN <= number <= NUMBER_MAX and result[number] is None:
             result[number] = index
     return result
+
+
+def numbers_absent_in_heat_window(
+    periods_since_last: Mapping[int, int | None],
+    *,
+    sample_size: int,
+    window: int = HEAT_ABSENT_WINDOW,
+) -> set[int]:
+    """最近 ``window`` 期出现热度为 0 的号码（1..49）。
+
+    ``periods_since_last`` 与 ``compute_periods_since_last`` 同口径：最新一期下标 0，
+    下标 ``>= window`` 或样本内从未出现 = 这 ``window`` 期里次数为 0。
+
+    样本短于 ``window`` 时返回空集：短样本里的「没出现」不能当成「100 期没出现」。
+    """
+    limit = int(window)
+    if int(sample_size) < limit or limit <= 0:
+        return set()
+    absent: set[int] = set()
+    for number in range(NUMBER_MIN, NUMBER_MAX + 1):
+        gap = periods_since_last.get(number)
+        if gap is None or int(gap) >= limit:
+            absent.add(number)
+    return absent
 
 
 def soft_flags(
@@ -1433,6 +1489,22 @@ def take_from_role_band(
             if item["number"] not in used:
                 return item
     return None
+
+
+def stake_ladder(top: int = STAKE_TOP_DEFAULT) -> list[tuple[str, int]]:
+    """8 码固定档位：``(角色, 金额)``。
+
+    顺序即出票顺序：尖刀主攻、第二主攻、常规 ×3、防守 ×3。
+    ``top`` 只接受 15 或 20，其它值回退 15。候选不足 8 个时从末尾（防守）截掉。
+    """
+    tip = int(top) if int(top) in STAKE_TOP_CHOICES else STAKE_TOP_DEFAULT
+    rows: list[tuple[str, int]] = [
+        (ROLE_PRIMARY, tip),
+        (ROLE_PRIMARY, STAKE_ATTACK_SECOND),
+    ]
+    rows.extend((ROLE_SECONDARY, STAKE_REGULAR) for _ in range(STAKE_REGULAR_COUNT))
+    rows.extend((ROLE_DEFENSE, STAKE_DEFENSE) for _ in range(STAKE_DEFENSE_COUNT))
+    return rows
 
 
 def assign_roles(pick_count: int) -> list[str]:
@@ -2371,19 +2443,39 @@ def recommend(
         if amount_seed not in (None, ""):
             seed_key = f"{seed_key}|explicit={amount_seed}"
 
-    # 预算规范化（唯一入口，random / 其余模式同口径）：可覆盖注数 / 可分配金额 /
-    # 降级说明 / 原因码。下面「选号、角色、金额」三处全部以这里的 ``pick_count``
-    # 为准 —— 预算不够 1 个注码单位时它是 0，三处就都描述 0 注，不会再打架。
-    budget_plan = plan_budget(mode, total, pick_count, unit, seed=seed_key)
-    # 降级信息（不可满足 / 非整数倍）如实进入 notes，绝不静默
-    allocation_notes.extend(budget_plan["notes"])
-    total = budget_plan["allocated_total"]
-    pick_count = budget_plan["pick_count"]
-    no_ticket_reason: str | None = budget_plan["reason_code"]
-    no_ticket_message: str | None = budget_plan["reason_message"]
+    # 档位：8 码金额写死，不走「总预算 // 单位」拆分，也不因预算不足把注数降成 0。
+    ladder_rows: list[tuple[str, int]] | None = None
+    if mode == MODE_LADDER:
+        ladder_rows = stake_ladder(int(cfg["stake_top"]))
+        pick_count = len(ladder_rows)
+        total = sum(amount for _, amount in ladder_rows)
+        allocation_notes.append(
+            "档位金额不按固定总预算拆分："
+            f"主攻 {ladder_rows[0][1]} 元 + 主攻 {ladder_rows[1][1]} 元、"
+            f"常规 {STAKE_REGULAR_COUNT} 注各 {STAKE_REGULAR} 元、"
+            f"防守 {STAKE_DEFENSE_COUNT} 注各 {STAKE_DEFENSE} 元；"
+            f"合计 {total} 元是各注相加。尖刀只取 15 或 20。"
+        )
+        no_ticket_reason = None
+        no_ticket_message = None
+    else:
+        # 预算规范化（唯一入口，random / 其余模式同口径）：可覆盖注数 / 可分配金额 /
+        # 降级说明 / 原因码。下面「选号、角色、金额」三处全部以这里的 ``pick_count``
+        # 为准 —— 预算不够 1 个注码单位时它是 0，三处就都描述 0 注，不会再打架。
+        budget_plan = plan_budget(mode, total, pick_count, unit, seed=seed_key)
+        # 降级信息（不可满足 / 非整数倍）如实进入 notes，绝不静默
+        allocation_notes.extend(budget_plan["notes"])
+        total = budget_plan["allocated_total"]
+        pick_count = budget_plan["pick_count"]
+        no_ticket_reason = budget_plan["reason_code"]
+        no_ticket_message = budget_plan["reason_message"]
 
-    history = list(history_numbers)
-    dates_list = list(history_dates) if history_dates is not None else None
+    history_all = list(history_numbers)
+    dates_all = list(history_dates) if history_dates is not None else None
+    # 选号、遗漏、热度剔除、波动线都只看最近 100 期；更短的本池用全部。
+    history = history_all[:RECENT_SAMPLE_WINDOW]
+    dates_list = dates_all[: len(history)] if dates_all is not None else None
+    history_capped = len(history_all) > len(history)
     # 生肖参照日（只增不改）：本池最新一期开奖日 → 农历年 → 生肖表。
     # 与 GET /api/draws 给该期补的 zodiac 同源，且与 latest_zodiac 的号码分组恒等
     # （农历年只决定这一组叫什么生肖）；拿不到日期就整块留 null，绝不用「今天」猜。
@@ -2472,6 +2564,20 @@ def recommend(
         # 上期出过的号不避开（只打「重号」信息标签），所以候选池保留重号
         include_repeat_number=bool(cfg["include_repeat_number"]),
     )
+    # 出现热度：最近 100 期次数为 0 的号不进入财富密码（样本不足 100 期不启用）
+    heat_window = HEAT_ABSENT_WINDOW
+    heat_absent = numbers_absent_in_heat_window(
+        periods_since_last,
+        sample_size=len(history),
+        window=heat_window,
+    )
+    if heat_absent:
+        for wave in WAVE_ORDER:
+            pools[wave] = [
+                item
+                for item in pools[wave]
+                if int(item["number"]) not in heat_absent
+            ]
 
     # 上期波动类型 → 本期侧重顺序
     prev_wave: dict[str, Any] | None = None
@@ -2707,16 +2813,23 @@ def recommend(
     # 角色按侧重顺序分配 —— 在侧重顺序中出现越靠前的波动类型越优先，
     # 依次获得 主推 / 次选 / 防守…（focus 恒含全部三类波动）。
     picks.sort(key=lambda pick: focus.index(pick["wave_type"]))
-    roles = assign_roles(len(picks))
     role_weights = role_amount_weights(cfg)
-    amounts = allocate_amounts(
-        mode,
-        roles,
-        total,
-        amount_unit=cfg["amount_unit"],
-        seed=seed_key,
-        role_weights=role_weights,
-    )
+    if ladder_rows is not None:
+        # 候选不足 8 个时从防守那一端截掉，主攻 / 常规优先保留
+        rows = ladder_rows[: len(picks)]
+        roles = [role for role, _amount in rows]
+        amounts = [amount for _role, amount in rows]
+        total = sum(amounts)
+    else:
+        roles = assign_roles(len(picks))
+        amounts = allocate_amounts(
+            mode,
+            roles,
+            total,
+            amount_unit=cfg["amount_unit"],
+            seed=seed_key,
+            role_weights=role_weights,
+        )
 
     # 避冷加权：把「距上次出现超过阈值」的注金额压低（选号排后已在 order_pool /
     # take_from_role_band 生效），省下的预算不补给其它注；关闭时权重全为 1.0。
@@ -2759,7 +2872,9 @@ def recommend(
         soft_weight_value = 1.0
         periods = periods_since_last.get(number)
         pick["role"] = role
-        pick["role_label"] = ROLE_LABELS[role]
+        pick["role_label"] = (
+            LADDER_ROLE_LABELS[role] if mode == MODE_LADDER else ROLE_LABELS[role]
+        )
         pick["amount"] = amount
         pick["wave_label"] = WAVE_LABELS[pick["wave_type"]]
         # 三类软降权标记（用户要求：不排除，且**信息必须诚实**，
@@ -2800,6 +2915,17 @@ def recommend(
         pick["avoid_cold_weight"] = round(float(cold_weight), 4)
 
     notes: list[str] = [*allocation_notes]
+    if history_capped:
+        notes.append(
+            f"本次样本取最近 {RECENT_SAMPLE_WINDOW} 期"
+            f"（本池共 {len(history_all)} 期，更早的不参与选号、波动线与热度剔除）。"
+        )
+    elif len(history) < RECENT_SAMPLE_WINDOW:
+        notes.append(
+            f"本池仅 {len(history)} 期，不足 {RECENT_SAMPLE_WINDOW} 期，本次样本用全部已导入期数。"
+        )
+    else:
+        notes.append(f"本次样本为最近 {len(history)} 期。")
     if no_ticket_reason is not None:
         # 预算连 1 个注码单位都覆盖不了：明确说明「本次不出票」，不静默给空 picks
         notes.append(
@@ -2856,12 +2982,26 @@ def recommend(
             "避冷加权已关闭：距上次出现多久都不影响选号与金额（旧行为）。"
         )
 
+    # 出现热度硬排除：近 100 期 0 次的号不进财富密码
+    if len(history) >= heat_window:
+        notes.append(
+            f"出现热度近 {heat_window} 期次数为 0 的号码已排除，不进入财富密码"
+            f"（本次排除 {len(heat_absent)} 个号）。"
+            "这是样本内筛选，不是概率，也不承诺提高命中率。"
+        )
+    else:
+        notes.append(
+            f"本池仅 {len(history)} 期，不足 {heat_window} 期，"
+            f"暂不按「近 {heat_window} 期未出现」排除号码。"
+        )
+
     # 三类软降权：**已去除**，如实说明「只保留标签、不产生权重」
     notes.append(
         f"三类软降权（重号/同肖/冷号）已去除：上期特码 {latest} 本身、与上期同肖的号、"
         f"以及本池样本内连续 {stale_periods} 期以上未出现的号，"
-        "都**不再降权、不再打折**——它们照常参与选号，金额也只按角色配额分配。"
-        "若被选中仍会在号码上标注「重号」「同肖」「冷号」（信息标签，仅供阅读）。"
+        "都**不再降权、不再打折**。"
+        f"近 {heat_window} 期一次都没出现的号另按出现热度规则从候选池剔除，不进入财富密码；"
+        f"未满 {heat_window} 期、但仍被选中的号会标注「重号」「同肖」「冷号」（信息标签）。"
         "（历史权重值 0.5 / 0.8 / 0.3 已停用；写入这些设置也不会改变选号或金额。）"
     )
 
@@ -2979,6 +3119,12 @@ def recommend(
         # 实际分配到各注的合计（避冷加权压低后可能 < total_amount；只增不改旧字段）
         "staked_total": staked_total,
         # 避冷加权本次的生效摘要（只增不改；无被压低注时 penalized_picks = 0）
+        "heat_absent": {
+            "window": heat_window,
+            "applied": len(history) >= heat_window,
+            "excluded_count": len(heat_absent),
+            "excluded_numbers": sorted(heat_absent),
+        },
         "avoid_cold": {
             "enabled": cold_enabled,
             "days": cold_days,

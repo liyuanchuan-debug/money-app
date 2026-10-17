@@ -161,7 +161,7 @@ async def post_recommend(
 
     settings = await store.get_settings(actor_user_id(actor))
     # 请求级覆盖（不落库）：让调用方能在不保存设置的前提下试算别的预算 / 走势加权 / 注数
-    for key in ("total_amount", "amount_unit", "trend_bias", "trend_window"):
+    for key in ("total_amount", "amount_unit", "trend_bias", "trend_window", "stake_top"):
         value = getattr(payload, key)
         if value is not None:
             settings[key] = value

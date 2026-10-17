@@ -96,6 +96,8 @@ interface ColumnCandidate {
   value: number
   /** 槽位号码短标签（如 07） */
   label?: string
+  /** 生肖汉字（如 马）；只用于光标提示，不画进点旁标签 */
+  zodiac?: string
   /** 单点色调（如按是否落在预测带内区分）；缺省用 candidateTone */
   tone?: ChartTone
 }
@@ -1190,6 +1192,7 @@ const columnGeometry = computed(() => {
       : (count <= 1 ? (top + bottom) / 2 : top + (span * i) / (count - 1)),
     value: item.value,
     label: item.label ? String(item.label) : '',
+    zodiac: item.zodiac ? String(item.zodiac) : '',
     tone: item.tone ? chartTone(item.tone) : chartTone(props.candidateTone),
     /** 标签基线 y：等距模式沿用改造前的「圆点右侧、纵向居中」（下方赋值）；
      *  真实值模式由下方确定性错开给出；错不开 / 步长过小则整列隐藏标签。 */
@@ -1608,6 +1611,8 @@ const hoverInfo = computed(() => {
     numberLabel?: string
     /** 整列候选这类「不是单个取值」的提示：直接给成稿文字，跳过数值格式化 */
     textOverride?: string
+    /** 整列候选改由 columnLines 换行展示，这条不重复画 */
+    isColumn?: boolean
   }> = props.series
     .map((item, seriesIndex) => ({
       name: item.name ?? `序列 ${seriesIndex + 1}`,
@@ -1631,15 +1636,30 @@ const hoverInfo = computed(() => {
   // 光标落在竖列候选槽位：整列共用一个 x，补一条整列提示（号码多时以图上的竖列标签为准，
   // 标签因槽位太密被隐藏时，这里把号码逐列出，保证光标仍能读到每个候选）
   const column = hoverColumn.value
+  let columnLines: string[] | null = null
   if (column) {
-    const labels = column.points.map((point) => point.label).filter(Boolean)
+    const labels = column.points.map((point) => {
+      const number = point.label
+      if (!number) return ''
+      return point.zodiac ? `${number} ${point.zodiac}` : number
+    }).filter(Boolean)
+    if (column.showLabels) {
+      columnLines = [`共 ${column.count} 个 · 竖列已标出`]
+    } else {
+      const perLine = 4
+      columnLines = []
+      for (let i = 0; i < labels.length; i += perLine) {
+        const chunk = labels.slice(i, i + perLine).join('  ')
+        columnLines.push(i === 0 ? `共 ${column.count} 个：${chunk || '—'}` : chunk)
+      }
+      if (!columnLines.length) columnLines = [`共 ${column.count} 个：—`]
+    }
     entries.push({
       name: '本期候选（非真实开奖）',
       value: column.points[0]?.value ?? 0,
       colors: chartTone(props.candidateTone),
-      textOverride: column.showLabels
-        ? `共 ${column.count} 个 · 竖列已标出`
-        : `共 ${column.count} 个：${labels.join(' ') || '—'}`,
+      textOverride: columnLines[0],
+      isColumn: true,
     })
   }
 
@@ -1658,13 +1678,16 @@ const hoverInfo = computed(() => {
   const pointX = xAt(index)
   // 滑动模式下 SVG 按 1:1 像素渲染，用 px 定位最准（百分比是按可视宽度算的，会随滚动漂移）；
   // 非滑动模式保持改造前的百分比定位，一个字都没变。
-  // 候选列模式：光标默认就在最右的候选列上，右边界多留一段，避免提示框被滚动容器裁掉。
+  // 提示框画在滚动容器外面（否则 overflow 会裁掉最右侧）。left 要减去 scrollLeft，
+  // 再按提示框半宽夹进视口，避免候选列贴在最右时右半截被切掉。
+  const columnTooltip = columnLines !== null
+  const tooltipHalf = columnTooltip ? 136 : 72
   const left = props.scrollable
     ? (() => {
-        const maxLeft = hasColumn.value
-          ? Math.max(SCROLL_PAD_LEFT, contentWidth.value - PAD.right - COLUMN_TOOLTIP_ROOM)
-          : Math.max(SCROLL_PAD_LEFT, contentWidth.value - PAD.right)
-        return `${Math.round(Math.min(Math.max(pointX, SCROLL_PAD_LEFT), maxLeft))}px`
+        const viewX = pointX - scrollState.left
+        const minLeft = tooltipHalf + 8
+        const maxLeft = Math.max(minLeft, viewportWidth.value - tooltipHalf - 8)
+        return `${Math.round(Math.min(Math.max(viewX, minLeft), maxLeft))}px`
       })()
     : `${Math.min(0.88, Math.max(0.12, pointX / VB_WIDTH)) * 100}%`
   // 滑动模式下滚动区有 padding-top（给提示框留出上探空间），百分比按 padding box 高度算
@@ -1685,8 +1708,10 @@ const hoverInfo = computed(() => {
     top: `${((topOffset + topY) / topBox) * 100}%`,
     guideX: pointX,
     label: headerLabel,
+    columnLines,
     entries: entries.map((entry) => ({
       name: entry.name,
+      isColumn: entry.isColumn === true,
       text: entry.textOverride ?? (entry.numberLabel
         ? `${entry.numberLabel} 号 · ${formatAxisValue(entry.value)}${props.valueSuffix}`
         : `${formatAxisValue(entry.value)}${props.valueSuffix}`),
@@ -2106,24 +2131,38 @@ const hoverInfo = computed(() => {
               @pointerleave="clearHover"
             />
           </svg>
-
-          <!-- 提示框：跟着 SVG 的坐标走（滑动模式下 SVG 是 1:1 像素，用 px 定位） -->
-          <div
-            v-if="hoverInfo"
-            class="glass-panel-strong pointer-events-none absolute z-10 -translate-x-1/2 -translate-y-[115%] rounded-lg px-2.5 py-1.5 text-[11px] whitespace-nowrap"
-            :style="{ left: hoverInfo.left, top: hoverInfo.top }"
-          >
-            <p class="mb-0.5 text-slate-400">{{ hoverInfo.label }}</p>
-            <p
-              v-for="entry in hoverInfo.entries"
-              :key="entry.name"
-              class="num flex items-center gap-1.5 text-slate-100"
-            >
-              <span class="h-1.5 w-1.5 rounded-full" :style="entry.dotStyle" />
-              <span>{{ entry.text }}</span>
-            </p>
-          </div>
         </template>
+      </div>
+
+      <!-- 提示框放在滚动容器外：容器 overflow-x/y 会把贴在最右侧的「本期候选」裁掉 -->
+      <div
+        v-if="hoverInfo"
+        class="glass-panel-strong pointer-events-none absolute z-10 -translate-x-1/2 -translate-y-[115%] rounded-lg px-2.5 py-1.5 text-[11px]"
+        :class="hoverInfo.columnLines ? 'max-w-[15.5rem] whitespace-normal' : 'whitespace-nowrap'"
+        :style="{ left: hoverInfo.left, top: hoverInfo.top }"
+      >
+        <p class="mb-0.5 text-slate-400">{{ hoverInfo.label }}</p>
+        <p
+          v-for="(line, lineIndex) in hoverInfo.columnLines ?? []"
+          :key="`col-line-${lineIndex}`"
+          class="num flex items-start gap-1.5 text-slate-100"
+        >
+          <span
+            class="mt-1 h-1.5 w-1.5 shrink-0 rounded-full"
+            :class="lineIndex === 0 ? '' : 'invisible'"
+            :style="hoverInfo.entries.find((entry) => entry.isColumn)?.dotStyle"
+          />
+          <span>{{ line }}</span>
+        </p>
+        <p
+          v-for="entry in hoverInfo.entries"
+          v-show="!entry.isColumn"
+          :key="entry.name"
+          class="num flex items-center gap-1.5 text-slate-100"
+        >
+          <span class="h-1.5 w-1.5 rounded-full" :style="entry.dotStyle" />
+          <span>{{ entry.text }}</span>
+        </p>
       </div>
 
       <!-- 滑动模式：固定在左侧的 y 轴条 + 两侧渐隐提示（都不跟着内容滚） -->

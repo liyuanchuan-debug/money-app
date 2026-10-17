@@ -27,11 +27,13 @@ from services.lottery import (
     DEFAULT_SETTINGS,
     DEFAULT_STALE_PERIODS,
     DEFAULT_STALE_WEIGHT,
+    HEAT_ABSENT_WINDOW,
     DEFAULT_TOTAL_AMOUNT,
     AMOUNT_UNIT_MIN,
     AMOUNT_UNIT_STEP,
     MIN_BET_AMOUNT,
     MODE_EVEN,
+    MODE_LADDER,
     MODE_RANDOM,
     MODE_SINGLE,
     MODE_WEIGHTED,
@@ -90,6 +92,7 @@ from services.lottery import (
     compute_days_since_last,
     compute_periods_since_last,
     format_number,
+    numbers_absent_in_heat_window,
     is_avoid_cold_number,
     lattice_primary_wave,
     lattice_weight,
@@ -224,6 +227,15 @@ def test_recommend_sweep(
     )
 
     picks = result["picks"]
+    if mode == MODE_LADDER:
+        assert len(picks) == 8
+        assert [pick["amount"] for pick in picks] == [15, 10, 5, 5, 5, 3, 3, 3]
+        assert [pick["role_label"] for pick in picks] == [
+            "主攻", "主攻", "常规", "常规", "常规", "防守", "防守", "防守",
+        ]
+        assert result["total_amount"] == 49
+        assert result["staked_total"] == 49
+        return
     expected_count = 1 if mode == MODE_SINGLE else pick_count
 
     assert len(picks) == expected_count
@@ -741,7 +753,7 @@ def test_default_settings_expose_total_amount_and_unit():
     assert clamp_settings({"exclude_repeat_zodiac": None})["exclude_repeat_zodiac"] is False
     assert clamp_settings({"exclude_repeat_zodiac": "false"})["exclude_repeat_zodiac"] is False
     assert "bet_unit" not in DEFAULT_SETTINGS  # 已降级为派生值，不再是可写真值
-    assert MODES == [MODE_EVEN, MODE_WEIGHTED, MODE_SINGLE, MODE_RANDOM]
+    assert MODES == [MODE_EVEN, MODE_WEIGHTED, MODE_SINGLE, MODE_RANDOM, MODE_LADDER]
 
 
 def test_legacy_row_without_total_amount_falls_back_to_bet_unit_times_count():
@@ -1219,7 +1231,7 @@ def test_trend_bias_is_inert_for_picks():
 
 def test_default_trend_bias_is_neutral():
     assert DEFAULT_SETTINGS["trend_bias"] == "neutral"
-    assert DEFAULT_SETTINGS["trend_window"] == 20
+    assert DEFAULT_SETTINGS["trend_window"] == 100
     assert clamp_settings({})["trend_bias"] == "neutral"
     assert clamp_settings({"trend_bias": "hot"})["trend_bias"] == "hot"
     assert clamp_settings({"trend_bias": "bogus"})["trend_bias"] == "neutral"
@@ -1311,7 +1323,7 @@ def test_settings_api_trend_bias_roundtrip():
     with TestClient(app) as client:
         body = client.get("/api/settings").json()
         assert body["trend_bias"] == "neutral"
-        assert body["trend_window"] == 20
+        assert body["trend_window"] == 100
 
         updated = client.put(
             "/api/settings",
@@ -1629,6 +1641,8 @@ def test_avoid_cold_disabled_matches_legacy_amounts():
 def test_avoid_cold_cap_holds_across_all_modes():
     """四种模式都不崩，且被压低的注金额 ≤ 保本金额、仍是最小单位倍数。"""
     for mode in MODES:
+        if mode == MODE_LADDER:
+            continue
         for days in (120, 300):
             result = _cold_recommend(days, mode=mode)
             penalized = [p for p in result["picks"] if p["avoid_cold_penalized"]]
@@ -3040,7 +3054,12 @@ def test_score_top_unfundable_budget_returns_no_ticket_not_crash():
 def test_unfundable_budget_never_raises_and_never_invents_amounts(
     strategy: str, mode: str
 ):
-    """所有策略 × 所有分配模式：预算不够 1 个注码单位 ⇒ 零注 no_ticket。"""
+    """所有策略 × 所有分配模式：预算不够 1 个注码单位 ⇒ 零注 no_ticket。
+
+    档位不读总预算，这条不变量对它不成立。
+    """
+    if mode == MODE_LADDER:
+        return
     result = recommend(
         latest=10,
         previous=9,
@@ -3103,7 +3122,12 @@ def test_build_copy_text_empty_picks_is_empty_string():
 def test_picks_and_amounts_lengths_match_across_budget_sweep(
     total: int, unit: int, mode: str, strategy: str
 ):
-    """不变量扫描：picks > 0 时，金额条数必须与号码条数逐位相等，且每注 > 0。"""
+    """不变量扫描：picks > 0 时，金额条数必须与号码条数逐位相等，且每注 > 0。
+
+    档位金额是 15/10/5/3，不要求是金额最小单位的倍数。
+    """
+    if mode == MODE_LADDER:
+        return
     result = recommend(
         latest=10,
         previous=9,
@@ -3219,3 +3243,66 @@ def test_recommend_api_unfundable_override_returns_no_ticket():
         assert body["copy_text"] == ""
         # 零注不进账本（不会产生 0 成本的对账快照）
         assert "adopted_round" not in body
+
+
+def test_stake_ladder_eight_codes_and_top_switch():
+    """档位不按总预算拆：8 码为 15/10/5×3/3×3；尖刀可改成 20，合计跟着变。"""
+    history = [18, 7, 33, 12, 41, 5, 26, 9]
+    base = dict(pick_count=3, total_amount=50, amount_unit=5, avoid_cold_enabled=False)
+    fifteen = recommend(
+        latest=18, previous=7, history_numbers=history, settings={**base, "stake_top": 15}, mode=MODE_LADDER,
+    )
+    twenty = recommend(
+        latest=18, previous=7, history_numbers=history, settings={**base, "stake_top": 20}, mode=MODE_LADDER,
+    )
+    assert [p["amount"] for p in fifteen["picks"]] == [15, 10, 5, 5, 5, 3, 3, 3]
+    assert fifteen["total_amount"] == 49
+    assert [p["amount"] for p in twenty["picks"]] == [20, 10, 5, 5, 5, 3, 3, 3]
+    assert twenty["total_amount"] == 54
+    assert {p["number"] for p in fifteen["picks"]} == {p["number"] for p in twenty["picks"]}
+    assert any("不按固定总预算" in note for note in fifteen["notes"])
+
+
+def test_heat_absent_numbers_stay_out_of_wealth_password():
+    """最近 100 期出现次数为 0 的号不进入财富密码；样本不足 100 期不启用。"""
+    # 最新在前：近 100 期里只有 1 和（恰好落在第 100 格的）2；3..49 只出现在更早
+    recent = [1] * HEAT_ABSENT_WINDOW
+    recent[HEAT_ABSENT_WINDOW - 1] = 2
+    older = list(range(3, 50))
+    history = recent + older
+    gaps = compute_periods_since_last(history)
+    absent = numbers_absent_in_heat_window(
+        gaps, sample_size=len(history), window=HEAT_ABSENT_WINDOW
+    )
+    assert gaps[2] == HEAT_ABSENT_WINDOW - 1
+    assert 2 not in absent
+    assert absent == set(range(3, 50))
+
+    result = recommend(
+        latest=history[0],
+        previous=history[1],
+        history_numbers=history,
+        settings={
+            "pick_count": 10,
+            "avoid_cold_enabled": False,
+            "pick_strategy": PICK_STRATEGY_SCORE_TOP,
+        },
+        period=1001,
+    )
+    picked = {int(pick["number"]) for pick in result["picks"]}
+    assert picked == {1, 2}
+    assert picked.isdisjoint(absent)
+    assert result["heat_absent"]["applied"] is True
+    assert result["heat_absent"]["excluded_count"] == len(absent)
+    assert any("不进入财富密码" in note for note in result["notes"])
+
+    short = history[:30]
+    short_result = recommend(
+        latest=short[0],
+        previous=short[1],
+        history_numbers=short,
+        settings={"pick_count": 6, "avoid_cold_enabled": False},
+    )
+    assert short_result["heat_absent"]["applied"] is False
+    assert short_result["heat_absent"]["excluded_numbers"] == []
+    assert any("不足 100 期" in note for note in short_result["notes"])
