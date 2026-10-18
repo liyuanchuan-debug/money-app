@@ -611,49 +611,6 @@ function pickTrendRefs(pick: { wave_type: string; role: 'primary' | 'secondary' 
   return band[pick.role] ?? []
 }
 
-/**
- * 筹码点阵散落：用 number + index 做确定性伪随机偏移，刷新不乱跳。
- * 频次高 → 略大略实；0 次 → 更淡更小；当前 pick 号另加高亮。
- * 另用 margin 制造不规则间距，避免整齐表格感。
- */
-function scatterChipStyle(
-  item: TrendNumberStat,
-  index: number,
-  activeNumber: number,
-): Record<string, string> {
-  const n = item.number
-  const seed = (n * 37 + index * 53) % 97
-  const dx = ((seed % 13) - 6) * 1.35
-  const dy = (((seed * 3) % 11) - 5) * 1.15
-  const rot = ((seed % 9) - 4) * 1.6
-  const mRight = 2 + (seed % 7)
-  const mBottom = 2 + ((seed * 5) % 6)
-  const count = item.count ?? 0
-  const isActive = n === activeNumber
-  let scale = 0.78
-  let opacity = 0.38
-  if (count >= 5) {
-    scale = 1.16
-    opacity = 0.96
-  } else if (count >= 3) {
-    scale = 1.06
-    opacity = 0.9
-  } else if (count >= 1) {
-    scale = 0.95
-    opacity = 0.74
-  }
-  if (isActive) {
-    scale = Math.max(scale, 1.18)
-    opacity = 1
-  }
-  return {
-    transform: `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px) rotate(${rot.toFixed(1)}deg) scale(${scale.toFixed(2)})`,
-    opacity: String(opacity),
-    marginRight: `${mRight}px`,
-    marginBottom: `${mBottom}px`,
-  }
-}
-
 function formatRate(rate: number | undefined) {
   if (rate == null || !Number.isFinite(rate)) return '—'
   return `${(rate * 100).toFixed(1)}%`
@@ -671,13 +628,6 @@ function trendCountLabel(item: TrendNumberStat): string {
     return `${item.count} 次 · ${formatRate(item.rate)}`
   }
   return `0 次 · ${formatZeroCountNote(item)}`
-}
-
-/** 点阵筹码副文案（空间紧，用短写）。 */
-function trendChipSub(item: TrendNumberStat): string {
-  if ((item.count ?? 0) > 0) return `${item.count}次`
-  if (item.days_since_last == null) return '未出'
-  return `0·${item.days_since_last}天`
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1344,42 +1294,42 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
             </p>
           </MotionReveal>
 
-          <div v-if="!noTicket" class="grid gap-4 sm:grid-cols-3">
+          <div v-if="!noTicket" class="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
             <MotionReveal
               v-for="(pick, index) in result.picks"
               :key="pick.number"
               :index="index"
-              :stagger="60"
+              :stagger="40"
             >
               <GlassCard
                 as="article"
-                padding="md"
+                padding="sm"
                 :selected="pick.role === 'primary'"
-                class="flex h-full flex-col items-center gap-3"
+                class="flex h-full flex-col gap-2"
               >
-                <div class="flex w-full items-center justify-between gap-2">
-                  <StatChip :tone="roleTones[pick.role] ?? 'neutral'" size="sm" dot>
-                    {{ pick.role_label }}
-                  </StatChip>
-                  <span class="num text-sm font-medium text-slate-200">{{ pick.amount }} 元</span>
+                <div class="flex items-center gap-2">
+                  <SpecialBall
+                    :number="pick.number"
+                    size="sm"
+                    :tone="pick.role === 'primary' ? 'aqua' : 'nebula'"
+                    :glow="pick.role === 'primary'"
+                  />
+                  <div class="min-w-0 flex-1">
+                    <div class="flex items-center justify-between gap-2">
+                      <StatChip :tone="roleTones[pick.role] ?? 'neutral'" size="xs" dot>
+                        {{ pick.role_label }}
+                      </StatChip>
+                      <span class="num text-xs font-medium text-slate-200">{{ pick.amount }} 元</span>
+                    </div>
+                    <p class="mt-1 text-[11px] text-slate-400">
+                      生肖 {{ pickZodiac(pick) || '—' }}
+                    </p>
+                  </div>
                 </div>
 
-                <SpecialBall
-                  :number="pick.number"
-                  size="lg"
-                  :tone="pick.role === 'primary' ? 'aqua' : 'nebula'"
-                  :glow="pick.role === 'primary'"
-                />
-
-                <!-- 生肖：号码的固定映射（随农历年轮转），不是命中概率 / 预测 -->
-                <StatChip tone="nebula" size="xs">
-                  生肖 {{ pickZodiac(pick) || '—' }}
-                </StatChip>
-
-                <!-- 软降权标记：重号 / 同肖 / 冷号 + 是否落在预测波动带内（不排除，只打标） -->
                 <div
                   v-if="pickSoftReasons(pick).length || pick.in_lattice_band"
-                  class="flex flex-wrap items-center justify-center gap-1.5"
+                  class="flex flex-wrap items-center gap-1"
                 >
                   <StatChip
                     v-for="reason in pickSoftReasons(pick)"
@@ -1395,125 +1345,89 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   </StatChip>
                 </div>
 
-                <div class="w-full space-y-1.5 text-sm">
-                  <div class="flex items-center justify-between">
-                    <span class="text-slate-500">差值</span>
-                    <AnimatedNumber :value="pick.diff" :pad="0" text-class="text-slate-200" />
+                <dl class="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11px] leading-5">
+                  <div class="flex items-center justify-between gap-1">
+                    <dt class="text-slate-500">差值</dt>
+                    <dd><AnimatedNumber :value="pick.diff" :pad="0" text-class="text-slate-200" /></dd>
                   </div>
-                  <div class="flex items-center justify-between">
-                    <span class="text-slate-500">波动</span>
-                    <StatChip :tone="waveTones[pick.wave_type] ?? 'neutral'" size="xs">
-                      {{ pick.wave_label }}
-                    </StatChip>
+                  <div class="flex items-center justify-between gap-1">
+                    <dt class="text-slate-500">波动</dt>
+                    <dd class="text-slate-200">{{ pick.wave_label }}</dd>
                   </div>
-                  <div class="flex items-center justify-between">
-                    <span class="text-slate-500">近窗出现</span>
-                    <span class="num text-xs text-slate-200">
-                      {{ pick.trend_count ?? 0 }} 次
-                    </span>
+                  <div class="flex items-center justify-between gap-1">
+                    <dt class="text-slate-500">近窗</dt>
+                    <dd class="num text-slate-200">{{ pick.trend_count ?? 0 }} 次</dd>
                   </div>
-                  <div class="flex items-center justify-between">
-                    <span class="text-slate-500">距上次出现</span>
-                    <span
-                      class="text-xs"
-                      :class="pick.avoid_cold_penalized ? 'text-amber-300' : 'text-slate-200'"
-                    >
+                  <div class="flex items-center justify-between gap-1">
+                    <dt class="text-slate-500">距上次</dt>
+                    <dd :class="pick.avoid_cold_penalized ? 'text-amber-300' : 'text-slate-200'">
                       {{ avoidColdDaysText(pick.days_since_last) }}
-                    </span>
+                    </dd>
                   </div>
-                  <div class="flex items-center justify-between">
-                    <span class="text-slate-500">重号</span>
-                    <span
-                      class="text-xs font-medium"
-                      :class="pick.is_repeat_number ? 'text-bloom-300' : 'text-emerald-300'"
-                    >
+                  <div class="flex items-center justify-between gap-1">
+                    <dt class="text-slate-500">重号</dt>
+                    <dd :class="pick.is_repeat_number ? 'text-bloom-300' : 'text-emerald-300'">
                       {{ pick.is_repeat_number ? '是' : '否' }}
-                    </span>
+                    </dd>
                   </div>
-                  <div class="flex items-center justify-between">
-                    <span class="text-slate-500">重肖</span>
-                    <span
-                      class="text-xs font-medium"
-                      :class="pick.is_repeat_zodiac ? 'text-bloom-300' : 'text-emerald-300'"
-                    >
+                  <div class="flex items-center justify-between gap-1">
+                    <dt class="text-slate-500">重肖</dt>
+                    <dd :class="pick.is_repeat_zodiac ? 'text-bloom-300' : 'text-emerald-300'">
                       {{ pick.is_repeat_zodiac ? '是' : '否' }}
-                    </span>
+                    </dd>
                   </div>
-                  <div
-                    v-if="pick.is_stale"
-                    class="flex items-center justify-between"
-                  >
-                    <span class="text-slate-500">冷号</span>
-                    <StatChip tone="aqua" size="xs">
-                      {{ periodsSinceLastText(pick.periods_since_last) }}
-                    </StatChip>
+                  <div v-if="pick.is_stale" class="flex items-center justify-between gap-1">
+                    <dt class="text-slate-500">冷号</dt>
+                    <dd class="text-slate-200">{{ periodsSinceLastText(pick.periods_since_last) }}</dd>
                   </div>
-                  <div
-                    v-if="pick.soft_penalized"
-                    class="flex items-center justify-between"
-                  >
-                    <span class="text-slate-500">降权</span>
-                    <StatChip tone="amber" size="xs">
-                      {{ softWeightText(pick.soft_weight) }}
-                    </StatChip>
+                  <div v-if="pick.soft_penalized" class="flex items-center justify-between gap-1">
+                    <dt class="text-slate-500">降权</dt>
+                    <dd class="text-amber-200">{{ softWeightText(pick.soft_weight) }}</dd>
                   </div>
-                  <div
-                    v-if="pick.avoid_cold_penalized"
-                    class="flex items-center justify-between"
-                  >
-                    <span class="text-slate-500">避冷加权</span>
-                    <StatChip tone="amber" size="xs">
-                      {{ avoidColdWeightText(pick.avoid_cold_weight) }}
-                    </StatChip>
+                  <div v-if="pick.avoid_cold_penalized" class="col-span-2 flex items-center justify-between gap-1">
+                    <dt class="text-slate-500">避冷加权</dt>
+                    <dd class="text-amber-200">{{ avoidColdWeightText(pick.avoid_cold_weight) }}</dd>
                   </div>
-                </div>
+                </dl>
 
-                <!-- 同角色走势参考：pick.wave_type × pick.role，筹码点阵散落 -->
                 <div
                   v-if="result.trend_distributions"
-                  class="w-full border-t border-white/5 pt-3"
+                  class="border-t border-white/5 pt-1.5"
                 >
-                  <div class="mb-2 flex flex-wrap items-center justify-between gap-1">
-                    <span class="text-[11px] font-medium text-slate-400">
-                      走势参考 · {{ pick.wave_label }}
-                    </span>
-                    <span class="text-[10px] text-slate-500">经验频率 · 非概率</span>
-                  </div>
+                  <p class="mb-1 text-[10px] text-slate-500">
+                    走势参考 · {{ pick.wave_label }}
+                  </p>
                   <p
                     v-if="!pickTrendRefs(pick).length"
-                    class="text-[11px] leading-relaxed text-slate-500"
+                    class="text-[11px] text-slate-500"
                   >
-                    数据不足：本档同角色暂无可列号码
+                    本档同角色暂无可列号码
                   </p>
                   <div
                     v-else
-                    class="trend-scatter flex flex-wrap content-start items-center overflow-visible px-1 py-2"
+                    class="flex flex-wrap gap-1"
                     role="list"
                     :aria-label="`${pick.role_label}走势参考`"
                   >
                     <span
-                      v-for="(item, chipIndex) in pickTrendRefs(pick).slice(0, 12)"
+                      v-for="item in pickTrendRefs(pick).slice(0, 8)"
                       :key="`${pick.role}-${pick.wave_type}-${item.number}`"
                       role="listitem"
-                      class="trend-chip num inline-flex min-h-[34px] min-w-[38px] select-none flex-col items-center justify-center rounded-full px-1.5 py-0.5 text-center leading-none will-change-transform"
+                      class="num inline-flex min-h-[22px] items-center rounded-full px-1.5 text-[10px] tabular-nums"
                       :class="item.number === pick.number
-                        ? 'z-[1] bg-aqua-400/25 text-aqua-50 ring-1 ring-aqua-300/60 shadow-[0_0_12px_rgba(34,211,238,0.35)]'
-                        : 'bg-white/[0.06] text-slate-200 ring-1 ring-white/10'"
-                      :style="scatterChipStyle(item, chipIndex, pick.number)"
+                        ? 'bg-aqua-400/25 text-aqua-50 ring-1 ring-aqua-300/60'
+                        : 'bg-white/[0.06] text-slate-300 ring-1 ring-white/10'"
                       :title="`${pad(item.number)} · ${trendCountLabel(item)}`"
                     >
-                      <span class="text-[13px] font-semibold tabular-nums">{{ pad(item.number) }}</span>
-                      <span class="mt-0.5 text-[9px] tabular-nums text-slate-400">
-                        {{ trendChipSub(item) }}
-                      </span>
+                      {{ pad(item.number) }}
+                    </span>
+                    <span
+                      v-if="pickTrendRefs(pick).length > 8"
+                      class="text-[10px] leading-[22px] text-slate-500"
+                    >
+                      +{{ pickTrendRefs(pick).length - 8 }}
                     </span>
                   </div>
-                  <p
-                    v-if="pickTrendRefs(pick).length > 12"
-                    class="mt-1 text-[10px] text-slate-500"
-                  >
-                    另有 {{ pickTrendRefs(pick).length - 12 }} 个未展开
-                  </p>
                 </div>
               </GlassCard>
             </MotionReveal>
