@@ -46,8 +46,8 @@ const BET_COUNT_MAX = 10
 
 /** 临时预览用的筹码模式：初值仍来自设置页保存的默认值 */
 const mode = ref<ChipMode>('ladder')
-/** 临时预览：注数（档位固定 8 码；其它模式仍跟设置 pick_count） */
-const betCount = ref(8)
+/** 临时预览：注数（档位固定 10 码；其它模式仍跟设置 pick_count） */
+const betCount = ref(10)
 /** 档位尖刀：15 或 20，只影响第一注主攻 */
 const stakeTop = ref<15 | 20>(15)
 const stakeTopOptions = [15, 20] as const
@@ -252,7 +252,7 @@ const {
 } = await useAsyncData<RecommendResult>('recommend', () =>
   api.recommend({
     mode: mode.value,
-    bet_count: mode.value === 'ladder' ? 8 : betCount.value,
+    bet_count: mode.value === 'ladder' ? 10 : betCount.value,
     amount_seed: amountSeed.value,
     trend_bias: trendBias.value,
     trend_window: trendWindow.value,
@@ -783,8 +783,8 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
             </div>
 
             <p class="text-xs leading-relaxed text-slate-500">
-              本页默认走「档位」：固定 8 个码，金额按角色相加，不先锁一笔总预算。
-              尖刀主攻 {{ stakeTop }} 元，另一注主攻 10 元，常规 3 注各 5 元，防守 3 注各 3 元。
+              本页默认走「档位」：固定 10 个码，金额按角色相加，不先锁一笔总预算。
+              尖刀主攻 {{ stakeTop }} 元，另一注主攻 10 元，常规 3 注各 5 元，防守 5 注各 3 元。
               切到均注 / 侧重 / 单挑 / 随机分配后，才按最大投注金额拆分。
               要改默认请到
               <NuxtLink
@@ -840,7 +840,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   +
                 </GlassButton>
                 <StatChip tone="aqua" size="sm">
-                  {{ mode === 'single' ? '单挑恒为 1 注' : mode === 'ladder' ? '档位固定 8 码' : `当前 ${betCount} 注` }}
+                  {{ mode === 'single' ? '单挑恒为 1 注' : mode === 'ladder' ? '档位固定 10 码' : `当前 ${betCount} 注` }}
                 </StatChip>
               </div>
               <div v-if="mode === 'ladder'" class="flex flex-wrap gap-2" role="group" aria-label="尖刀金额">
@@ -858,8 +858,8 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               </div>
               <p class="text-xs leading-relaxed text-slate-500">
                 <template v-if="mode === 'ladder'">
-                  8 码金额：主攻 {{ stakeTop }} 元、主攻 10 元、常规 5 元 ×3、防守 3 元 ×3。
-                  合计是这些金额相加（尖刀 15 元时 49 元，20 元时 54 元），不从固定总预算里拆。
+                  10 码金额：主攻 {{ stakeTop }} 元、主攻 10 元、常规 5 元 ×3、防守 3 元 ×5。
+                  合计是这些金额相加（尖刀 15 元时 55 元，20 元时 60 元），不从固定总预算里拆。
                 </template>
                 <template v-else>
                   改注数会立刻按当前最大投注金额与金额最小单位重新出码、重摊金额（最大投注与单位倍数约束不变）。
@@ -887,7 +887,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 各注 {{ result.picks[0]?.amount ?? result.bet_unit }} 元（最小单位 {{ result.amount_unit }} 元的倍数）
               </StatChip>
               <StatChip v-else-if="result.mode === 'ladder'" tone="amber" size="sm">
-                主攻 {{ stakeTop }}/10 · 常规 5×3 · 防守 3×3
+                主攻 {{ stakeTop }}/10 · 常规 5×3 · 防守 3×5
               </StatChip>
               <StatChip v-else tone="amber" size="sm">各注金额不等（均为最小单位倍数）</StatChip>
             </div>

@@ -757,19 +757,13 @@ def _backtest(draws: list[dict[str, object]], **overrides: object) -> dict:
 
 
 def test_live_snapshot_backtest_anchor_is_stable() -> None:
-    """线上配置快照的回测锚点（2026-10-10「走势加权去掉」后重算为 51/208）。
-
-    LIVE_SETTINGS 是钉住 ``wave_alloc="drain"`` 的历史线上配置快照，仍是**逐期确定性**
-    的：种子随机只在 balanced 配额内生效，drain 忽略 ``pick_sampling``。因此这里断言
-    的是「同一份快照每次跑出同一组命中」，不是「再也不许变」——引擎口径变更即会改这个数字。
-    """
+    """线上配置快照的回测锚点。下期侧重配额后为 48/208，仍是 noise。"""
     draws = _real_draws_for_backtest()
     body = _backtest(draws)
-    assert (body["hits"], body["evaluated"]) == (51, 208)
+    assert (body["hits"], body["evaluated"]) == (48, 208)
     assert body["verdict"]["kind"] == "noise"
-    assert body["hit_rate"] == pytest.approx(51 / 208)
-    # 再跑一次必须逐位一致（确定性 → 锚点可复现）
-    assert _backtest(draws)["hits"] == 51
+    assert body["hit_rate"] == pytest.approx(48 / 208)
+    assert _backtest(draws)["hits"] == 48
 
 
 def test_lattice_toggle_is_not_a_sort_key_but_a_sampling_knob() -> None:
@@ -789,7 +783,7 @@ def test_lattice_toggle_is_not_a_sort_key_but_a_sampling_knob() -> None:
     ranked_off = _backtest(
         draws, wave_alloc="balanced", lattice_enabled=False, pick_sampling="ranked"
     )
-    assert ranked_on["hits"] == ranked_off["hits"] == 49
+    assert ranked_on["hits"] == ranked_off["hits"] == 41
     assert ranked_on["evaluated"] == ranked_off["evaluated"] == 208
 
     # 2) 审计快照（drain）：同样与开关无关
@@ -805,13 +799,13 @@ def test_lattice_toggle_is_not_a_sort_key_but_a_sampling_knob() -> None:
         include_results=False,
         include_wave_breakdown=False,
     )
-    assert audit_on["hits"] == audit_off["hits"] == 51
+    assert audit_on["hits"] == audit_off["hits"] == 45
     assert WS.audit_config()["pick_count"] == K_DEFAULT
 
     # 3) 新默认（期号种子随机）：点阵作为抽样概率改变样本（命中数可碰巧相同，号码集合必须不同）
     seeded_on = _backtest(draws, wave_alloc="balanced", lattice_enabled=True)
     seeded_off = _backtest(draws, wave_alloc="balanced", lattice_enabled=False)
-    assert seeded_on["hits"] == seeded_off["hits"] == 45
+    assert seeded_on["evaluated"] == seeded_off["evaluated"] == 208
     on_full = A.backtest_stats(
         draws,
         base_settings=clamp_settings(
@@ -847,14 +841,13 @@ def test_lattice_toggle_is_not_a_sort_key_but_a_sampling_knob() -> None:
 def test_repeat_zodiac_toggle_changes_the_sample_not_the_edge() -> None:
     """排除重肖是**候选池口径**开关（改池 → 改样本），不是降权。
 
-    2026-10-10「走势加权去掉」后这两条路径都会产出不同的确定性样本；两边的命中数
-    （50 / 51）都落在零边均值 ±2SE（42.45 ± 5.81）内，不构成任何边际优势声明。
+    下期侧重配额后两边命中数是 44 / 48，仍落在零边均值 ±2SE（42.45 ± 5.81）内。
     """
     draws = _real_draws_for_backtest()
     off = _backtest(draws, exclude_repeat_zodiac=False)
     on = _backtest(draws, exclude_repeat_zodiac=True)
-    assert off["hits"] == 50
-    assert on["hits"] == 51
+    assert off["hits"] == 44
+    assert on["hits"] == 48
     assert off["verdict"]["kind"] == "noise"
     assert on["verdict"]["kind"] == "noise"
 

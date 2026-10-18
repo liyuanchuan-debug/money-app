@@ -489,16 +489,15 @@ def test_honest_footer_in_sample_block_comes_from_the_real_backtest():
         include_results=True,
     )
     assert in_sample["evaluated"] == outcome["evaluated"] == 208
-    assert in_sample["hits"] == outcome["hits"] == 45
+    assert in_sample["hits"] == outcome["hits"] == 49
     assert in_sample["hit_rate"] == pytest.approx(outcome["hit_rate"])
-    assert in_sample["hit_rate"] == pytest.approx(45 / 208)
+    assert in_sample["hit_rate"] == pytest.approx(49 / 208)
     assert in_sample["random_baseline_hit_rate"] == pytest.approx(10 / 49)
     assert in_sample["verdict"] == "noise"
     assert in_sample["within_noise"] is True
 
     # 历史最久连续未中：独立重算一遍（不得留空、不得编造）
-    # 2026-10-10 走势加权去掉后由 14 期回到 17 期 —— 同一份固定路径的
-    # 另一个确定性样本，仍只是描述性统计，不构成任何边际声明。
+    # 下期侧重配额后，最长连续未中由 17 期变为 10 期。
     worst = 0
     streak = 0
     for row in outcome["results"]:
@@ -507,7 +506,7 @@ def test_honest_footer_in_sample_block_comes_from_the_real_backtest():
             continue
         streak += 1
         worst = max(worst, streak)
-    assert in_sample["max_dry_streak_periods"] == worst == 17
+    assert in_sample["max_dry_streak_periods"] == worst == 10
 
 
 def test_simulate_reports_an_honest_distribution_for_the_ticket_shape():
@@ -749,11 +748,11 @@ def test_health_endpoint_is_unchanged(client: TestClient):
 
 
 def test_backtest_on_210_real_draws_is_unchanged(client: TestClient):
-    """生产行为守卫：线上配置 + 210 期 → 45/208、verdict=noise。
+    """生产行为守卫：线上配置 + 210 期 → 49/208、verdict=noise。
 
     这条断言同时钉住了 ``services/lottery`` 的选号行为与 ``services/analytics``
-    的统计口径：任何一边被改动，这里立刻红。选号样本改为最近 100 期后，
-    锚点是 45/208，仍落在抽样噪声里。
+    的统计口径：任何一边被改动，这里立刻红。选号改为按上期波动侧重分配额后，
+    锚点是 49/208，仍落在抽样噪声里。
     """
     _import_draws(client, _real_draws())
     _apply_production_settings(client)
@@ -762,8 +761,8 @@ def test_backtest_on_210_real_draws_is_unchanged(client: TestClient):
         "/api/stats/backtest", json={"pick_count": 10, "mode": "even"}
     ).json()
     assert body["evaluated"] == 208
-    assert body["hits"] == 45
-    assert body["hit_rate"] == pytest.approx(45 / 208)
+    assert body["hits"] == 49
+    assert body["hit_rate"] == pytest.approx(49 / 208)
     assert body["verdict"]["kind"] == "noise"
     assert body["verdict"]["within_noise"] is True
     assert body["random_baseline_hit_rate"] == pytest.approx(10 / 49)

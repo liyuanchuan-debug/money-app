@@ -48,7 +48,7 @@ MODE_WEIGHTED = "weighted"
 MODE_SINGLE = "single"
 # 随机分配：把最大投注金额按金额最小单位随机拆给各注（各注金额允许不等）。
 MODE_RANDOM = "random"
-# 档位：8 码金额按角色写死，合计是各注相加，不从总预算反拆
+# 档位：10 码金额按角色写死，合计是各注相加，不从总预算反拆
 MODE_LADDER = "ladder"
 MODE_LABELS = {
     MODE_EVEN: "均注",
@@ -77,15 +77,15 @@ TOTAL_AMOUNT_MIN = 5
 TOTAL_AMOUNT_MAX = 100
 DEFAULT_TOTAL_AMOUNT = 50
 DEFAULT_PICK_COUNT = 6
-# 8 码档位（mode=ladder）：金额先按角色定，合计 = 各注之和，不锁死总预算。
-# 主攻 2 注：尖刀默认 15（可改 20），另一注 10；常规 3 注各 5；防守 3 注各 3。
+# 10 码档位（mode=ladder）：金额先按角色定，合计 = 各注之和，不锁死总预算。
+# 主攻 2 注：尖刀默认 15（可改 20），另一注 10；常规 3 注各 5；防守 5 注各 3。
 STAKE_TOP_DEFAULT = 15
 STAKE_TOP_CHOICES = (15, 20)
 STAKE_ATTACK_SECOND = 10
 STAKE_REGULAR = 5
 STAKE_REGULAR_COUNT = 3
 STAKE_DEFENSE = 3
-STAKE_DEFENSE_COUNT = 3
+STAKE_DEFENSE_COUNT = 5
 LADDER_ROLE_LABELS = {
     ROLE_PRIMARY: "主攻",
     ROLE_SECONDARY: "常规",
@@ -1492,10 +1492,10 @@ def take_from_role_band(
 
 
 def stake_ladder(top: int = STAKE_TOP_DEFAULT) -> list[tuple[str, int]]:
-    """8 码固定档位：``(角色, 金额)``。
+    """10 码固定档位：``(角色, 金额)``。
 
-    顺序即出票顺序：尖刀主攻、第二主攻、常规 ×3、防守 ×3。
-    ``top`` 只接受 15 或 20，其它值回退 15。候选不足 8 个时从末尾（防守）截掉。
+    顺序即出票顺序：尖刀主攻、第二主攻、常规 ×3、防守 ×5。
+    ``top`` 只接受 15 或 20，其它值回退 15。候选不足 10 个时从末尾（防守）截掉。
     """
     tip = int(top) if int(top) in STAKE_TOP_CHOICES else STAKE_TOP_DEFAULT
     rows: list[tuple[str, int]] = [
@@ -1554,6 +1554,60 @@ def balanced_wave_quotas(
         active = [wave for wave in active if quota[wave] < caps[wave]]
         if not progressed:
             break
+    return quota
+
+
+# 下期侧重配额：侧重 : 次侧重 : 垫后 = 3 : 2 : 1。
+# 8 注且三池都有号 → 4 / 3 / 1；10 注 → 5 / 3 / 2。空池跳过，权重顺延。
+FOCUS_QUOTA_WEIGHTS = (3, 2, 1)
+
+
+def focus_wave_quotas(
+    pick_count: int,
+    focus: list[str],
+    available: Mapping[str, int],
+) -> dict[str, int]:
+    """按上期波动的侧重顺序分配注数（最大余数法，确定可复现）。
+
+    ``focus`` 第一个是本期主侧重。空池不参与，权重按剩余池顺延。
+    某池装不下配额时，余数按侧重顺序补给仍有空位的池。
+    """
+    total = max(0, int(pick_count))
+    quota = {wave: 0 for wave in WAVE_ORDER}
+    caps = {wave: max(0, int(available.get(wave, 0))) for wave in WAVE_ORDER}
+    ordered = [wave for wave in focus if caps.get(wave, 0) > 0]
+    if total <= 0 or not ordered:
+        return quota
+    weights = [
+        FOCUS_QUOTA_WEIGHTS[index] if index < len(FOCUS_QUOTA_WEIGHTS) else 1
+        for index in range(len(ordered))
+    ]
+    weight_sum = sum(weights)
+    raw_num = [total * weight for weight in weights]
+    floors = [num // weight_sum for num in raw_num]
+    leftover = total - sum(floors)
+    remainder_order = sorted(
+        range(len(ordered)),
+        key=lambda index: (-(raw_num[index] % weight_sum), index),
+    )
+    for index in remainder_order:
+        if leftover <= 0:
+            break
+        floors[index] += 1
+        leftover -= 1
+    spill = 0
+    for index, wave in enumerate(ordered):
+        give = min(floors[index], caps[wave])
+        quota[wave] = give
+        spill += floors[index] - give
+    if spill:
+        for wave in ordered:
+            if spill <= 0:
+                break
+            room = caps[wave] - quota[wave]
+            give = min(room, spill)
+            quota[wave] += give
+            spill -= give
     return quota
 
 
@@ -2443,7 +2497,7 @@ def recommend(
         if amount_seed not in (None, ""):
             seed_key = f"{seed_key}|explicit={amount_seed}"
 
-    # 档位：8 码金额写死，不走「总预算 // 单位」拆分，也不因预算不足把注数降成 0。
+    # 档位：10 码金额写死，不走「总预算 // 单位」拆分，也不因预算不足把注数降成 0。
     ladder_rows: list[tuple[str, int]] | None = None
     if mode == MODE_LADDER:
         ladder_rows = stake_ladder(int(cfg["stake_top"]))
@@ -2727,10 +2781,12 @@ def recommend(
         #   drain                           = 旧行为（逐桶取满，仅历史审计复用）。
         # 点阵不再「先在预测波动桶取满」：它只改抽样概率，不改取号顺序 / 桶配额。
         if wave_alloc == WAVE_ALLOC_BALANCED:
-            # 均衡分散（形状骨架）：配额按非空桶均分（最大余额法，10 注 → 4/3/3），
-            # 因此「某个连续区段被抽干」的结构被彻底消除；注数 / P(hit) / EV 不变。
-            quotas = balanced_wave_quotas(
-                pick_count, {wave: len(ordered_pools[wave]) for wave in WAVE_ORDER}
+            # 下期侧重：配额按上一期波动的侧重顺序 3:2:1（8 注 → 4/3/1），
+            # 不再按非空桶均分。空池跳过。
+            quotas = focus_wave_quotas(
+                pick_count,
+                focus,
+                {wave: len(ordered_pools[wave]) for wave in WAVE_ORDER},
             )
             if pick_sampling == PICK_SAMPLING_SEEDED_RANDOM:
                 rng = _random_source(
@@ -2815,7 +2871,7 @@ def recommend(
     picks.sort(key=lambda pick: focus.index(pick["wave_type"]))
     role_weights = role_amount_weights(cfg)
     if ladder_rows is not None:
-        # 候选不足 8 个时从防守那一端截掉，主攻 / 常规优先保留
+        # 候选不足 10 个时从防守那一端截掉，主攻 / 常规优先保留
         rows = ladder_rows[: len(picks)]
         roles = [role for role, _amount in rows]
         amounts = [amount for _role, amount in rows]
@@ -3056,20 +3112,18 @@ def recommend(
         )
     elif wave_alloc == WAVE_ALLOC_BALANCED and pick_sampling == PICK_SAMPLING_SEEDED_RANDOM:
         notes.append(
-            "选号策略为波动轮取（均衡分散 + 种子随机）：先按非空波动桶均分注数"
-            f"（{pick_count} 注 → 各桶尽量均分，最多相差 1 注），"
-            "再在每个桶的配额内按「点阵概率分布」用**期号种子随机**不放回抽样。"
-            "形状由配额保证（不会挤在同一个连续区段），具体号码期期不同；"
-            "同一期 + 同一组设置重算恒得同一组号（可复现）。"
+            "选号策略为波动轮取（下期侧重 + 种子随机）：按上一期波动把注数分给侧重池"
+            f"（权重 3:2:1，{pick_count} 注在三池都有号时主侧重最多），"
+            "空池跳过。再在每个桶的配额内按「点阵概率分布」用**期号种子随机**不放回抽样。"
             "命中概率与期望值完全不变（任意"
             f" {pick_count} 个不同号命中概率恒为 {pick_count}/49），"
             "也不承诺提高命中率。"
         )
     elif wave_alloc == WAVE_ALLOC_BALANCED:
         notes.append(
-            "选号策略为波动轮取（均衡分散 + 按名次）：三个波动桶按非空桶均分注数"
-            f"（{pick_count} 注 → 各桶尽量均分，最多相差 1 注），轮转取号，"
-            "桶内优先挑「离已选号码最远」的号，避免号码挤在同一个连续区段。"
+            "选号策略为波动轮取（下期侧重 + 按名次）：按上一期波动把注数分给侧重池"
+            f"（权重 3:2:1，{pick_count} 注在三池都有号时主侧重最多），"
+            "桶内优先挑「离已选号码最远」的号。"
             "该口径为**确定性**（不随机），供历史审计快照复现。"
             "命中概率与期望值完全不变（任意"
             f" {pick_count} 个不同号命中概率恒为 {pick_count}/49）。"
