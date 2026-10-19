@@ -87,7 +87,7 @@ interface CandidatePoint {
  *   落在序列绘图区右边界上；其右侧留出号码标签宽度，不与右边缘贴死；
  * - y：默认绘图区内**等距槽位**（只为了让每个号码读得清，纵向不是数值/时间坐标）；
  *   传 candidateColumnByValue = true 时改为 y = yAt(value)：纵轴同单位时这一列即取值的点阵分布；
- * - 连线：从 candidateColumnFromIndex 指定的「最新真实数据点」向每个槽位画虚线扇形；
+ * - 连线：从 candidateColumnFromIndex 指定的「最新真实数据点」分别连到每个候选点，算法与主走势同一套 linePath；
  * - 标签：槽位间距不足时整列隐藏标签，号码交给光标提示（绝不重叠）。
  * 口径：本期候选，非真实开奖；纵列等距时只为人眼读号码，不表示取值大小。
  */
@@ -276,18 +276,6 @@ const COLUMN_LABEL_OFFSET = 7
 /** 候选列槽位在绘图区内的上/下留白（首末槽位不贴绘图区边） */
 const COLUMN_SLOT_PAD_TOP = 10
 const COLUMN_SLOT_PAD_BOTTOM = 10
-/**
- * 竖列扇形连线的弯曲量：把「最新真实数据点 → 每个候选槽位」的直线改成一条
- * 向外（图右）鼓起的二次贝塞尔弧，控制点取两端横向中点再右移 bow。
- * 候选列不再有固定带宽后，扇形横向跨度 = 一个等距 x 步长，会随屏幕/期数在约 7–30px 间变化：
- * 固定的 10px 弯曲在大步长下合适、在小步长下却会顶到候选列上（弧线被压平甚至反折）。
- * 故改为按**实际跨度**取固定比例（全确定性、无 Math.random）：全束连线仍朝同一侧、观感一致；
- * 比例 < 0.5 保证控制点横向恒落在两端之间，弧线不外溢绘图区/内容框，也不压到右侧号码标签。
- * 上/下限沿用原来的 10px 量级，并把步长很小（<6px）时的弯曲兜底到 2px，避免退化成完全笔直。
- */
-const COLUMN_FAN_BOW_RATIO = 0.35
-const COLUMN_FAN_BOW_MIN = 2
-const COLUMN_FAN_BOW_MAX = 10
 /** 槽位间距小于它时号码标签必互相压住：整列隐藏标签，号码改由光标提示给出（确定性降级） */
 const COLUMN_LABEL_MIN_SPACING = 11
 /**
@@ -1164,7 +1152,8 @@ const candidateGeometry = computed(() => {
  * - y：默认绘图区内**等距槽位**（slot 0 在上、slot n-1 在下）—— 纵向不是数值/时间坐标，
  *   只为让每个号码读得清；candidateColumnByValue = true 时改为按真实取值 yAt(value) 定位，
  *   纵轴同单位时这一列就是取值的点阵分布；调用方传的 value 两种模式都保留给提示框；
- * - 扇形连线：从 candidateColumnFromIndex 指定的「最新真实数据点」→ 每个槽位，虚线；
+ * - 预测折线：从 candidateColumnFromIndex 指定的「最新真实数据点」**分别**连到每个槽位，
+ *   每条都用与主走势同一套 linePath（两点退化为直线段）；
  * - 标签：真实值模式下按 y 升序上下交替 + 固定步长确定性错开；最小步长过小或错不开时
  *   整列隐藏标签，号码交给光标提示（绝不重叠）。
  * candidateColumn 为空时返回 null，模板整段不渲染（其余调用方零影响）。
@@ -1243,8 +1232,8 @@ const columnGeometry = computed(() => {
     for (const point of points) point.labelY = point.y + 3.2
   }
 
-  // 扇形起点：优先用调用方显式给的「最新真实数据点」下标；缺省回落到列槽前最后一个有效序列点。
-  // 下标必须落在当前渲染窗口内（SSR 首帧只画最近一屏），否则只画列、不画扇形。
+  // 折线起点：优先用调用方显式给的「最新真实数据点」下标；缺省回落到列槽前最后一个有效序列点。
+  // 下标必须落在当前渲染窗口内（SSR 首帧只画最近一屏），否则只画列、不画预测折线。
   let fromIndex: number | null = null
   const explicit = props.candidateColumnFromIndex
   if (typeof explicit === 'number' && Number.isFinite(explicit)) {
@@ -1273,32 +1262,29 @@ const columnGeometry = computed(() => {
     }
   }
 
+  // 每个候选点各画一条折线接回最新一期：与主走势同一套 linePath（两点时退化为直线段）
+  const colors = chartTone('emerald')
+  const lines = from
+    ? points.map((point) => ({
+        key: `col-line-${point.key}`,
+        d: linePath([
+          { x: from.x, y: from.y },
+          { x: point.x, y: point.y },
+        ]),
+      }))
+    : []
+
   return {
     x,
     points,
     from,
+    lines,
+    colors,
     count,
     // 间距足够、且真实值模式下标签能错开才画号码；否则整列只画点，号码交给光标提示（确定性降级，绝不重叠）
     showLabels: count <= 1 || (minStep >= COLUMN_LABEL_MIN_SPACING && separated),
   }
 })
-
-/**
- * 竖列扇形连线：从「最新真实数据点」到单个候选槽位的**向外鼓起**的二次贝塞尔弧（M … Q …）。
- * - 端点严格是 (point.x, point.y)：弧线仍精确收在每个槽位圆点上，只是中途鼓起；
- * - 弯曲量 bow 按实际横向跨度（= 一个等距 x 步长）取比例，并夹在 [MIN, MAX]；
- *   控制点 = 两端横向中点向右平移 bow，纵向取两端中点；
- *   因比例 0.35 < 0.5，控制点横向恒落在 [from.x, point.x] 内，纵向落在两端之间，
- *   由二次贝塞尔的凸包性质 ⇒ 弧线不外溢绘图区/内容框，也不压到右侧号码标签（标签从 point.x + 7 起）；
- * - 全确定性（无 Math.random），同一端点多次渲染逐点一致。
- */
-function fanArcPath(from: PathPoint, point: PathPoint) {
-  const span = Math.max(0, point.x - from.x)
-  const bow = Math.max(COLUMN_FAN_BOW_MIN, Math.min(COLUMN_FAN_BOW_MAX, span * COLUMN_FAN_BOW_RATIO))
-  const ctrlX = Math.min(point.x, (from.x + point.x) / 2 + bow)
-  const ctrlY = Math.min(plotBottom.value, Math.max(plotTop, (from.y + point.y) / 2))
-  return `M ${round(from.x)} ${round(from.y)} Q ${round(ctrlX)} ${round(ctrlY)} ${round(point.x)} ${round(point.y)}`
-}
 
 const gridLines = computed(() => {
   const count = 4
@@ -1938,18 +1924,26 @@ const hoverInfo = computed(() => {
 
             <!--
               本期候选段：接在预测点之后横向铺开的一串候选点（opt-in，默认不画）。
-              与主折线同一 x 标尺、同一 y 单位：虚线从这里接出去，读作「主线继续的一小段」；
+              与主折线同一 x 标尺、同一 y 单位：绿色实线接出去，读作「主线继续的一小段」；
               号码写在点旁（上下交替错开）。口径：本期候选，非真实开奖。
             -->
             <g v-if="candidateGeometry" aria-hidden="true">
               <path
                 :d="candidateGeometry.line"
                 fill="none"
-                :stroke="candidateGeometry.colors.stroke"
-                stroke-width="2"
+                :stroke="chartTone('emerald').glow"
+                stroke-width="7"
                 stroke-linecap="round"
                 stroke-linejoin="round"
-                stroke-dasharray="5 4"
+                opacity="0.28"
+              />
+              <path
+                :d="candidateGeometry.line"
+                fill="none"
+                :stroke="chartTone('emerald').stroke"
+                stroke-width="2.4"
+                stroke-linecap="round"
+                stroke-linejoin="round"
               />
               <g v-for="point in candidateGeometry.points" :key="`cand-${point.index}`">
                 <circle
@@ -1978,23 +1972,30 @@ const hoverInfo = computed(() => {
               竖列候选（opt-in，默认不画）：全部候选共用同一 x 的单列，x 就是最后一个等距下标（与真实期同一步长）。
               - 槽位纵向默认等距（只为人眼读号码，不是数值/时间坐标）；candidateColumnByValue 时
                 按真实取值定位（纵轴同单位 → 这一列就是取值的点阵分布）；绘图区外不画网格；
-              - 虚线扇形从「最新真实数据点」发散到每个槽位（口径：与最新号码的关联，非未来路径）；
+              - 绿色预测折线：每个候选点各自连回最新真实数据点，画法与主走势同一套 linePath；
               - 号码写在圆点右侧；槽位太密 / 真实值模式下错不开时整列隐藏标签（号码交给光标提示），绝不重叠。
               口径：本期候选，非真实开奖。
             -->
             <g v-if="columnGeometry" aria-hidden="true">
-              <template v-if="columnGeometry.from">
+              <g v-for="segment in columnGeometry.lines" :key="segment.key">
                 <path
-                  v-for="point in columnGeometry.points"
-                  :key="`colfan-${point.key}`"
-                  :d="fanArcPath(columnGeometry.from, point)"
+                  :d="segment.d"
                   fill="none"
-                  :stroke="point.tone.stroke"
-                  stroke-width="1.5"
-                  stroke-dasharray="3 3"
-                  opacity="0.6"
+                  :stroke="columnGeometry.colors.glow"
+                  stroke-width="7"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  opacity="0.28"
                 />
-              </template>
+                <path
+                  :d="segment.d"
+                  fill="none"
+                  :stroke="columnGeometry.colors.stroke"
+                  stroke-width="2.4"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </g>
               <g v-for="point in columnGeometry.points" :key="point.key">
                 <circle
                   :cx="point.x"

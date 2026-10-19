@@ -48,7 +48,7 @@ MODE_WEIGHTED = "weighted"
 MODE_SINGLE = "single"
 # 随机分配：把最大投注金额按金额最小单位随机拆给各注（各注金额允许不等）。
 MODE_RANDOM = "random"
-# 档位：10 码金额按角色写死，合计是各注相加，不从总预算反拆
+# 档位：默认 8 码金额按角色写死，合计是各注相加，不从总预算反拆；注数可改（1–10）
 MODE_LADDER = "ladder"
 MODE_LABELS = {
     MODE_EVEN: "均注",
@@ -77,15 +77,17 @@ TOTAL_AMOUNT_MIN = 5
 TOTAL_AMOUNT_MAX = 100
 DEFAULT_TOTAL_AMOUNT = 50
 DEFAULT_PICK_COUNT = 6
-# 10 码档位（mode=ladder）：金额先按角色定，合计 = 各注之和，不锁死总预算。
-# 主攻 2 注：尖刀默认 15（可改 20），另一注 10；常规 3 注各 5；防守 5 注各 3。
+# 档位（mode=ladder）：金额先按角色定，合计 = 各注之和，不锁死总预算。
+# 默认 8 码：主攻 2 注（尖刀 15/20 + 10）、常规 3 注各 5、防守 3 注各 3。
+# 注数可变：少于 8 从防守端截；多于 8 继续补防守 3 元，上限 PICK_COUNT_MAX。
 STAKE_TOP_DEFAULT = 15
 STAKE_TOP_CHOICES = (15, 20)
 STAKE_ATTACK_SECOND = 10
 STAKE_REGULAR = 5
 STAKE_REGULAR_COUNT = 3
 STAKE_DEFENSE = 3
-STAKE_DEFENSE_COUNT = 5
+STAKE_DEFENSE_COUNT = 3
+STAKE_LADDER_DEFAULT_COUNT = 8
 LADDER_ROLE_LABELS = {
     ROLE_PRIMARY: "主攻",
     ROLE_SECONDARY: "常规",
@@ -1491,20 +1493,27 @@ def take_from_role_band(
     return None
 
 
-def stake_ladder(top: int = STAKE_TOP_DEFAULT) -> list[tuple[str, int]]:
-    """10 码固定档位：``(角色, 金额)``。
+def stake_ladder(
+    top: int = STAKE_TOP_DEFAULT,
+    count: int | None = None,
+) -> list[tuple[str, int]]:
+    """档位金额表：``(角色, 金额)``，默认 8 码，注数可改。
 
-    顺序即出票顺序：尖刀主攻、第二主攻、常规 ×3、防守 ×5。
-    ``top`` 只接受 15 或 20，其它值回退 15。候选不足 10 个时从末尾（防守）截掉。
+    顺序：尖刀主攻、第二主攻、常规 ×3、防守 ×3；多于 8 时继续补防守 3 元。
+    ``top`` 只接受 15 或 20。``count`` 夹在 1–PICK_COUNT_MAX；候选不足时由调用方再截。
     """
     tip = int(top) if int(top) in STAKE_TOP_CHOICES else STAKE_TOP_DEFAULT
+    target = STAKE_LADDER_DEFAULT_COUNT if count is None else int(count)
+    target = min(PICK_COUNT_MAX, max(PICK_COUNT_MIN, target))
     rows: list[tuple[str, int]] = [
         (ROLE_PRIMARY, tip),
         (ROLE_PRIMARY, STAKE_ATTACK_SECOND),
     ]
     rows.extend((ROLE_SECONDARY, STAKE_REGULAR) for _ in range(STAKE_REGULAR_COUNT))
     rows.extend((ROLE_DEFENSE, STAKE_DEFENSE) for _ in range(STAKE_DEFENSE_COUNT))
-    return rows
+    while len(rows) < target:
+        rows.append((ROLE_DEFENSE, STAKE_DEFENSE))
+    return rows[:target]
 
 
 def assign_roles(pick_count: int) -> list[str]:
@@ -2497,18 +2506,23 @@ def recommend(
         if amount_seed not in (None, ""):
             seed_key = f"{seed_key}|explicit={amount_seed}"
 
-    # 档位：10 码金额写死，不走「总预算 // 单位」拆分，也不因预算不足把注数降成 0。
+    # 档位：金额按角色表写死（默认 8 码，注数跟 pick_count），不走总预算拆分。
     ladder_rows: list[tuple[str, int]] | None = None
     if mode == MODE_LADDER:
-        ladder_rows = stake_ladder(int(cfg["stake_top"]))
+        ladder_rows = stake_ladder(int(cfg["stake_top"]), pick_count)
         pick_count = len(ladder_rows)
         total = sum(amount for _, amount in ladder_rows)
+        primary_n = sum(1 for role, _ in ladder_rows if role == ROLE_PRIMARY)
+        regular_n = sum(1 for role, _ in ladder_rows if role == ROLE_SECONDARY)
+        defense_n = sum(1 for role, _ in ladder_rows if role == ROLE_DEFENSE)
+        tip_amount = ladder_rows[0][1] if ladder_rows else STAKE_TOP_DEFAULT
         allocation_notes.append(
             "档位金额不按固定总预算拆分："
-            f"主攻 {ladder_rows[0][1]} 元 + 主攻 {ladder_rows[1][1]} 元、"
-            f"常规 {STAKE_REGULAR_COUNT} 注各 {STAKE_REGULAR} 元、"
-            f"防守 {STAKE_DEFENSE_COUNT} 注各 {STAKE_DEFENSE} 元；"
-            f"合计 {total} 元是各注相加。尖刀只取 15 或 20。"
+            f"{pick_count} 码按角色相加（尖刀主攻 {tip_amount} 元"
+            + (f"、主攻 {STAKE_ATTACK_SECOND} 元" if primary_n > 1 else "")
+            + (f"、常规 {regular_n} 注各 {STAKE_REGULAR} 元" if regular_n else "")
+            + (f"、防守 {defense_n} 注各 {STAKE_DEFENSE} 元" if defense_n else "")
+            + f"）；合计 {total} 元。尖刀只取 15 或 20，注数可改。"
         )
         no_ticket_reason = None
         no_ticket_message = None
@@ -2871,7 +2885,7 @@ def recommend(
     picks.sort(key=lambda pick: focus.index(pick["wave_type"]))
     role_weights = role_amount_weights(cfg)
     if ladder_rows is not None:
-        # 候选不足 10 个时从防守那一端截掉，主攻 / 常规优先保留
+        # 候选不足时从防守那一端截掉，主攻 / 常规优先保留
         rows = ladder_rows[: len(picks)]
         roles = [role for role, _amount in rows]
         amounts = [amount for _role, amount in rows]

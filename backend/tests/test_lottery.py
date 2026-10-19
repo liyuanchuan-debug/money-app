@@ -228,13 +228,13 @@ def test_recommend_sweep(
 
     picks = result["picks"]
     if mode == MODE_LADDER:
-        assert len(picks) == 10
-        assert [pick["amount"] for pick in picks] == [15, 10, 5, 5, 5, 3, 3, 3, 3, 3]
-        assert [pick["role_label"] for pick in picks] == [
-            "主攻", "主攻", "常规", "常规", "常规", "防守", "防守", "防守", "防守", "防守",
-        ]
-        assert result["total_amount"] == 55
-        assert result["staked_total"] == 55
+        from services.lottery import stake_ladder
+
+        expected = stake_ladder(15, pick_count)
+        assert len(picks) == len(expected)
+        assert [pick["amount"] for pick in picks] == [amount for _, amount in expected]
+        assert result["total_amount"] == sum(amount for _, amount in expected)
+        assert result["staked_total"] == result["total_amount"]
         return
     expected_count = 1 if mode == MODE_SINGLE else pick_count
 
@@ -3234,20 +3234,26 @@ def test_recommend_api_unfundable_override_returns_no_ticket():
         assert "adopted_round" not in body
 
 
-def test_stake_ladder_ten_codes_and_top_switch():
-    """档位不按总预算拆：10 码为 15/10/5×3/3×5；尖刀可改成 20，合计跟着变。"""
+def test_stake_ladder_default_eight_and_count_switch():
+    """档位默认 8 码；注数可改；尖刀 15/20 合计跟着变。"""
     history = [18, 7, 33, 12, 41, 5, 26, 9]
-    base = dict(pick_count=3, total_amount=50, amount_unit=5, avoid_cold_enabled=False)
+    base = dict(pick_count=8, total_amount=50, amount_unit=5, avoid_cold_enabled=False)
     fifteen = recommend(
         latest=18, previous=7, history_numbers=history, settings={**base, "stake_top": 15}, mode=MODE_LADDER,
     )
     twenty = recommend(
         latest=18, previous=7, history_numbers=history, settings={**base, "stake_top": 20}, mode=MODE_LADDER,
     )
-    assert [p["amount"] for p in fifteen["picks"]] == [15, 10, 5, 5, 5, 3, 3, 3, 3, 3]
-    assert fifteen["total_amount"] == 55
-    assert [p["amount"] for p in twenty["picks"]] == [20, 10, 5, 5, 5, 3, 3, 3, 3, 3]
-    assert twenty["total_amount"] == 60
+    ten = recommend(
+        latest=18, previous=7, history_numbers=history,
+        settings={**base, "pick_count": 10, "stake_top": 15}, mode=MODE_LADDER,
+    )
+    assert [p["amount"] for p in fifteen["picks"]] == [15, 10, 5, 5, 5, 3, 3, 3]
+    assert fifteen["total_amount"] == 49
+    assert [p["amount"] for p in twenty["picks"]] == [20, 10, 5, 5, 5, 3, 3, 3]
+    assert twenty["total_amount"] == 54
+    assert [p["amount"] for p in ten["picks"]] == [15, 10, 5, 5, 5, 3, 3, 3, 3, 3]
+    assert ten["total_amount"] == 55
     assert {p["number"] for p in fifteen["picks"]} == {p["number"] for p in twenty["picks"]}
     assert any("不按固定总预算" in note for note in fifteen["notes"])
 
