@@ -141,9 +141,8 @@ DEFAULT_STALE_PERIODS = 60
 STALE_PERIODS_MIN = 1
 STALE_PERIODS_MAX = 999
 DEFAULT_STALE_WEIGHT = 0.3
-# 出现热度：最近 N 期一次都没出现的号码从财富密码候选池剔除（硬排除，不是打折）。
-# 只在本池样本 ≥ N 时生效；更短的样本证明不了「N 期没出现」。
-# 近期样本默认长度：选号历史、出现热度剔除、预测波动线、走势近窗都用这一档。
+# 近期样本默认长度：选号历史、预测波动线、走势近窗都用这一档。
+# 「近 N 期热度为 0 就剔除」的硬排除已停用；HEAT_ABSENT_WINDOW 仅保留兼容旧字段。
 RECENT_SAMPLE_WINDOW = 100
 HEAT_ABSENT_WINDOW = RECENT_SAMPLE_WINDOW
 # 权重取值范围（1.0 = 不降权）
@@ -2632,20 +2631,9 @@ def recommend(
         # 上期出过的号不避开（只打「重号」信息标签），所以候选池保留重号
         include_repeat_number=bool(cfg["include_repeat_number"]),
     )
-    # 出现热度：最近 100 期次数为 0 的号不进入财富密码（样本不足 100 期不启用）
+    # 出现热度硬排除已停用：近 100 期未出现的号仍可进入财富密码（只打「冷号」信息标签）。
     heat_window = HEAT_ABSENT_WINDOW
-    heat_absent = numbers_absent_in_heat_window(
-        periods_since_last,
-        sample_size=len(history),
-        window=heat_window,
-    )
-    if heat_absent:
-        for wave in WAVE_ORDER:
-            pools[wave] = [
-                item
-                for item in pools[wave]
-                if int(item["number"]) not in heat_absent
-            ]
+    heat_absent: set[int] = set()
 
     # 上期波动类型 → 本期侧重顺序
     prev_wave: dict[str, Any] | None = None
@@ -3052,26 +3040,18 @@ def recommend(
             "避冷加权已关闭：距上次出现多久都不影响选号与金额（旧行为）。"
         )
 
-    # 出现热度硬排除：近 100 期 0 次的号不进财富密码
-    if len(history) >= heat_window:
-        notes.append(
-            f"出现热度近 {heat_window} 期次数为 0 的号码已排除，不进入财富密码"
-            f"（本次排除 {len(heat_absent)} 个号）。"
-            "这是样本内筛选，不是概率，也不承诺提高命中率。"
-        )
-    else:
-        notes.append(
-            f"本池仅 {len(history)} 期，不足 {heat_window} 期，"
-            f"暂不按「近 {heat_window} 期未出现」排除号码。"
-        )
+    notes.append(
+        f"出现热度硬排除已停用：近 {heat_window} 期一次都没出现的号码仍可进入财富密码，"
+        "不再因「100 期未出现」从候选池剔除。"
+    )
 
     # 三类软降权：**已去除**，如实说明「只保留标签、不产生权重」
     notes.append(
         f"三类软降权（重号/同肖/冷号）已去除：上期特码 {latest} 本身、与上期同肖的号、"
         f"以及本池样本内连续 {stale_periods} 期以上未出现的号，"
         "都**不再降权、不再打折**。"
-        f"近 {heat_window} 期一次都没出现的号另按出现热度规则从候选池剔除，不进入财富密码；"
-        f"未满 {heat_window} 期、但仍被选中的号会标注「重号」「同肖」「冷号」（信息标签）。"
+        "近窗未出现的号也不会被硬剔除；"
+        "被选中时仍会标注「重号」「同肖」「冷号」（信息标签）。"
         "（历史权重值 0.5 / 0.8 / 0.3 已停用；写入这些设置也不会改变选号或金额。）"
     )
 
@@ -3189,8 +3169,8 @@ def recommend(
         # 避冷加权本次的生效摘要（只增不改；无被压低注时 penalized_picks = 0）
         "heat_absent": {
             "window": heat_window,
-            "applied": len(history) >= heat_window,
-            "excluded_count": len(heat_absent),
+            "applied": False,
+            "excluded_count": 0,
             "excluded_numbers": sorted(heat_absent),
         },
         "avoid_cold": {

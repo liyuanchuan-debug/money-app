@@ -3258,8 +3258,8 @@ def test_stake_ladder_default_eight_and_count_switch():
     assert any("不按固定总预算" in note for note in fifteen["notes"])
 
 
-def test_heat_absent_numbers_stay_out_of_wealth_password():
-    """最近 100 期出现次数为 0 的号不进入财富密码；样本不足 100 期不启用。"""
+def test_heat_absent_hard_exclude_disabled():
+    """近 100 期热度为 0 的硬排除已停用：冷号仍可进入财富密码。"""
     # 最新在前：近 100 期里只有 1 和（恰好落在第 100 格的）2；3..49 只出现在更早
     recent = [1] * HEAT_ABSENT_WINDOW
     recent[HEAT_ABSENT_WINDOW - 1] = 2
@@ -3284,12 +3284,12 @@ def test_heat_absent_numbers_stay_out_of_wealth_password():
         },
         period=1001,
     )
-    picked = {int(pick["number"]) for pick in result["picks"]}
-    assert picked == {1, 2}
-    assert picked.isdisjoint(absent)
-    assert result["heat_absent"]["applied"] is True
-    assert result["heat_absent"]["excluded_count"] == len(absent)
-    assert any("不进入财富密码" in note for note in result["notes"])
+    assert result["heat_absent"]["applied"] is False
+    assert result["heat_absent"]["excluded_count"] == 0
+    assert result["heat_absent"]["excluded_numbers"] == []
+    assert any("出现热度硬排除已停用" in note for note in result["notes"])
+    # 硬排除停用后，推荐不再被锁死在近窗仅出现过的 1、2
+    assert {int(pick["number"]) for pick in result["picks"]} != {1, 2}
 
     short = history[:30]
     short_result = recommend(
@@ -3300,4 +3300,4 @@ def test_heat_absent_numbers_stay_out_of_wealth_password():
     )
     assert short_result["heat_absent"]["applied"] is False
     assert short_result["heat_absent"]["excluded_numbers"] == []
-    assert any("不足 100 期" in note for note in short_result["notes"])
+    assert any("出现热度硬排除已停用" in note for note in short_result["notes"])

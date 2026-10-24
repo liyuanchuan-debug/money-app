@@ -255,8 +255,8 @@ export interface RecommendResult {
   /** 实际分配到各注的合计（避冷加权压低后可能 < total_amount） */
   staked_total?: number
   /**
-   * 出现热度硬排除：最近 `window` 期次数为 0 的号不进入财富密码。
-   * `applied=false` 表示本池样本短于窗口，这条规则未启用。
+   * 出现热度硬排除（已停用）：`applied` 恒为 false，不再因近窗未出现而剔除号码。
+   * 字段保留仅为兼容旧前端。
    */
   heat_absent?: {
     window: number
