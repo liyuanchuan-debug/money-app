@@ -277,6 +277,7 @@ function normalizeRecommendResult(raw: unknown): RecommendResult | undefined {
   const asArray = <T>(value: T[] | null | undefined): T[] =>
     Array.isArray(value) ? value : []
   const soft = source.soft_weights
+  const triple = source.triple_sets
   return {
     ...(source as RecommendResult),
     picks: asArray(source.picks),
@@ -284,6 +285,14 @@ function normalizeRecommendResult(raw: unknown): RecommendResult | undefined {
     missing_waves: asArray(source.missing_waves),
     focus_order: asArray(source.focus_order),
     latest_zodiac: asArray(source.latest_zodiac),
+    ...(triple
+      ? {
+          triple_sets: {
+            ...triple,
+            sets: asArray(triple.sets),
+          },
+        }
+      : {}),
     ...(soft
       ? {
           soft_weights: {
@@ -418,6 +427,17 @@ const softSummary = computed(() => result.value?.soft_weights ?? null)
 
 const lattice = computed(() => result.value?.lattice ?? null)
 const latticeBand = computed(() => lattice.value?.band ?? null)
+
+/** 三中三：后端从预测带派生；点阵关闭 / 无带时仍回块，前端按 status 展示或隐藏 */
+const tripleSets = computed(() => result.value?.triple_sets ?? null)
+const tripleSetsReady = computed(() => tripleSets.value?.status === 'ok')
+const showTripleSets = computed(() => {
+  const block = tripleSets.value
+  if (!block) return false
+  // 点阵未开 → 整块隐藏；有带但不足 / 已生成 → 展示（不足时给「数据不足」）
+  if (block.status === 'disabled') return false
+  return true
+})
 
 const WAVE_TREND_WINDOW_DEFAULT = 100
 const WAVE_TREND_WINDOW_OPTIONS = [30, 60, 100, 0]
@@ -1195,6 +1215,59 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
             </MotionReveal>
           </div>
         </section>
+
+        <!-- 三中三：从本期预测带内选 3 组 × 每组 3 号（不发明带外号码） -->
+        <MotionReveal v-if="showTripleSets" :index="5">
+          <GlassPanel padding="md" rounded="3xl" class="space-y-3">
+            <div class="space-y-1">
+              <h2 class="text-lg font-medium text-white">三中三</h2>
+              <p class="text-xs text-slate-500">
+                从本期预测带内选号组成 3 组，每组 3 个。
+                <template v-if="tripleSetsReady && tripleSets?.reuse">
+                  带内仅 {{ tripleSets.band_count }} 个号，组间允许复用。
+                </template>
+                <template v-else-if="tripleSetsReady">
+                  带内号码充足，三组互不重复。
+                </template>
+              </p>
+            </div>
+
+            <p
+              v-if="!tripleSetsReady"
+              class="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-200"
+              role="status"
+            >
+              {{ tripleSets?.note || '数据不足，无法组成三中三。' }}
+            </p>
+
+            <div
+              v-else
+              class="grid gap-2 sm:grid-cols-3"
+              role="list"
+              aria-label="三中三推荐组"
+            >
+              <GlassCard
+                v-for="group in tripleSets?.sets ?? []"
+                :key="group.index"
+                as="article"
+                padding="sm"
+                class="flex flex-col gap-2"
+                role="listitem"
+              >
+                <p class="text-[11px] text-slate-400">第 {{ group.index }} 组</p>
+                <div class="flex flex-wrap items-center gap-2">
+                  <SpecialBall
+                    v-for="num in group.numbers"
+                    :key="`${group.index}-${num}`"
+                    :number="num"
+                    size="sm"
+                    tone="aqua"
+                  />
+                </div>
+              </GlassCard>
+            </div>
+          </GlassPanel>
+        </MotionReveal>
 
         <MotionReveal v-if="lattice?.enabled && latticeBand && waveTrendChart.pointCount" :index="6">
           <GlassPanel padding="lg" rounded="3xl" class="space-y-3">

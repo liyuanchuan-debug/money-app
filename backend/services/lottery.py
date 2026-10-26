@@ -347,6 +347,23 @@ STATUS_NO_TICKET = "no_ticket"
 REASON_BUDGET_TOO_SMALL_FOR_ONE_UNIT = "BUDGET_TOO_SMALL_FOR_ONE_UNIT"
 # 设置写入校验：金额最小单位 > 最大投注金额（写入边界直接拒绝，不落库）
 REASON_AMOUNT_UNIT_EXCEEDS_TOTAL_AMOUNT = "AMOUNT_UNIT_EXCEEDS_TOTAL_AMOUNT"
+
+# --------------------------------------------------------------------------- #
+# 三中三（triple_sets）：从本期预测带内选 3 组、每组 3 个号（纯展示，不改选号）
+#
+# 状态一律英文枚举；汉字只出现在 status_label / note。
+# --------------------------------------------------------------------------- #
+TRIPLE_SETS_GROUP_COUNT = 3
+TRIPLE_SETS_GROUP_SIZE = 3
+TRIPLE_SETS_SEED_DOMAIN = "lottery.triple_sets.v1"
+TRIPLE_SETS_STATUS_OK = "ok"
+TRIPLE_SETS_STATUS_INSUFFICIENT = "insufficient"
+TRIPLE_SETS_STATUS_DISABLED = "disabled"
+TRIPLE_SETS_STATUS_LABELS = {
+    TRIPLE_SETS_STATUS_OK: "已生成",
+    TRIPLE_SETS_STATUS_INSUFFICIENT: "数据不足",
+    TRIPLE_SETS_STATUS_DISABLED: "预测带未开启",
+}
 REASON_TOTAL_AMOUNT_NOT_POSITIVE = "TOTAL_AMOUNT_NOT_POSITIVE"
 REASON_AMOUNT_UNIT_NOT_POSITIVE = "AMOUNT_UNIT_NOT_POSITIVE"
 REASON_PICK_COUNT_NOT_POSITIVE = "PICK_COUNT_NOT_POSITIVE"
@@ -1170,6 +1187,121 @@ def build_number_lattice(
             }
         )
     return rows
+
+
+def triple_sets_seed_key(
+    *,
+    period: Any,
+    latest: Any,
+    previous: Any,
+    band_numbers: Sequence[int],
+) -> str:
+    """三中三选号的确定性种子（SHA-256 十六进制串）。
+
+    材料含期号 / 最新·上期特码 / 排序后的带内号码；同输入 → 同三组，与时间无关。
+    """
+    payload = {
+        "domain": TRIPLE_SETS_SEED_DOMAIN,
+        "latest": int(latest),
+        "period": None if period is None else int(period),
+        "previous": None if previous is None else int(previous),
+        "band_numbers": sorted(int(n) for n in band_numbers),
+    }
+    if period is None:
+        payload["period_fallback"] = f"latest={int(latest)}|previous={previous}"
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def build_triple_sets(
+    band_numbers: Sequence[int],
+    *,
+    seed: Any = None,
+    group_count: int = TRIPLE_SETS_GROUP_COUNT,
+    group_size: int = TRIPLE_SETS_GROUP_SIZE,
+) -> dict[str, Any]:
+    """从预测带号码池生成「三中三」组合（纯展示；不发明带外号码）。
+
+    - 候选池 = ``band_numbers``（应已是 ``in_band`` 号码）；
+    - 池 < 3 → ``status=insufficient``，不编造号码；
+    - 池 ≥ 9 → 三组互不重复；
+    - 池 3–8 → 组内不重复，组间按需复用（先尽量不放回抽干，再回填整池）。
+    """
+    pool = sorted(
+        {
+            int(n)
+            for n in band_numbers
+            if NUMBER_MIN <= int(n) <= NUMBER_MAX
+        }
+    )
+    band_count = len(pool)
+    if band_count < group_size:
+        return {
+            "status": TRIPLE_SETS_STATUS_INSUFFICIENT,
+            "status_label": TRIPLE_SETS_STATUS_LABELS[TRIPLE_SETS_STATUS_INSUFFICIENT],
+            "band_count": band_count,
+            "reuse": False,
+            "sets": [],
+            "note": "预测带内号码不足 3 个，无法组成三中三。",
+        }
+
+    needed = group_count * group_size
+    reuse = band_count < needed
+    rng = _random_source(seed)
+    sets: list[dict[str, Any]] = []
+
+    if not reuse:
+        deck = pool[:]
+        rng.shuffle(deck)
+        for index in range(group_count):
+            start = index * group_size
+            numbers = sorted(deck[start : start + group_size])
+            sets.append({"index": index + 1, "numbers": numbers})
+        note = (
+            "从本期预测带内选号组成 3 组，每组 3 个；"
+            "带内号码充足，三组互不重复。"
+        )
+    else:
+        available = pool[:]
+        rng.shuffle(available)
+        for index in range(group_count):
+            group: list[int] = []
+            while len(group) < group_size:
+                if not available:
+                    available = [n for n in pool if n not in group]
+                    rng.shuffle(available)
+                group.append(available.pop())
+            sets.append({"index": index + 1, "numbers": sorted(group)})
+        note = (
+            f"从本期预测带内选号组成 3 组，每组 3 个；"
+            f"带内仅 {band_count} 个号，组间允许复用。"
+        )
+
+    return {
+        "status": TRIPLE_SETS_STATUS_OK,
+        "status_label": TRIPLE_SETS_STATUS_LABELS[TRIPLE_SETS_STATUS_OK],
+        "band_count": band_count,
+        "reuse": reuse,
+        "sets": sets,
+        "note": note,
+    }
+
+
+def empty_triple_sets(
+    *,
+    status: str,
+    note: str,
+    band_count: int = 0,
+) -> dict[str, Any]:
+    """点阵关闭 / 无预测带时的空三中三块（英文 status + 中文 note）。"""
+    return {
+        "status": status,
+        "status_label": TRIPLE_SETS_STATUS_LABELS.get(status, status),
+        "band_count": int(band_count),
+        "reuse": False,
+        "sets": [],
+        "note": note,
+    }
 
 
 def apply_soft_weights(
@@ -3130,6 +3262,31 @@ def recommend(
             "仅供历史审计复现，不建议线上使用。"
         )
 
+    # 三中三：仅从本期预测带内选号；点阵关闭 / 无带宽 → 不编造号码
+    if not lattice_enabled:
+        triple_sets = empty_triple_sets(
+            status=TRIPLE_SETS_STATUS_DISABLED,
+            note="预测波动线未开启，无法从预测带组成三中三。",
+        )
+    elif not lattice_band:
+        triple_sets = empty_triple_sets(
+            status=TRIPLE_SETS_STATUS_INSUFFICIENT,
+            note="数据不足：样本不足，本期无预测波动线，无法组成三中三。",
+        )
+    else:
+        band_numbers = [
+            int(row["number"]) for row in lattice_rows if row.get("in_band")
+        ]
+        triple_sets = build_triple_sets(
+            band_numbers,
+            seed=triple_sets_seed_key(
+                period=period,
+                latest=latest,
+                previous=previous,
+                band_numbers=band_numbers,
+            ),
+        )
+
     # 派生展示值（deprecated）：均分后再向下对齐到 amount_unit
     effective_notes = max(1, len(picks))
     no_ticket = len(picks) == 0
@@ -3237,6 +3394,8 @@ def recommend(
             # 说明点阵的新语义：只定义抽样概率分布，不参与排序
             "role": "sampling_distribution",
         },
+        # 三中三：从本期预测带内选 3 组 × 每组 3 号（纯展示；英文 status）
+        "triple_sets": triple_sets,
         "focus_order": [{"type": w, "label": WAVE_LABELS[w]} for w in focus],
         # 桶内取号方式（英文枚举 + 中文标签）：seeded_random / ranked
         "pick_sampling": pick_sampling,

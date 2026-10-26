@@ -87,7 +87,9 @@ from services.lottery import (
     build_candidate_pools,
     build_copy_text,
     build_number_lattice,
+    build_triple_sets,
     classify_wave,
+    empty_triple_sets,
     clamp_settings,
     compute_days_since_last,
     compute_periods_since_last,
@@ -106,6 +108,10 @@ from services.lottery import (
     resolve_zodiac_date,
     sampling_seed_key,
     select_score_top_candidates,
+    triple_sets_seed_key,
+    TRIPLE_SETS_STATUS_DISABLED,
+    TRIPLE_SETS_STATUS_INSUFFICIENT,
+    TRIPLE_SETS_STATUS_OK,
     soft_penalty_weight,
     trend_sampling_weight,
     validate_settings,
@@ -2769,6 +2775,126 @@ def test_recommend_lattice_disabled_matches_legacy_wave_round():
     assert len(lattice["numbers"]) == 49
     assert all(row["lattice_weight"] == 1.0 for row in lattice["numbers"])
     assert any("点阵已关闭" in note for note in result["notes"])
+    # 点阵关闭 → 三中三标记 disabled，不编造号码
+    triple = result["triple_sets"]
+    assert triple["status"] == TRIPLE_SETS_STATUS_DISABLED
+    assert triple["sets"] == []
+
+
+def test_build_triple_sets_insufficient_when_band_shorter_than_three():
+    """带内不足 3 号 → 数据不足，sets 为空，绝不发明带外号码。"""
+    empty = build_triple_sets([1, 2], seed="x")
+    assert empty["status"] == TRIPLE_SETS_STATUS_INSUFFICIENT
+    assert empty["band_count"] == 2
+    assert empty["sets"] == []
+    assert empty["reuse"] is False
+    assert "不足" in empty["note"]
+
+
+def test_build_triple_sets_disjoint_when_band_has_at_least_nine():
+    """带内 ≥ 9：三组互不重复，每组恰 3 个号。"""
+    pool = list(range(1, 12))  # 11 个
+    result = build_triple_sets(pool, seed="period-1")
+    assert result["status"] == TRIPLE_SETS_STATUS_OK
+    assert result["reuse"] is False
+    assert result["band_count"] == 11
+    assert len(result["sets"]) == 3
+    used: list[int] = []
+    for group in result["sets"]:
+        assert len(group["numbers"]) == 3
+        assert len(set(group["numbers"])) == 3
+        assert group["numbers"] == sorted(group["numbers"])
+        used.extend(group["numbers"])
+    assert len(used) == len(set(used)) == 9
+    assert set(used).issubset(set(pool))
+
+
+def test_build_triple_sets_allows_reuse_when_band_has_three_to_eight():
+    """带内 3–8：组内不重复，组间按需复用。"""
+    pool = [5, 12, 19, 26, 33, 40]  # 6 个
+    result = build_triple_sets(pool, seed="short-band")
+    assert result["status"] == TRIPLE_SETS_STATUS_OK
+    assert result["reuse"] is True
+    assert result["band_count"] == 6
+    assert len(result["sets"]) == 3
+    for group in result["sets"]:
+        assert len(group["numbers"]) == 3
+        assert len(set(group["numbers"])) == 3
+        assert set(group["numbers"]).issubset(set(pool))
+    # 前两组应尽量不重叠地用完 6 个（不放回抽干）
+    first_two = result["sets"][0]["numbers"] + result["sets"][1]["numbers"]
+    assert sorted(first_two) == sorted(pool)
+
+
+def test_build_triple_sets_is_deterministic_for_same_seed():
+    pool = list(range(10, 25))
+    first = build_triple_sets(pool, seed="same")
+    second = build_triple_sets(pool, seed="same")
+    assert first == second
+    assert build_triple_sets(pool, seed="other") != first
+
+
+def test_triple_sets_seed_key_is_stable():
+    a = triple_sets_seed_key(
+        period=100, latest=18, previous=7, band_numbers=[3, 1, 2]
+    )
+    b = triple_sets_seed_key(
+        period=100, latest=18, previous=7, band_numbers=[1, 2, 3]
+    )
+    assert a == b
+    assert len(a) == 64
+    different = triple_sets_seed_key(
+        period=101, latest=18, previous=7, band_numbers=[1, 2, 3]
+    )
+    assert different != a
+
+
+def test_recommend_triple_sets_from_prediction_band():
+    """recommend 回包的三中三只使用 lattice.in_band 号码。"""
+    history = [18, 7, 33, 12, 41, 5, 26, 9, 44, 3, 17, 38, 11, 22, 6, 31, 15, 47]
+    result = recommend(
+        latest=18,
+        previous=7,
+        history_numbers=history,
+        period=200,
+        settings={"lattice_enabled": True, "lattice_window": 30, "pick_count": 6},
+    )
+    triple = result["triple_sets"]
+    band_nums = {
+        row["number"] for row in result["lattice"]["numbers"] if row["in_band"]
+    }
+    assert result["lattice"]["band"] is not None
+    if len(band_nums) < 3:
+        assert triple["status"] == TRIPLE_SETS_STATUS_INSUFFICIENT
+        assert triple["sets"] == []
+    else:
+        assert triple["status"] == TRIPLE_SETS_STATUS_OK
+        assert len(triple["sets"]) == 3
+        for group in triple["sets"]:
+            assert set(group["numbers"]).issubset(band_nums)
+        # 同期再算一次 → 逐字段相同
+        again = recommend(
+            latest=18,
+            previous=7,
+            history_numbers=history,
+            period=200,
+            settings={
+                "lattice_enabled": True,
+                "lattice_window": 30,
+                "pick_count": 6,
+            },
+        )
+        assert again["triple_sets"] == triple
+
+
+def test_empty_triple_sets_helper_shape():
+    block = empty_triple_sets(
+        status=TRIPLE_SETS_STATUS_DISABLED,
+        note="预测波动线未开启，无法从预测带组成三中三。",
+    )
+    assert block["status"] == TRIPLE_SETS_STATUS_DISABLED
+    assert block["sets"] == []
+    assert block["reuse"] is False
 
 
 def test_recommend_picks_expose_all_new_fields():

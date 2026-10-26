@@ -324,6 +324,22 @@ export interface RecommendResult {
       is_latest: boolean
     }>
   }
+  /**
+   * 三中三：从本期预测带内选 3 组、每组 3 个号（纯展示）。
+   * status 英文枚举：ok | insufficient | disabled；汉字只在 status_label / note。
+   */
+  triple_sets?: {
+    status: 'ok' | 'insufficient' | 'disabled' | string
+    status_label: string
+    band_count: number
+    /** 带内不足 9 个号时组间允许复用 */
+    reuse: boolean
+    sets: Array<{
+      index: number
+      numbers: number[]
+    }>
+    note: string
+  }
   focus_order: Array<{ type: string; label: string }>
   picks: Pick[]
   missing_waves: Array<{ type: string; label: string; note: string }>
