@@ -100,6 +100,11 @@ interface ColumnCandidate {
   zodiac?: string
   /** 单点色调（如按是否落在预测带内区分）；缺省用 candidateTone */
   tone?: ChartTone
+  /**
+   * 是否选中画扇形线（opt-in）。缺省 true = 与改造前一致（列内点都连线）。
+   * false：淡点可点，不画线。
+   */
+  selected?: boolean
 }
 
 /**
@@ -237,7 +242,11 @@ const props = withDefaults(
   },
 )
 
-const emit = defineEmits<{ 'update:windowSize': [value: number] }>()
+const emit = defineEmits<{
+  'update:windowSize': [value: number]
+  /** 竖列候选点被点按（号码取值）；调用方用来切换选中 */
+  'candidate-click': [payload: { value: number }]
+}>()
 
 const VB_WIDTH = 720
 const PAD = { top: 18, right: 18, bottom: 26, left: 42 }
@@ -1170,47 +1179,55 @@ const columnGeometry = computed(() => {
   const span = Math.max(1, bottom - top)
   const spacing = count > 1 ? span / (count - 1) : span
   const x = columnX.value
-  const points = list.map((item, i) => ({
-    key: `col-${i}`,
-    x,
-    // 槽位 y：默认等距（纵向只为人眼读号码，不是数值轴）；
-    // candidateColumnByValue = true 时按真实取值 yAt(value)（纵轴同单位 → 这一列就是取值的点阵分布），
-    // 并夹在绘图区内（防御：取值越界时不画到图外）。value 两种模式都保留给光标提示。
-    y: byValue
-      ? Math.min(bottom, Math.max(top, yAt(item.value)))
-      : (count <= 1 ? (top + bottom) / 2 : top + (span * i) / (count - 1)),
-    value: item.value,
-    label: item.label ? String(item.label) : '',
-    zodiac: item.zodiac ? String(item.zodiac) : '',
-    tone: item.tone ? chartTone(item.tone) : chartTone(props.candidateTone),
-    /** 标签基线 y：等距模式沿用改造前的「圆点右侧、纵向居中」（下方赋值）；
-     *  真实值模式由下方确定性错开给出；错不开 / 步长过小则整列隐藏标签。 */
-    labelY: 0,
-  }))
+  const points = list.map((item, i) => {
+    const selected = item.selected !== false
+    return {
+      key: `col-${i}`,
+      x,
+      // 槽位 y：默认等距（纵向只为人眼读号码，不是数值轴）；
+      // candidateColumnByValue = true 时按真实取值 yAt(value)（纵轴同单位 → 这一列就是取值的点阵分布），
+      // 并夹在绘图区内（防御：取值越界时不画到图外）。value 两种模式都保留给光标提示。
+      y: byValue
+        ? Math.min(bottom, Math.max(top, yAt(item.value)))
+        : (count <= 1 ? (top + bottom) / 2 : top + (span * i) / (count - 1)),
+      value: item.value,
+      label: item.label ? String(item.label) : '',
+      zodiac: item.zodiac ? String(item.zodiac) : '',
+      tone: item.tone ? chartTone(item.tone) : chartTone(props.candidateTone),
+      selected,
+      /** 标签基线 y：等距模式沿用改造前的「圆点右侧、纵向居中」（下方赋值）；
+       *  真实值模式由下方确定性错开给出；错不开 / 步长过小则整列隐藏标签。 */
+      labelY: 0,
+    }
+  })
 
   /**
-   * 标签「最小步长」：默认等距模式 = 槽位间距；
-   * 真实值模式 = 相邻取值的最小纵向间距（号码挤在一起时会很小）。
-   * 小于 COLUMN_LABEL_MIN_SPACING 时标签必互相压住 → 整列隐藏（号码交给光标提示）。
+   * 标签只给**选中点**：全量 01–49 时若按全部点算间距，标签永远被压掉。
+   * 真实值模式 = 相邻选中点的最小纵向间距；过小则整列隐藏标签（号码交给光标提示）。
    */
+  const labelSources = points.filter((point) => point.selected)
+  const labelCount = labelSources.length
   let minStep = spacing
-  if (byValue && count > 1) {
-    const ys = points.map((point) => point.y).sort((a, b) => a - b)
+  if (byValue && labelCount > 1) {
+    const ys = labelSources.map((point) => point.y).sort((a, b) => a - b)
     minStep = Infinity
     for (let i = 1; i < ys.length; i += 1) minStep = Math.min(minStep, ys[i] - ys[i - 1])
+  } else if (!byValue && count > 1) {
+    minStep = spacing
   }
   let separated = true
   if (byValue) {
-    // 真实值定位：圆点必须留在真实取值上，只把**标签**错开 ——
+    // 真实值定位：圆点必须留在真实取值上，只把**选中点标签**错开 ——
     // 按 y 升序排名上下交替（偶数在上、奇数在下），同一侧按固定步长拉开；
     // 全部确定性（无 Math.random）。同侧仍压不住则整列隐藏标签，绝不重叠。
-    const ranked = points
-      .map((point, i) => ({ i, y: point.y }))
+    for (const point of points) point.labelY = point.y + 3.2
+    const ranked = labelSources
+      .map((point, i) => ({ i, y: point.y, point }))
       .sort((a, b) => a.y - b.y || a.i - b.i)
     const usedTop: number[] = []
     const usedBottom: number[] = []
     for (let rank = 0; rank < ranked.length; rank += 1) {
-      const point = points[ranked[rank].i]
+      const point = ranked[rank].point
       const above = rank % 2 === 0
       const pool = above ? usedTop : usedBottom
       const step = above ? -COLUMN_LABEL_STEP : COLUMN_LABEL_STEP
@@ -1262,15 +1279,18 @@ const columnGeometry = computed(() => {
     }
   }
 
-  // 每个候选点各画一条折线接回最新一期：与主走势同一套 linePath（两点时退化为直线段）
-  const colors = chartTone('emerald')
+  // 每个**选中**候选点各画一条折线接回最新一期；线色跟该点 tone（预测绿 / 自选紫）
   const lines = from
-    ? points.map((point) => ({
+    ? points
+      .filter((point) => point.selected)
+      .map((point) => ({
         key: `col-line-${point.key}`,
         d: linePath([
           { x: from.x, y: from.y },
           { x: point.x, y: point.y },
         ]),
+        stroke: point.tone.stroke,
+        glow: point.tone.glow,
       }))
     : []
 
@@ -1279,10 +1299,9 @@ const columnGeometry = computed(() => {
     points,
     from,
     lines,
-    colors,
     count,
     // 间距足够、且真实值模式下标签能错开才画号码；否则整列只画点，号码交给光标提示（确定性降级，绝不重叠）
-    showLabels: count <= 1 || (minStep >= COLUMN_LABEL_MIN_SPACING && separated),
+    showLabels: labelCount <= 1 || (minStep >= COLUMN_LABEL_MIN_SPACING && separated),
   }
 })
 
@@ -1359,13 +1378,38 @@ const hoverCandidate = computed(() => {
   return candidateGeometry.value?.points.find((point) => point.index === index) ?? null
 })
 
-/** 光标落在竖列候选槽位时，整列几何（用于整体高亮 + 提示框标注） */
+/**
+ * 光标落在竖列时：高亮「当前悬停的单点」（由 hit 圆写入），
+ * 不再整列 49 点一起亮。
+ */
+const hoverColumnPointValue = ref<number | null>(null)
+
 const hoverColumn = computed(() => {
   const index = focusIndex.value
   if (index === null || !hasColumn.value) return null
   if (index !== columnSlotIndex.value) return null
-  return columnGeometry.value
+  const geo = columnGeometry.value
+  if (!geo) return null
+  const value = hoverColumnPointValue.value
+  if (value === null) {
+    return { ...geo, points: geo.points.filter((point) => point.selected) }
+  }
+  const hit = geo.points.find((point) => point.value === value)
+  return hit ? { ...geo, points: [hit] } : { ...geo, points: [] }
 })
+
+function onCandidatePointEnter(value: number) {
+  hoverColumnPointValue.value = value
+  hoverIndex.value = columnSlotIndex.value
+}
+
+function onCandidatePointLeave() {
+  hoverColumnPointValue.value = null
+}
+
+function onCandidatePointClick(value: number) {
+  emit('candidate-click', { value })
+}
 
 const gesture = reactive({
   active: false,
@@ -1470,6 +1514,7 @@ function onPointerMove(event: PointerEvent) {
 
 function clearHover() {
   hoverIndex.value = null
+  hoverColumnPointValue.value = null
 }
 
 function onPointerDown(event: PointerEvent) {
@@ -1981,7 +2026,7 @@ const hoverInfo = computed(() => {
                 <path
                   :d="segment.d"
                   fill="none"
-                  :stroke="columnGeometry.colors.glow"
+                  :stroke="segment.glow"
                   stroke-width="7"
                   stroke-linecap="round"
                   stroke-linejoin="round"
@@ -1990,7 +2035,7 @@ const hoverInfo = computed(() => {
                 <path
                   :d="segment.d"
                   fill="none"
-                  :stroke="columnGeometry.colors.stroke"
+                  :stroke="segment.stroke"
                   stroke-width="2.4"
                   stroke-linecap="round"
                   stroke-linejoin="round"
@@ -2000,13 +2045,14 @@ const hoverInfo = computed(() => {
                 <circle
                   :cx="point.x"
                   :cy="point.y"
-                  r="3.6"
+                  :r="point.selected ? 3.6 : 2.2"
                   :fill="point.tone.stroke"
+                  :opacity="point.selected ? 1 : 0.28"
                   stroke="rgba(5, 6, 15, 0.85)"
-                  stroke-width="1.4"
+                  :stroke-width="point.selected ? 1.4 : 0.9"
                 />
                 <text
-                  v-if="point.label && columnGeometry.showLabels"
+                  v-if="point.selected && point.label && columnGeometry.showLabels"
                   :x="point.x + COLUMN_LABEL_OFFSET"
                   :y="point.labelY"
                   text-anchor="start"
@@ -2025,7 +2071,7 @@ const hoverInfo = computed(() => {
                 font-size="8.5"
                 fill="rgba(148, 163, 184, 0.6)"
               >
-                {{ props.candidateColumnByValue ? '竖列候选 · 按真实值排布' : '竖列候选 · 非数值轴' }}
+                {{ props.candidateColumnByValue ? '竖列候选 · 点选连线' : '竖列候选 · 非数值轴' }}
               </text>
             </g>
 
@@ -2131,6 +2177,21 @@ const hoverInfo = computed(() => {
               @pointercancel="onPointerUp"
               @pointerleave="clearHover"
             />
+            <!-- 竖列点命中层：叠在热区之上，才能点选单个号码切换连线 -->
+            <g v-if="columnGeometry">
+              <circle
+                v-for="point in columnGeometry.points"
+                :key="`hit-${point.key}`"
+                :cx="point.x"
+                :cy="point.y"
+                r="7"
+                fill="transparent"
+                class="cursor-pointer"
+                @pointerenter="onCandidatePointEnter(point.value)"
+                @pointerleave="onCandidatePointLeave"
+                @click.stop="onCandidatePointClick(point.value)"
+              />
+            </g>
           </svg>
         </template>
       </div>

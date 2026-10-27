@@ -58,8 +58,14 @@ const props = withDefaults(
     showLabels?: boolean
     /** 高亮某几格（如最新一期） */
     highlight?: Array<number | string>
-    /** 次要标识（如本期预测号码；角标「预」+ 绿色描边，与最新一期 aqua 高亮可并存） */
+    /** 次要标识（如本期预测号码；角标「预」，与是否选中画线无关） */
     marked?: Array<number | string>
+    /** 本期预测号中落在预测带外的（选中时 bloom 红描边，与点阵带外红点一致） */
+    markedOutBand?: Array<number | string>
+    /** 当前选中、会在点阵上连线的号码 */
+    selected?: Array<number | string>
+    /** 单击切换选中（与点阵共用状态）；开时不再用单击做读数切换 */
+    selectable?: boolean
     /** 格子间距（viewBox 单位） */
     gap?: number
     /** 是否显示色阶图例（含点按读数）；默认关，避免影响未打开它的调用方布局 */
@@ -84,6 +90,9 @@ const props = withDefaults(
     showLabels: false,
     highlight: () => [],
     marked: () => [],
+    markedOutBand: () => [],
+    selected: () => [],
+    selectable: false,
     gap: 6,
     legend: false,
     valueUnit: '',
@@ -170,8 +179,14 @@ interface Cell {
   isTop: boolean
   isHighlighted: boolean
   isMarked: boolean
+  isMarkedOutBand: boolean
+  isSelected: boolean
   showMeta: boolean
 }
+
+const emit = defineEmits<{
+  toggle: [number: number | string]
+}>()
 
 /**
  * 格内排版：号码是唯一主视觉；生肖 + 天数合成一行副标，避免三行硬堆。
@@ -218,6 +233,8 @@ const layout = computed<Cell[]>(() =>
       isTop: level > 0 && level === maxLevel.value,
       isHighlighted: props.highlight.some(item => String(item) === String(cell.number)),
       isMarked: props.marked.some(item => String(item) === String(cell.number)),
+      isMarkedOutBand: props.markedOutBand.some(item => String(item) === String(cell.number)),
+      isSelected: props.selected.some(item => String(item) === String(cell.number)),
       showMeta: showMeta && Boolean(caption),
     }
   }),
@@ -246,19 +263,20 @@ function ruleStroke(cell: Cell) {
 }
 
 /**
- * 描边直接用本档的 stroke：零值档是极淡中性灰、普通档是同色相实色，
- * 最高档是 useChartTheme 换上的**家族强调色**（让它和零值档的暗色块一眼分开）。
- * 高亮（最新一期）优先级最高，覆盖档位描边。
+ * 描边优先级：最新一期 aqua → 选中画线（带内绿 / 带外红 / 自选紫）→ 档位描边。
+ * 「预」角标单独表达预测身份，未选中的预测号不再靠绿描边占位。
  */
 function cellStroke(cell: Cell) {
   if (cell.isHighlighted) return 'rgba(161, 241, 255, 0.95)'
-  if (cell.isMarked) return 'rgba(52, 211, 153, 0.88)'
+  if (cell.isSelected && cell.isMarkedOutBand) return 'rgba(255, 106, 141, 0.92)'
+  if (cell.isSelected && cell.isMarked) return 'rgba(52, 211, 153, 0.92)'
+  if (cell.isSelected) return 'rgba(154, 123, 255, 0.92)'
   return (binByLevel.value.get(cell.level) ?? bins.value[0])?.stroke ?? 'rgba(255, 255, 255, 0.10)'
 }
 
 function cellStrokeWidth(cell: Cell) {
   if (cell.isHighlighted) return 2.2
-  if (cell.isMarked) return 2
+  if (cell.isSelected) return 2.1
   if (focusIndex.value === cell.index) return 2.2
   return 1.1
 }
@@ -281,6 +299,12 @@ const activeIndex = ref<number | null>(null)
 const focusIndex = computed(() => activeIndex.value ?? hoverIndex.value)
 
 function toggleCell(index: number) {
+  const cell = layout.value[index]
+  if (props.selectable && cell) {
+    emit('toggle', cell.number)
+    activeIndex.value = index
+    return
+  }
   activeIndex.value = activeIndex.value === index ? null : index
 }
 
@@ -456,7 +480,9 @@ const gridLabel = computed(
             <span class="num font-semibold text-slate-100">{{ readout.number }}</span>
             <span class="num text-slate-200">{{ readout.value }}{{ props.valueUnit }}</span>
           </template>
-          <span v-else class="text-slate-500">点按格子查看具体数值</span>
+          <span v-else class="text-slate-500">
+            {{ props.selectable ? '点按格子勾选连线 · 绿=带内预测 · 红=带外预测 · 紫=自选' : '点按格子查看具体数值' }}
+          </span>
         </p>
         <HeatScaleLegend :items="legendItems" :caption="legendCaption" />
       </div>

@@ -78,16 +78,19 @@ TOTAL_AMOUNT_MAX = 100
 DEFAULT_TOTAL_AMOUNT = 50
 DEFAULT_PICK_COUNT = 6
 # 档位（mode=ladder）：金额先按角色定，合计 = 各注之和，不锁死总预算。
-# 默认 8 码：主攻 2 注（尖刀 15/20 + 10）、常规 3 注各 5、防守 3 注各 3。
-# 注数可变：少于 8 从防守端截；多于 8 继续补防守 3 元，上限 PICK_COUNT_MAX。
+# 容量：尖刀 1～2（≥11 注时 2）→ 10 元 ≤3 → 5 元 ≤5 → 其余 3 元；默认 8 码。
 STAKE_TOP_DEFAULT = 15
 STAKE_TOP_CHOICES = (15, 20)
 STAKE_ATTACK_SECOND = 10
 STAKE_REGULAR = 5
-STAKE_REGULAR_COUNT = 3
 STAKE_DEFENSE = 3
-STAKE_DEFENSE_COUNT = 3
+# 档位容量：一档尖刀 1～2；二档（10 元）≤3；五元档 ≤5；其余进 3 元档
+STAKE_TIP_MAX = 2
+STAKE_ATTACK_SECOND_MAX = 3
+STAKE_REGULAR_MAX = 5
 STAKE_LADDER_DEFAULT_COUNT = 8
+# 注数达到该值时一档可升到 2 注，否则默认 1 注
+STAKE_TIP_TWO_MIN_COUNT = 11
 LADDER_ROLE_LABELS = {
     ROLE_PRIMARY: "主攻",
     ROLE_SECONDARY: "常规",
@@ -1624,26 +1627,44 @@ def take_from_role_band(
     return None
 
 
+def stake_ladder_tier_counts(count: int) -> tuple[int, int, int, int]:
+    """按注数切分四档容量：``(尖刀, 10元, 5元, 3元)``。
+
+    - 一档（尖刀）：1～2（注数 ≥ ``STAKE_TIP_TWO_MIN_COUNT`` 时取 2，否则 1）
+    - 二档（10 元）：不超过 ``STAKE_ATTACK_SECOND_MAX``
+    - 五元档：不超过 ``STAKE_REGULAR_MAX``
+    - 其余全部进 3 元档
+    """
+    target = max(0, int(count))
+    if target <= 0:
+        return 0, 0, 0, 0
+    tip_n = min(STAKE_TIP_MAX, 2 if target >= STAKE_TIP_TWO_MIN_COUNT else 1, target)
+    rem = target - tip_n
+    second_n = min(STAKE_ATTACK_SECOND_MAX, rem)
+    rem -= second_n
+    regular_n = min(STAKE_REGULAR_MAX, rem)
+    defense_n = rem - regular_n
+    return tip_n, second_n, regular_n, defense_n
+
+
 def stake_ladder(
     top: int = STAKE_TOP_DEFAULT,
     count: int | None = None,
 ) -> list[tuple[str, int]]:
     """档位金额表：``(角色, 金额)``，默认 8 码，注数可改。
 
-    顺序：尖刀主攻、第二主攻、常规 ×3、防守 ×3；多于 8 时继续补防守 3 元。
+    顺序：尖刀（1～2）→ 10 元（≤3）→ 5 元（≤5）→ 其余 3 元。
     ``top`` 只接受 15 或 20。``count`` 夹在 1–PICK_COUNT_MAX；候选不足时由调用方再截。
     """
     tip = int(top) if int(top) in STAKE_TOP_CHOICES else STAKE_TOP_DEFAULT
     target = STAKE_LADDER_DEFAULT_COUNT if count is None else int(count)
     target = min(PICK_COUNT_MAX, max(PICK_COUNT_MIN, target))
-    rows: list[tuple[str, int]] = [
-        (ROLE_PRIMARY, tip),
-        (ROLE_PRIMARY, STAKE_ATTACK_SECOND),
-    ]
-    rows.extend((ROLE_SECONDARY, STAKE_REGULAR) for _ in range(STAKE_REGULAR_COUNT))
-    rows.extend((ROLE_DEFENSE, STAKE_DEFENSE) for _ in range(STAKE_DEFENSE_COUNT))
-    while len(rows) < target:
-        rows.append((ROLE_DEFENSE, STAKE_DEFENSE))
+    tip_n, second_n, regular_n, defense_n = stake_ladder_tier_counts(target)
+    rows: list[tuple[str, int]] = []
+    rows.extend((ROLE_PRIMARY, tip) for _ in range(tip_n))
+    rows.extend((ROLE_PRIMARY, STAKE_ATTACK_SECOND) for _ in range(second_n))
+    rows.extend((ROLE_SECONDARY, STAKE_REGULAR) for _ in range(regular_n))
+    rows.extend((ROLE_DEFENSE, STAKE_DEFENSE) for _ in range(defense_n))
     return rows[:target]
 
 
@@ -2643,17 +2664,18 @@ def recommend(
         ladder_rows = stake_ladder(int(cfg["stake_top"]), pick_count)
         pick_count = len(ladder_rows)
         total = sum(amount for _, amount in ladder_rows)
-        primary_n = sum(1 for role, _ in ladder_rows if role == ROLE_PRIMARY)
-        regular_n = sum(1 for role, _ in ladder_rows if role == ROLE_SECONDARY)
-        defense_n = sum(1 for role, _ in ladder_rows if role == ROLE_DEFENSE)
+        tip_n = sum(1 for _, amount in ladder_rows if amount in STAKE_TOP_CHOICES)
+        second_n = sum(1 for _, amount in ladder_rows if amount == STAKE_ATTACK_SECOND)
+        regular_n = sum(1 for _, amount in ladder_rows if amount == STAKE_REGULAR)
+        defense_n = sum(1 for _, amount in ladder_rows if amount == STAKE_DEFENSE)
         tip_amount = ladder_rows[0][1] if ladder_rows else STAKE_TOP_DEFAULT
         allocation_notes.append(
             "档位金额不按固定总预算拆分："
-            f"{pick_count} 码按角色相加（尖刀主攻 {tip_amount} 元"
-            + (f"、主攻 {STAKE_ATTACK_SECOND} 元" if primary_n > 1 else "")
-            + (f"、常规 {regular_n} 注各 {STAKE_REGULAR} 元" if regular_n else "")
-            + (f"、防守 {defense_n} 注各 {STAKE_DEFENSE} 元" if defense_n else "")
-            + f"）；合计 {total} 元。尖刀只取 15 或 20，注数可改。"
+            f"{pick_count} 码按档相加（尖刀 {tip_n} 注各 {tip_amount} 元"
+            + (f"、10 元档 {second_n} 注" if second_n else "")
+            + (f"、5 元档 {regular_n} 注" if regular_n else "")
+            + (f"、3 元档 {defense_n} 注" if defense_n else "")
+            + f"）；合计 {total} 元。尖刀只取 15 或 20；一档≤2、二档≤3、五元档≤5，其余进 3 元。"
         )
         no_ticket_reason = None
         no_ticket_message = None

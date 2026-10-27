@@ -61,6 +61,8 @@ const activeWaveTab = ref<'small' | 'normal' | 'big'>('small')
 /** 下方「走势分布参考」大区块默认折叠，避免与卡片内同角色参考号重复刷屏 */
 const trendDistExpanded = ref(false)
 const copied = ref(false)
+/** 最近一次复制来源，用于对应按钮显示「已复制」 */
+const copiedSource = ref<'ticket' | 'triple' | `group-${number}` | ''>('')
 const copyError = ref('')
 const generateHit = useHitPulse()
 const copyHit = useHitPulse()
@@ -236,6 +238,13 @@ const heatPickMarkedNumbers = computed(() =>
   (result.value?.picks ?? []).map(pick => pad(pick.number)),
 )
 
+/** 本期预测号里落在预测带外的（点阵 / 热力勾选时用 bloom 红，与改造前一致） */
+const heatPickOutBandNumbers = computed(() =>
+  (result.value?.picks ?? [])
+    .filter(pick => pick.in_lattice_band !== true)
+    .map(pick => pad(pick.number)),
+)
+
 /** 图例口径随所选窗口走，保证图例与格子永不打架（只描述样本内计数，无预测含义） */
 const heatScope = computed(() => scopeLabel(heatWindowEffective.value))
 
@@ -308,6 +317,169 @@ function normalizeRecommendResult(raw: unknown): RecommendResult | undefined {
 
 /** 模板统一读这个归一化后的对象（`result.value` 语义不变，只是数组字段一定存在） */
 const result = computed(() => normalizeRecommendResult(rawResult.value))
+
+/** 点阵 / 热力共用：当前选中会连线的号码（默认 = 本期预测 picks） */
+const latticeSelected = ref<number[]>([])
+
+const latticePickSet = computed(() => {
+  const set = new Set<number>()
+  for (const pick of result.value?.picks ?? []) {
+    const n = Number(pick.number)
+    if (Number.isFinite(n) && n >= 1 && n <= 49) set.add(Math.trunc(n))
+  }
+  return set
+})
+
+function syncLatticeSelectedFromPicks() {
+  latticeSelected.value = [...latticePickSet.value].sort((a, b) => a - b)
+}
+
+watch(
+  () => (result.value?.picks ?? []).map(pick => Number(pick.number)).join(','),
+  () => {
+    syncLatticeSelectedFromPicks()
+  },
+  { immediate: true },
+)
+
+function toggleLatticeNumber(raw: number | string) {
+  const n = typeof raw === 'number' ? raw : Number(String(raw).replace(/^0+/, '') || raw)
+  if (!Number.isFinite(n)) return
+  const num = Math.trunc(n)
+  if (num < 1 || num > 49) return
+  const set = new Set(latticeSelected.value)
+  if (set.has(num)) set.delete(num)
+  else set.add(num)
+  latticeSelected.value = [...set].sort((a, b) => a - b)
+}
+
+const heatSelectedNumbers = computed(() => latticeSelected.value.map(pad))
+
+const latticeSelectedCount = computed(() => latticeSelected.value.length)
+
+/**
+ * 勾选号排序：仍在本期 picks 里的保持引擎名次，其余自选号按号码升序接在后面。
+ * 再按当前模式摊金额，生成投注串（与热力格勾选同步）。
+ */
+const STAKE_ATTACK_SECOND = 10
+const STAKE_REGULAR = 5
+const STAKE_DEFENSE = 3
+/** 与后端 stake_ladder_tier_counts 同口径 */
+const STAKE_TIP_MAX = 2
+const STAKE_ATTACK_SECOND_MAX = 3
+const STAKE_REGULAR_MAX = 5
+const STAKE_TIP_TWO_MIN_COUNT = 11
+
+function stakeLadderTierCounts(count: number): [number, number, number, number] {
+  const target = Math.max(0, Math.trunc(count))
+  if (target <= 0) return [0, 0, 0, 0]
+  const tipN = Math.min(
+    STAKE_TIP_MAX,
+    target >= STAKE_TIP_TWO_MIN_COUNT ? 2 : 1,
+    target,
+  )
+  let rem = target - tipN
+  const secondN = Math.min(STAKE_ATTACK_SECOND_MAX, rem)
+  rem -= secondN
+  const regularN = Math.min(STAKE_REGULAR_MAX, rem)
+  const defenseN = rem - regularN
+  return [tipN, secondN, regularN, defenseN]
+}
+
+function stakeLadderAmounts(top: number, count: number): number[] {
+  const tip = top === 20 ? 20 : 15
+  const n = Math.max(0, Math.min(49, Math.trunc(count)))
+  const [tipN, secondN, regularN, defenseN] = stakeLadderTierCounts(n)
+  const rows: number[] = []
+  for (let i = 0; i < tipN; i += 1) rows.push(tip)
+  for (let i = 0; i < secondN; i += 1) rows.push(STAKE_ATTACK_SECOND)
+  for (let i = 0; i < regularN; i += 1) rows.push(STAKE_REGULAR)
+  for (let i = 0; i < defenseN; i += 1) rows.push(STAKE_DEFENSE)
+  return rows
+}
+
+/** 均注：余数补给前几注（与后端均注口径一致的展示版） */
+function evenAmounts(total: number, count: number, unit: number): number[] {
+  const n = Math.max(0, Math.trunc(count))
+  if (n <= 0) return []
+  const u = Math.max(1, Math.trunc(unit) || 1)
+  let budget = Math.max(0, Math.trunc(total))
+  budget = Math.floor(budget / u) * u
+  if (budget < u) return Array.from({ length: n }, () => 0)
+  const base = Math.floor(budget / n / u) * u
+  let rest = budget - base * n
+  return Array.from({ length: n }, () => {
+    const extra = rest >= u ? u : 0
+    rest -= extra
+    return base + extra
+  })
+}
+
+function buildSelectionCopyText(picks: Array<{ number: number; amount: number }>): string {
+  if (!picks.length) return ''
+  const groups: Array<{ amount: number; numbers: number[] }> = []
+  const amountIndex = new Map<number, number>()
+  for (const pick of picks) {
+    const amount = Math.trunc(pick.amount)
+    const number = Math.trunc(pick.number)
+    const idx = amountIndex.get(amount)
+    if (idx === undefined) {
+      amountIndex.set(amount, groups.length)
+      groups.push({ amount, numbers: [number] })
+    } else {
+      groups[idx].numbers.push(number)
+    }
+  }
+  const lines: string[] = []
+  for (const group of groups) {
+    const joined = group.numbers.map(pad).join('、')
+    if (group.numbers.length === 1) lines.push(`${joined}：${group.amount}元；`)
+    else lines.push(`${joined}：各${group.amount}元；`)
+  }
+  const total = picks.reduce((sum, pick) => sum + Math.trunc(pick.amount), 0)
+  lines.push(`合计：${total}元。`)
+  return lines.join('\n')
+}
+
+const selectionTicketPicks = computed(() => {
+  const selected = new Set(latticeSelected.value)
+  if (!selected.size) return [] as Array<{ number: number; amount: number }>
+  const ordered: number[] = []
+  for (const pick of result.value?.picks ?? []) {
+    const n = Number(pick.number)
+    if (!Number.isFinite(n)) continue
+    const num = Math.trunc(n)
+    if (selected.has(num) && !ordered.includes(num)) ordered.push(num)
+  }
+  for (const n of [...selected].sort((a, b) => a - b)) {
+    if (!ordered.includes(n)) ordered.push(n)
+  }
+  const activeMode = result.value?.mode ?? mode.value
+  let amounts: number[]
+  if (activeMode === 'ladder') {
+    amounts = stakeLadderAmounts(stakeTop.value, ordered.length)
+  } else if (activeMode === 'single') {
+    const unit = Math.max(1, Number(result.value?.amount_unit) || 5)
+    const total = Math.max(0, Number(result.value?.total_amount) || 0)
+    const tip = Math.floor(total / unit) * unit
+    amounts = ordered.map((_, i) => (i === 0 ? tip : 0))
+  } else {
+    const unit = Math.max(1, Number(result.value?.amount_unit) || 5)
+    const total = Math.max(0, Number(result.value?.total_amount) || 0)
+    amounts = evenAmounts(total, ordered.length, unit)
+  }
+  return ordered.map((number, index) => ({
+    number,
+    amount: amounts[index] ?? 0,
+  })).filter(pick => pick.amount > 0)
+})
+
+/** 投注串：始终按热力格当前勾选重排（空选则空串） */
+const displayCopyText = computed(() => buildSelectionCopyText(selectionTicketPicks.value))
+
+const selectionTicketTotal = computed(() =>
+  selectionTicketPicks.value.reduce((sum, pick) => sum + pick.amount, 0),
+)
 
 /** 各注金额（随机分配下通常不等，如实展示，不做任何美化） */
 const amounts = computed(() => result.value?.picks.map(pick => pick.amount) ?? [])
@@ -438,6 +610,26 @@ const showTripleSets = computed(() => {
   if (block.status === 'disabled') return false
   return true
 })
+/** status=ok 且有组时才展示复制按钮 / 生成可粘贴文案 */
+const canCopyTripleSets = computed(
+  () => tripleSetsReady.value && (tripleSets.value?.sets?.length ?? 0) > 0,
+)
+
+function formatTripleGroupLine(index: number, numbers: number[]): string {
+  return `${index}组: ${numbers.map(pad).join(' ')}`
+}
+
+/** 整块三中三剪贴板文案（中文标签 + 零填充号码） */
+const tripleSetsCopyText = computed(() => {
+  const sets = tripleSets.value?.sets
+  if (!canCopyTripleSets.value || !sets?.length) return ''
+  return ['三中三', ...sets.map(g => formatTripleGroupLine(g.index, g.numbers))].join('\n')
+})
+
+/** 三中三区块是否应展示复制成功 / 失败反馈 */
+const tripleCopyFeedback = computed(
+  () => copiedSource.value === 'triple' || copiedSource.value.startsWith('group-'),
+)
 
 const WAVE_TREND_WINDOW_DEFAULT = 100
 const WAVE_TREND_WINDOW_OPTIONS = [30, 60, 100, 0]
@@ -448,7 +640,8 @@ const waveTrendChart = computed(() => {
     value: number
     label: string
     zodiac?: string
-    tone: 'emerald' | 'bloom'
+    tone: 'emerald' | 'bloom' | 'nebula' | 'slate'
+    selected: boolean
   }
   type Annotation = {
     index: number
@@ -488,19 +681,33 @@ const waveTrendChart = computed(() => {
   const bandValid = newestValid && Number.isFinite(low) && Number.isFinite(high)
   const bandFrom = bandValid ? clampToLane(newestValue - high) : null
   const bandTo = bandValid ? clampToLane(newestValue - low) : null
-  const candidateColumn: ColumnCandidate[] = []
+  const selectedSet = new Set(latticeSelected.value)
+  const pickSet = latticePickSet.value
+  /** 本期预测号是否落在预测带内（沿用 picks.in_lattice_band；带外仍画 bloom 红点） */
+  const pickInBand = new Map<number, boolean>()
   for (const pick of result.value?.picks ?? []) {
-    const num = Number(pick.number)
-    if (!Number.isFinite(num)) continue
-    const zodiac = pickZodiac(pick)
-    candidateColumn.push({
+    const n = Number(pick.number)
+    if (!Number.isFinite(n)) continue
+    pickInBand.set(Math.trunc(n), pick.in_lattice_band === true)
+  }
+  /** 01–49 全列：选中才连线；带内预测绿、带外预测红、自选紫、未选淡灰 */
+  const candidateColumn: ColumnCandidate[] = Array.from({ length: 49 }, (_, index) => {
+    const num = index + 1
+    const selected = selectedSet.has(num)
+    const isPick = pickSet.has(num)
+    let tone: ColumnCandidate['tone'] = 'slate'
+    if (selected && isPick) tone = pickInBand.get(num) ? 'emerald' : 'bloom'
+    else if (selected) tone = 'nebula'
+    const zodiac = heatZodiacLabelByNumber.value.get(num) ?? ''
+    return {
       value: num,
       label: pad(num),
       zodiac: zodiac || undefined,
-      tone: pick.in_lattice_band ? 'emerald' : 'bloom',
-    })
-  }
-  candidateColumn.sort((a, b) => Number(a.label) - Number(b.label))
+      tone,
+      selected,
+    }
+  })
+  const hasSelected = candidateColumn.some(item => item.selected)
   labels.push('')
   const annotations: Annotation[] = []
   if (newestDraw && typeof newestValue === 'number' && Number.isFinite(newestValue)) {
@@ -518,7 +725,7 @@ const waveTrendChart = computed(() => {
       ? [{ from: bandFrom, to: bandTo, label: '预测带' }]
       : [],
     candidateColumn,
-    candidateColumnFromIndex: candidateColumn.length ? specialValues.length - 1 : null,
+    candidateColumnFromIndex: hasSelected ? specialValues.length - 1 : null,
     annotations,
     pointCount: specialValues.length,
   }
@@ -528,9 +735,14 @@ const waveTrendChart = computed(() => {
  * 切换筹码模式 / 注数 / 走势加权 = 只重算本页（临时预览）。
  * ⚠️ 这里刻意**不调用** api.updateSettings：默认值只在设置页改。
  */
-watch([mode, betCount, trendBias, trendWindow, stakeTop], async () => {
+function clearCopyFeedback() {
   copied.value = false
+  copiedSource.value = ''
   copyError.value = ''
+}
+
+watch([mode, betCount, trendBias, trendWindow, stakeTop], async () => {
+  clearCopyFeedback()
   rerollCount.value = 0
   await refresh()
 })
@@ -538,8 +750,7 @@ watch([mode, betCount, trendBias, trendWindow, stakeTop], async () => {
 /** 显式重新生成（首屏仍会自动生成一次，这颗按钮只是「再算一遍」） */
 async function generate() {
   if (pending.value) return
-  copied.value = false
-  copyError.value = ''
+  clearCopyFeedback()
   await refresh()
   generateHit.fire()
 }
@@ -548,8 +759,7 @@ async function generate() {
 async function reroll() {
   if (pending.value) return
   rerollCount.value += 1
-  copied.value = false
-  copyError.value = ''
+  clearCopyFeedback()
   await refresh()
   generateHit.fire()
 }
@@ -588,18 +798,43 @@ const chipModes = CHIP_MODE_OPTIONS
 const trendBiasOptions = TREND_BIAS_OPTIONS
 const trendWindowOptions = TREND_WINDOW_OPTIONS
 
-async function copy() {
-  if (!result.value?.copy_text) return
+async function writeClipboard(
+  text: string,
+  source: 'ticket' | 'triple' | `group-${number}`,
+) {
+  if (!text) return
   try {
-    await navigator.clipboard.writeText(result.value.copy_text)
+    await navigator.clipboard.writeText(text)
     copied.value = true
+    copiedSource.value = source
     copyError.value = ''
     copyHit.fire()
-    setTimeout(() => (copied.value = false), 2000)
+    setTimeout(() => {
+      copied.value = false
+      copiedSource.value = ''
+    }, 2000)
   } catch {
     copied.value = false
+    copiedSource.value = source
     copyError.value = '复制失败，请手动选中下方文本'
   }
+}
+
+async function copy() {
+  const text = displayCopyText.value
+  if (!text) return
+  await writeClipboard(text, 'ticket')
+}
+
+async function copyTripleSets() {
+  const text = tripleSetsCopyText.value
+  if (!text) return
+  await writeClipboard(text, 'triple')
+}
+
+async function copyTripleGroup(group: { index: number; numbers: number[] }) {
+  if (!canCopyTripleSets.value || !group.numbers?.length) return
+  await writeClipboard(formatTripleGroupLine(group.index, group.numbers), `group-${group.index}`)
 }
 
 useHead({ title: '波浪买入法 · 四叶沙盘' })
@@ -803,8 +1038,8 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
             </div>
 
             <p class="text-xs leading-relaxed text-slate-500">
-              本页默认走「档位」：默认 8 个码，注数可改；金额按角色相加，不先锁一笔总预算。
-              8 码时：尖刀主攻 {{ stakeTop }} 元、主攻 10 元、常规 5 元 ×3、防守 3 元 ×3；多于 8 再补防守 3 元。
+              本页默认走「档位」：默认 8 个码，注数可改；金额按档相加，不先锁一笔总预算。
+              一档尖刀 {{ stakeTop }} 元（1～2 注）、二档 10 元（≤3）、五元档（≤5），其余 3 元。
               切到均注 / 侧重 / 单挑 / 随机分配后，才按最大投注金额拆分。
               要改默认请到
               <NuxtLink
@@ -878,8 +1113,8 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               </div>
               <p class="text-xs leading-relaxed text-slate-500">
                 <template v-if="mode === 'ladder'">
-                  默认 8 码：主攻 {{ stakeTop }} 元、主攻 10 元、常规 5 元 ×3、防守 3 元 ×3
-                  （尖刀 15 元合计 49 元，20 元合计 54 元）。改注数时从防守端增减，不从固定总预算里拆。
+                  一档 {{ stakeTop }} 元（1～2）、二档 10 元（≤3）、五元档（≤5），其余 3 元。
+                  改注数按档位容量重摊，不从固定总预算里拆。
                 </template>
                 <template v-else>
                   改注数会立刻按当前最大投注金额与金额最小单位重新出码、重摊金额（最大投注与单位倍数约束不变）。
@@ -907,7 +1142,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 各注 {{ result.picks[0]?.amount ?? result.bet_unit }} 元（最小单位 {{ result.amount_unit }} 元的倍数）
               </StatChip>
               <StatChip v-else-if="result.mode === 'ladder'" tone="amber" size="sm">
-                主攻 {{ stakeTop }}/10 · 常规 5×3 · 防守 3×N
+                尖刀≤2 · 10元≤3 · 5元≤5 · 其余3元
               </StatChip>
               <StatChip v-else tone="amber" size="sm">各注金额不等（均为最小单位倍数）</StatChip>
             </div>
@@ -1219,17 +1454,20 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
         <!-- 三中三：从本期预测带内选 3 组 × 每组 3 号（不发明带外号码） -->
         <MotionReveal v-if="showTripleSets" :index="5">
           <GlassPanel padding="md" rounded="3xl" class="space-y-3">
-            <div class="space-y-1">
-              <h2 class="text-lg font-medium text-white">三中三</h2>
-              <p class="text-xs text-slate-500">
-                从本期预测带内选号组成 3 组，每组 3 个。
-                <template v-if="tripleSetsReady && tripleSets?.reuse">
-                  带内仅 {{ tripleSets.band_count }} 个号，组间允许复用。
-                </template>
-                <template v-else-if="tripleSetsReady">
-                  带内号码充足，三组互不重复。
-                </template>
-              </p>
+            <div class="flex flex-wrap items-start justify-between gap-2">
+              <div class="space-y-1">
+                <h2 class="text-lg font-medium text-white">三中三</h2>
+                <p class="text-xs text-slate-500">
+                  从本期预测带内选号组成 3 组，每组 3 个。
+                  <template v-if="tripleSetsReady && tripleSets?.reuse">
+                    带内仅 {{ tripleSets.band_count }} 个号，组间允许复用。
+                  </template>
+                  <template v-else-if="tripleSetsReady">
+                    带内号码充足，三组互不重复。
+                  </template>
+                </p>
+              </div>
+              <StatChip v-if="canCopyTripleSets" tone="neutral" size="sm">复制到剪贴板</StatChip>
             </div>
 
             <p
@@ -1240,38 +1478,81 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               {{ tripleSets?.note || '数据不足，无法组成三中三。' }}
             </p>
 
-            <div
-              v-else
-              class="grid gap-2 sm:grid-cols-3"
-              role="list"
-              aria-label="三中三推荐组"
-            >
-              <GlassCard
-                v-for="group in tripleSets?.sets ?? []"
-                :key="group.index"
-                as="article"
-                padding="sm"
-                class="flex flex-col gap-2"
-                role="listitem"
+            <template v-else>
+              <div
+                class="grid gap-2 sm:grid-cols-3"
+                role="list"
+                aria-label="三中三推荐组"
               >
-                <p class="text-[11px] text-slate-400">第 {{ group.index }} 组</p>
-                <div class="flex flex-wrap items-center gap-2">
-                  <SpecialBall
-                    v-for="num in group.numbers"
-                    :key="`${group.index}-${num}`"
-                    :number="num"
-                    size="sm"
-                    tone="aqua"
-                  />
-                </div>
-              </GlassCard>
-            </div>
+                <GlassCard
+                  v-for="group in tripleSets?.sets ?? []"
+                  :key="group.index"
+                  as="article"
+                  padding="sm"
+                  class="flex flex-col gap-2"
+                  role="listitem"
+                >
+                  <div class="flex items-center justify-between gap-2">
+                    <p class="text-[11px] text-slate-400">第 {{ group.index }} 组</p>
+                    <GlassButton
+                      v-if="canCopyTripleSets"
+                      variant="glass"
+                      class="min-h-[32px] px-2.5 text-xs"
+                      @click="copyTripleGroup(group)"
+                    >
+                      {{ copied && copiedSource === `group-${group.index}` ? '已复制' : '复制' }}
+                    </GlassButton>
+                  </div>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <SpecialBall
+                      v-for="num in group.numbers"
+                      :key="`${group.index}-${num}`"
+                      :number="num"
+                      size="sm"
+                      tone="aqua"
+                    />
+                  </div>
+                </GlassCard>
+              </div>
+
+              <div v-if="canCopyTripleSets" class="relative">
+                <GlassButton
+                  variant="primary"
+                  size="lg"
+                  block
+                  class="min-h-[48px]"
+                  @click="copyTripleSets"
+                >
+                  {{ copied && copiedSource === 'triple' ? '已复制 ✓' : '一键复制三中三' }}
+                </GlassButton>
+                <PulseRing :trigger="copyHit.key" tone="aqua" :rings="2" />
+              </div>
+              <p
+                v-if="copyError && tripleCopyFeedback"
+                class="text-center text-xs text-bloom-300"
+                role="alert"
+              >
+                {{ copyError }}
+              </p>
+              <p
+                v-else-if="copied && tripleCopyFeedback"
+                class="text-center text-xs text-emerald-300"
+                role="status"
+              >
+                已复制到剪贴板
+              </p>
+            </template>
           </GlassPanel>
         </MotionReveal>
 
         <MotionReveal v-if="lattice?.enabled && latticeBand && waveTrendChart.pointCount" :index="6">
           <GlassPanel padding="lg" rounded="3xl" class="space-y-3">
-            <h2 class="text-lg font-medium text-white">预测点阵</h2>
+            <div class="space-y-1">
+              <h2 class="text-lg font-medium text-white">预测点阵</h2>
+              <p class="text-xs leading-relaxed text-slate-500">
+                连线随下方「01–49 出现热度」勾选同步：绿=带内预测，红=带外预测，紫=自选；未勾选不连线。
+              </p>
+            </div>
             <LineChart
               :series="waveTrendChart.series"
               :labels="waveTrendChart.labels"
@@ -1292,40 +1573,59 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
           </GlassPanel>
         </MotionReveal>
 
-        <!-- 01 - 49 出现热度：本页为单列手机版式，直接整幅铺开（不用开奖页的 lg:grid-cols-3 / col-span-2 栅格） -->
+        <!-- 01 - 49 出现热度：点选主入口，与上方预测点阵连线同步 -->
         <MotionReveal :index="7">
           <GlassPanel padding="md" rounded="3xl">
-            <div class="mb-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5">
-              <h2 class="text-base font-medium text-white">01 - 49 出现热度</h2>
-              <div class="flex flex-wrap gap-1" role="group" aria-label="热度统计期数">
+            <div class="mb-2 flex flex-wrap items-end justify-between gap-x-3 gap-y-1.5">
+              <div class="space-y-0.5">
+                <h2 class="text-base font-medium text-white">01 - 49 出现热度</h2>
+                <p class="text-[11px] leading-relaxed text-slate-500">
+                  点格勾选后在上方点阵连线。「预」=本期预测；绿=带内预测，红=带外预测，紫=自选。已选 {{ latticeSelectedCount }}。
+                </p>
+              </div>
+              <div class="flex flex-wrap items-center gap-2">
                 <button
-                  v-for="option in heatWindowOptions"
-                  :key="option"
                   type="button"
-                  class="num inline-flex min-h-[32px] min-w-[44px] items-center justify-center rounded-lg border px-2.5 text-xs font-medium transition-colors duration-200 select-none active:scale-[0.98]"
-                  :class="option === heatWindow
-                    ? 'border-aqua-400/60 bg-aqua-400/15 text-aqua-100'
-                    : 'border-white/10 bg-white/5 text-slate-300 active:bg-white/15'"
-                  :aria-pressed="option === heatWindow"
-                  @click="heatWindow = option"
+                  class="inline-flex min-h-[32px] items-center justify-center rounded-lg border border-white/10 bg-white/5 px-2.5 text-xs text-slate-300 transition-colors active:bg-white/15"
+                  @click="syncLatticeSelectedFromPicks"
                 >
-                  {{ option }}
+                  恢复预测号
                 </button>
+                <div class="flex flex-wrap gap-1" role="group" aria-label="热度统计期数">
+                  <button
+                    v-for="option in heatWindowOptions"
+                    :key="option"
+                    type="button"
+                    class="num inline-flex min-h-[32px] min-w-[44px] items-center justify-center rounded-lg border px-2.5 text-xs font-medium transition-colors duration-200 select-none active:scale-[0.98]"
+                    :class="option === heatWindow
+                      ? 'border-aqua-400/60 bg-aqua-400/15 text-aqua-100'
+                      : 'border-white/10 bg-white/5 text-slate-300 active:bg-white/15'"
+                    :aria-pressed="option === heatWindow"
+                    @click="heatWindow = option"
+                  >
+                    {{ option }}
+                  </button>
+                </div>
               </div>
             </div>
 
             <HeatGrid
               :cells="heatCells"
               :columns="7"
-              :row-scale="0.72"
+              :row-scale="0.58"
+              :gap="3"
               tone="aqua"
               show-labels
+              selectable
               :highlight="latestSampleNumber === null ? [] : [pad(latestSampleNumber)]"
               :marked="heatPickMarkedNumbers"
+              :marked-out-band="heatPickOutBandNumbers"
+              :selected="heatSelectedNumbers"
               legend
               value-unit="次"
               :legend-scope="heatScope"
               empty-text="数据不足"
+              @toggle="toggleLatticeNumber"
             />
           </GlassPanel>
         </MotionReveal>
@@ -1420,11 +1720,17 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
           </GlassPanel>
         </MotionReveal>
 
-        <!-- 复制投注串 -->
+        <!-- 复制投注串：随热力格勾选重排号码与档位金额 -->
         <MotionReveal :index="9">
           <GlassPanel padding="lg" rounded="3xl" class="space-y-3">
             <div class="flex flex-wrap items-center justify-between gap-2">
-              <h2 class="text-lg font-medium text-white">投注串</h2>
+              <div class="space-y-1">
+                <h2 class="text-lg font-medium text-white">投注串</h2>
+                <p class="text-xs leading-relaxed text-slate-500">
+                  按上方热力格勾选重排；档位：尖刀 {{ stakeTop }}（1～2）→10 元（≤3）→5 元（≤5）→其余 3 元。已选 {{ latticeSelectedCount }} 注
+                  <template v-if="selectionTicketTotal"> · 合计 {{ selectionTicketTotal }} 元</template>。
+                </p>
+              </div>
               <StatChip tone="neutral" size="sm">复制到剪贴板</StatChip>
             </div>
 
@@ -1434,20 +1740,35 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 size="lg"
                 block
                 class="min-h-[48px]"
+                :disabled="!displayCopyText"
                 @click="copy"
               >
-                {{ copied ? '已复制 ✓' : '一键复制投注串' }}
+                {{ copied && copiedSource === 'ticket' ? '已复制 ✓' : '一键复制投注串' }}
               </GlassButton>
               <PulseRing :trigger="copyHit.key" tone="aqua" :rings="2" />
             </div>
 
-            <p class="whitespace-pre-line break-all text-center font-mono text-sm text-slate-300">
-              {{ result.copy_text }}
+            <p
+              v-if="displayCopyText"
+              class="whitespace-pre-line break-all text-left font-mono text-sm text-slate-300"
+            >
+              {{ displayCopyText }}
             </p>
-            <p v-if="copyError" class="text-center text-xs text-bloom-300" role="alert">
+            <p v-else class="text-left text-sm text-slate-500">
+              请先在「01–49 出现热度」勾选号码
+            </p>
+            <p
+              v-if="copyError && copiedSource === 'ticket'"
+              class="text-center text-xs text-bloom-300"
+              role="alert"
+            >
               {{ copyError }}
             </p>
-            <p v-else-if="copied" class="text-center text-xs text-emerald-300" role="status">
+            <p
+              v-else-if="copied && copiedSource === 'ticket'"
+              class="text-center text-xs text-emerald-300"
+              role="status"
+            >
               已复制到剪贴板
             </p>
           </GlassPanel>

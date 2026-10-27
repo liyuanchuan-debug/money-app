@@ -3360,8 +3360,19 @@ def test_recommend_api_unfundable_override_returns_no_ticket():
         assert "adopted_round" not in body
 
 
+def test_stake_ladder_tier_counts_caps():
+    """一档1～2、二档≤3、五元档≤5；注数≥11 时一档升到 2。"""
+    from services.lottery import stake_ladder_tier_counts
+
+    assert stake_ladder_tier_counts(1) == (1, 0, 0, 0)
+    assert stake_ladder_tier_counts(8) == (1, 3, 4, 0)
+    assert stake_ladder_tier_counts(10) == (1, 3, 5, 1)
+    assert stake_ladder_tier_counts(11) == (2, 3, 5, 1)
+    assert stake_ladder_tier_counts(16) == (2, 3, 5, 6)
+
+
 def test_stake_ladder_default_eight_and_count_switch():
-    """档位默认 8 码；注数可改；尖刀 15/20 合计跟着变。"""
+    """档位：一档1～2、二档≤3、五元档≤5、其余3元；尖刀15/20合计跟着变。"""
     history = [18, 7, 33, 12, 41, 5, 26, 9]
     base = dict(pick_count=8, total_amount=50, amount_unit=5, avoid_cold_enabled=False)
     fifteen = recommend(
@@ -3374,12 +3385,14 @@ def test_stake_ladder_default_eight_and_count_switch():
         latest=18, previous=7, history_numbers=history,
         settings={**base, "pick_count": 10, "stake_top": 15}, mode=MODE_LADDER,
     )
-    assert [p["amount"] for p in fifteen["picks"]] == [15, 10, 5, 5, 5, 3, 3, 3]
-    assert fifteen["total_amount"] == 49
-    assert [p["amount"] for p in twenty["picks"]] == [20, 10, 5, 5, 5, 3, 3, 3]
-    assert twenty["total_amount"] == 54
-    assert [p["amount"] for p in ten["picks"]] == [15, 10, 5, 5, 5, 3, 3, 3, 3, 3]
-    assert ten["total_amount"] == 55
+    # 8 注：尖刀1 + 10元×3 + 5元×4
+    assert [p["amount"] for p in fifteen["picks"]] == [15, 10, 10, 10, 5, 5, 5, 5]
+    assert fifteen["total_amount"] == 65
+    assert [p["amount"] for p in twenty["picks"]] == [20, 10, 10, 10, 5, 5, 5, 5]
+    assert twenty["total_amount"] == 70
+    # 10 注（引擎上限）：尖刀1 + 10元×3 + 5元×5 + 3元×1
+    assert [p["amount"] for p in ten["picks"]] == [15, 10, 10, 10, 5, 5, 5, 5, 5, 3]
+    assert ten["total_amount"] == 73
     assert {p["number"] for p in fifteen["picks"]} == {p["number"] for p in twenty["picks"]}
     assert any("不按固定总预算" in note for note in fifteen["notes"])
 
