@@ -89,8 +89,8 @@ STAKE_TIP_MAX = 2
 STAKE_ATTACK_SECOND_MAX = 3
 STAKE_REGULAR_MAX = 5
 STAKE_LADDER_DEFAULT_COUNT = 8
-# 注数达到该值时一档可升到 2 注，否则默认 1 注
-STAKE_TIP_TWO_MIN_COUNT = 11
+# 注数达到该值时一档可升到 2 注，否则默认 1 注（16 注样例为 1+3+5+其余）
+STAKE_TIP_TWO_MIN_COUNT = 20
 LADDER_ROLE_LABELS = {
     ROLE_PRIMARY: "主攻",
     ROLE_SECONDARY: "常规",
@@ -2433,13 +2433,12 @@ def build_copy_text(mode: str, picks: list[dict[str, Any]]) -> str:
     空 ``picks``（例如预算不足 1 个注码单位 → ``status = "no_ticket"``）返回空串，
     绝不编造金额；非空时每一注都必须带 ``amount``（由 ``recommend`` 按构造保证）。
 
-    格式（与分配模式无关）：
+    格式（与分配模式无关，对齐用户粘贴样例）：
     - 单号独额：``号码：金额元；``
     - 相同金额合并：``号1、号2：各金额元；``
-    - 组间用中文分号，分号后换行；末行 ``合计：N注 · M元。``
+    - 组间用中文分号，分号后换行；**不含合计行**（注数 / 金额在页面另标）
 
-    号码一律经 ``format_number`` 补零为两位（``9`` → ``09``，``13`` 保持 ``13``）；
-    ``合计`` 里注数与金额都不做补零。
+    号码一律经 ``format_number`` 补零为两位（``9`` → ``09``，``13`` 保持 ``13``）。
     """
     del mode  # 格式统一，不再按模式分支
     if not picks:
@@ -2466,8 +2465,6 @@ def build_copy_text(mode: str, picks: list[dict[str, Any]]) -> str:
         else:
             lines.append(f"{joined}：各{amount}元；")
 
-    total = sum(int(p["amount"]) for p in picks)
-    lines.append(f"合计：{len(picks)}注 · {total}元。")
     return "\n".join(lines)
 
 

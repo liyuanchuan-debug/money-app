@@ -368,7 +368,8 @@ const STAKE_DEFENSE = 3
 const STAKE_TIP_MAX = 2
 const STAKE_ATTACK_SECOND_MAX = 3
 const STAKE_REGULAR_MAX = 5
-const STAKE_TIP_TWO_MIN_COUNT = 11
+/** 注数达到该值才把一档升到 2；未满时保持 1 注尖刀（如 16 注 → 1+3+5+其余） */
+const STAKE_TIP_TWO_MIN_COUNT = 20
 
 function stakeLadderTierCounts(count: number): [number, number, number, number] {
   const target = Math.max(0, Math.trunc(count))
@@ -430,20 +431,28 @@ function buildSelectionCopyText(picks: Array<{ number: number; amount: number }>
       groups[idx].numbers.push(number)
     }
   }
+  // 格式与用户粘贴样例一致：独额「号：N元；」/ 同额「号、号：各N元；」，无合计行
   const lines: string[] = []
   for (const group of groups) {
     const joined = group.numbers.map(pad).join('、')
     if (group.numbers.length === 1) lines.push(`${joined}：${group.amount}元；`)
     else lines.push(`${joined}：各${group.amount}元；`)
   }
-  const total = picks.reduce((sum, pick) => sum + Math.trunc(pick.amount), 0)
-  lines.push(`合计：${picks.length}注 · ${total}元。`)
   return lines.join('\n')
 }
 
 const selectionTicketPicks = computed(() => {
   const selected = new Set(latticeSelected.value)
   if (!selected.size) return [] as Array<{ number: number; amount: number }>
+  /** 红色 = 本期预测且落在预测带外 → 投注串一律 3 元，不占尖刀 / 10 / 5 档 */
+  const redSet = new Set<number>()
+  for (const pick of result.value?.picks ?? []) {
+    if (pick.in_lattice_band === true) continue
+    const n = Number(pick.number)
+    if (!Number.isFinite(n)) continue
+    const num = Math.trunc(n)
+    if (selected.has(num)) redSet.add(num)
+  }
   const ordered: number[] = []
   for (const pick of result.value?.picks ?? []) {
     const n = Number(pick.number)
@@ -454,24 +463,31 @@ const selectionTicketPicks = computed(() => {
   for (const n of [...selected].sort((a, b) => a - b)) {
     if (!ordered.includes(n)) ordered.push(n)
   }
+  const core = ordered.filter(n => !redSet.has(n))
+  const reds = ordered.filter(n => redSet.has(n))
   const activeMode = result.value?.mode ?? mode.value
-  let amounts: number[]
+  let coreAmounts: number[]
   if (activeMode === 'ladder') {
-    amounts = stakeLadderAmounts(stakeTop.value, ordered.length)
+    coreAmounts = stakeLadderAmounts(stakeTop.value, core.length)
   } else if (activeMode === 'single') {
     const unit = Math.max(1, Number(result.value?.amount_unit) || 5)
     const total = Math.max(0, Number(result.value?.total_amount) || 0)
     const tip = Math.floor(total / unit) * unit
-    amounts = ordered.map((_, i) => (i === 0 ? tip : 0))
+    coreAmounts = core.map((_, i) => (i === 0 ? tip : 0))
   } else {
     const unit = Math.max(1, Number(result.value?.amount_unit) || 5)
     const total = Math.max(0, Number(result.value?.total_amount) || 0)
-    amounts = evenAmounts(total, ordered.length, unit)
+    coreAmounts = evenAmounts(total, core.length, unit)
   }
-  return ordered.map((number, index) => ({
-    number,
-    amount: amounts[index] ?? 0,
-  })).filter(pick => pick.amount > 0)
+  const picks: Array<{ number: number; amount: number }> = []
+  for (let i = 0; i < core.length; i += 1) {
+    const amount = coreAmounts[i] ?? 0
+    if (amount > 0) picks.push({ number: core[i], amount })
+  }
+  for (const number of reds) {
+    picks.push({ number, amount: STAKE_DEFENSE })
+  }
+  return picks
 })
 
 /** 投注串：始终按热力格当前勾选重排（空选则空串） */
@@ -1727,7 +1743,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               <div class="space-y-1">
                 <h2 class="text-lg font-medium text-white">投注串</h2>
                 <p class="text-xs leading-relaxed text-slate-500">
-                  按上方热力格勾选重排；档位：尖刀 {{ stakeTop }}（1～2）→10 元（≤3）→5 元（≤5）→其余 3 元。已选 {{ latticeSelectedCount }} 注
+                  按上方热力格勾选重排；档位：尖刀 {{ stakeTop }}（1～2）→10 元（≤3）→5 元（≤5）→其余 3 元；红色（带外预测）一律 3 元。已选 {{ latticeSelectedCount }} 注
                   <template v-if="selectionTicketTotal"> · 合计 {{ selectionTicketTotal }} 元</template>。
                 </p>
               </div>
