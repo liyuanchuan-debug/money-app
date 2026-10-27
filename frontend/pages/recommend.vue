@@ -437,7 +437,7 @@ function buildSelectionCopyText(picks: Array<{ number: number; amount: number }>
     else lines.push(`${joined}：各${group.amount}元；`)
   }
   const total = picks.reduce((sum, pick) => sum + Math.trunc(pick.amount), 0)
-  lines.push(`合计：${total}元。`)
+  lines.push(`合计：${picks.length}注 · ${total}元。`)
   return lines.join('\n')
 }
 

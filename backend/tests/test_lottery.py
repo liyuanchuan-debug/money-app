@@ -717,7 +717,9 @@ def test_single_mode_bets_whole_total_amount():
         assert result["picks"][0]["amount"] == expected_amount
         assert result["total_amount"] == expected_amount
         num = result["picks"][0]["number"]
-        assert result["copy_text"] == f"{num:02d}：{expected_amount}元；\n合计：{expected_amount}元。"
+        assert result["copy_text"] == (
+            f"{num:02d}：{expected_amount}元；\n合计：1注 · {expected_amount}元。"
+        )
 
 
 def test_single_mode_budget_ignores_configured_pick_count():
@@ -852,7 +854,7 @@ def test_recommend_random_end_to_end():
     # 派生：100/5=20 单位 ÷ 3 注 = 6 单位 → 30 元（向下对齐）
     assert result["bet_unit"] == 30
     assert result["mode_label"] == "随机分配"
-    assert result["copy_text"].endswith("合计：100元。")
+    assert result["copy_text"].endswith("合计：3注 · 100元。")
 
 
 def test_recommend_random_is_reproducible_for_same_period():
@@ -934,7 +936,7 @@ def test_even_copy_text_lists_amounts_when_total_not_divisible():
     ]
     text = build_copy_text(MODE_EVEN, picks)
     assert "各34元" not in text
-    assert text == "09：34元；\n19、31：各33元；\n合计：100元。"
+    assert text == "09：34元；\n19、31：各33元；\n合计：3注 · 100元。"
 
 
 def test_random_copy_text_lists_each_amount():
@@ -944,7 +946,7 @@ def test_random_copy_text_lists_each_amount():
         {"number": 31, "amount": 50, "role_label": "防守"},
     ]
     text = build_copy_text(MODE_RANDOM, picks)
-    assert text == "09：15元；\n19：35元；\n31：50元；\n合计：100元。"
+    assert text == "09：15元；\n19：35元；\n31：50元；\n合计：3注 · 100元。"
 
 
 def test_even_copy_text_merges_equal_amounts():
@@ -953,7 +955,7 @@ def test_even_copy_text_merges_equal_amounts():
         {"number": 19, "amount": 10, "role_label": "次选"},
         {"number": 31, "amount": 10, "role_label": "防守"},
     ]
-    assert build_copy_text(MODE_EVEN, picks) == "09、19、31：各10元；\n合计：30元。"
+    assert build_copy_text(MODE_EVEN, picks) == "09、19、31：各10元；\n合计：3注 · 30元。"
 
 
 def test_copy_text_pads_single_digit_numbers():
@@ -963,7 +965,7 @@ def test_copy_text_pads_single_digit_numbers():
         {"number": 39, "amount": 15, "role_label": "次选"},
     ]
     assert build_copy_text(MODE_WEIGHTED, picks) == (
-        "07、39：各15元；\n合计：30元。"
+        "07、39：各15元；\n合计：2注 · 30元。"
     )
 
 
@@ -973,7 +975,7 @@ def test_copy_text_keeps_two_digit_numbers_unchanged():
         {"number": 13, "amount": 20, "role_label": "主推"},
         {"number": 49, "amount": 30, "role_label": "次选"},
     ]
-    assert build_copy_text(MODE_EVEN, picks) == "13：20元；\n49：30元；\n合计：50元。"
+    assert build_copy_text(MODE_EVEN, picks) == "13：20元；\n49：30元；\n合计：2注 · 50元。"
 
 
 def test_format_number_helper():
@@ -986,14 +988,14 @@ def test_format_number_helper():
 
 
 def test_copy_text_user_sample_format():
-    """用户约定样例：独额 + 同额合并 + 分号换行 + 合计（两位数不补零）。"""
+    """用户约定样例：独额 + 同额合并 + 分号换行 + 合计含注数（两位数不补零）。"""
     picks = [
         {"number": 30, "amount": 20, "role_label": "主推"},
         {"number": 15, "amount": 15, "role_label": "次选"},
         {"number": 39, "amount": 15, "role_label": "防守"},
     ]
     assert build_copy_text(MODE_WEIGHTED, picks) == (
-        "30：20元；\n15、39：各15元；\n合计：50元。"
+        "30：20元；\n15、39：各15元；\n合计：3注 · 50元。"
     )
 
 

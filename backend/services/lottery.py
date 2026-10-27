@@ -2436,10 +2436,10 @@ def build_copy_text(mode: str, picks: list[dict[str, Any]]) -> str:
     格式（与分配模式无关）：
     - 单号独额：``号码：金额元；``
     - 相同金额合并：``号1、号2：各金额元；``
-    - 组间用中文分号，分号后换行；末行 ``合计：N元。``
+    - 组间用中文分号，分号后换行；末行 ``合计：N注 · M元。``
 
     号码一律经 ``format_number`` 补零为两位（``9`` → ``09``，``13`` 保持 ``13``）；
-    ``合计`` 是金额，不做补零。
+    ``合计`` 里注数与金额都不做补零。
     """
     del mode  # 格式统一，不再按模式分支
     if not picks:
@@ -2467,7 +2467,7 @@ def build_copy_text(mode: str, picks: list[dict[str, Any]]) -> str:
             lines.append(f"{joined}：各{amount}元；")
 
     total = sum(int(p["amount"]) for p in picks)
-    lines.append(f"合计：{total}元。")
+    lines.append(f"合计：{len(picks)}注 · {total}元。")
     return "\n".join(lines)
 
 
