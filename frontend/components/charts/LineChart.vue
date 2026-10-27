@@ -8,8 +8,8 @@
  *
  * 横向滑动（scrollable，opt-in，默认关）：
  *   - 每个点占固定像素宽（由「一屏 windowSize 期」反推），SVG 的固有宽度随期数增长；
- *   - 左右手势 / 方向键移动的是「号码光标」（高亮点 + 提示），不是整图自由平移；
- *     光标移出视口时组件才程序化 scrollLeft 跟随，避免和页面纵向滚动抢手势；
+ *   - 按住左右拖 / 触控板横向滚轮直接平移画布（transform 轨道，不依赖 overflow 滚动）；纵向仍交给页面滚动；
+ *   - 方向键仍步进「号码光标」（高亮点 + 提示）；轻点落点；
  *   - 打开时自动贴到最新一端（右端）并把光标落在最新一期；
  *   - y 轴刻度放在滚动区之外的固定轴条里，不会跟着数据一起滑出视口；
  *   - 悬浮提示跟着 SVG 坐标走（滑动模式下用 px 定位，非滑动模式仍是百分比）。
@@ -200,7 +200,7 @@ const props = withDefaults(
     /**
      * 是否开启横向浏览（opt-in，默认关）。
      * 关：所有点压进容器宽度（改造前行为）；
-     * 开：每个点占固定像素宽；左右手势移动号码光标，视口随光标程序化跟随。
+     * 开：每个点占固定像素宽；按住左右拖平移画布，方向键步进号码光标。
      */
     scrollable?: boolean
     /**
@@ -302,10 +302,10 @@ const COLUMN_LABEL_STEP = 10
 const COLUMN_TOOLTIP_ROOM = 96
 /** 悬浮提示需要向上探出的高度（滚动区的 padding-top，避免提示被裁掉） */
 const SCROLL_TOOLTIP_ROOM = 48
-/** 左右滑动累计位移达到该像素（或约 0.65 个点距）才步进一格光标 */
-const CURSOR_STEP_MIN_PX = 24
 /** 判定横/竖手势的死区（px），避免误触 */
 const GESTURE_AXIS_LOCK_PX = 8
+/** 横向拖动超过该像素才算平移（未达则仍按轻点落光标） */
+const GESTURE_PAN_SLOP_PX = 3
 
 const uid = useId()
 const { shouldAnimate } = useMotion()
@@ -334,8 +334,10 @@ const viewportReady = ref(false)
 /** 一屏显示多少期；0 = 全部 */
 const zoom = ref(normalizeWindow(props.windowSize))
 
-/** 滚动位置快照，用来决定两侧渐隐提示要不要出现 */
+/** 平移位置快照（transform 轨道用 left；max = 内容宽 − 视口宽） */
 const scrollState = reactive({ left: 0, max: 0 })
+/** 贴边 / 键盘步进时短暂开 CSS transition */
+const panSmooth = ref(false)
 
 /** 鼠标短暂悬停（仅桌面；松手后回落到 sticky 光标） */
 const hoverIndex = ref<number | null>(null)
@@ -527,10 +529,16 @@ const scrollerLabel = computed(() => {
       ? '（末端为本期候选段）'
       : ''
   if (!suffix) {
-    return `走势折线图，共 ${pointCount.value} 期；左右滑动可移动号码光标，查看更早或更新的期数`
+    return `走势折线图，共 ${pointCount.value} 期；按住左右拖可平移查看更早或更新的期数`
   }
-  return `走势折线图，共 ${pointCount.value} 个点${suffix}；左右滑动可移动号码光标，查看更早或更新的位置`
+  return `走势折线图，共 ${pointCount.value} 个点${suffix}；按住左右拖可平移查看更早或更新的位置`
 })
+
+/** 平移上限：内容宽 − 视口宽（不读 scrollWidth，避免 flex 把容器撑开后 max 恒为 0） */
+function panMax(): number {
+  if (!props.scrollable) return 0
+  return Math.max(0, Math.round(contentWidth.value - Math.max(1, viewportWidth.value)))
+}
 
 function measureViewport(el: HTMLElement) {
   const width = Math.round(el.clientWidth)
@@ -538,46 +546,52 @@ function measureViewport(el: HTMLElement) {
   // 量到真实宽度：从「只画最近一屏」切到全量（首帧不会先画一段最旧的历史）
   viewportReady.value = true
   if (width !== viewportWidth.value) viewportWidth.value = width
+  refreshPanExtent()
 }
 
-function readScrollState(el: HTMLElement) {
-  scrollState.max = Math.max(0, Math.round(el.scrollWidth - el.clientWidth))
-  scrollState.left = Math.max(0, Math.round(el.scrollLeft))
+/** 按当前内容/视口重算 max，并把 left 夹进合法区间 */
+function refreshPanExtent(pinNewest = false) {
+  if (!props.scrollable) {
+    scrollState.max = 0
+    scrollState.left = 0
+    return
+  }
+  const max = panMax()
+  scrollState.max = max
+  if (pinNewest) {
+    scrollState.left = max
+    return
+  }
+  scrollState.left = Math.min(max, Math.max(0, scrollState.left))
 }
 
-function onScroll() {
-  // 非滑动模式下不会滚动，直接短路（也避免把 conditional 表达式直接写成 @scroll 的处理器：
-  // 编译器会把它当成内联语句 `$event => (cond ? onScroll : undefined)`，结果永远不调用）
-  if (!props.scrollable) return
-  const el = scrollerEl.value
-  if (el) readScrollState(el)
+function applyPan(next: number, smooth = false) {
+  const max = panMax()
+  const clamped = Math.min(max, Math.max(0, Math.round(next)))
+  scrollState.max = max
+  scrollState.left = clamped
+  panSmooth.value = smooth && shouldAnimate.value
+  if (panSmooth.value) {
+    window.setTimeout(() => {
+      panSmooth.value = false
+    }, 300)
+  }
 }
 
 /** 贴到最新一端（右端）并把号码光标落到最新位置（有候选段则落在最后一个候选） */
 function snapToNewest(smooth = false) {
   const latest = newestIndex()
   if (latest !== null) cursorIndex.value = latest
-  const el = scrollerEl.value
-  if (!el || !import.meta.client) return
-  const max = Math.max(0, el.scrollWidth - el.clientWidth)
-  const useSmooth = smooth && shouldAnimate.value
-  el.scrollTo({ left: max, behavior: useSmooth ? 'smooth' : 'auto' })
-  if (useSmooth) {
-    // 平滑滚动期间 scrollLeft 还没到目标值，先按目标记账，避免渐隐提示闪一下
-    scrollState.max = max
-    scrollState.left = max
-    return
-  }
-  readScrollState(el)
+  if (!props.scrollable || !import.meta.client) return
+  applyPan(panMax(), smooth)
 }
 
 /** 等 DOM 尺寸稳定后再贴边，避免读到中间态 */
 async function syncScroll(pin: boolean, smooth = false) {
   await nextTick()
-  const el = scrollerEl.value
-  if (!el) return
+  if (!scrollerEl.value) return
   if (pin) snapToNewest(smooth)
-  readScrollState(el)
+  else refreshPanExtent(false)
 }
 
 function selectWindow(option: number) {
@@ -601,7 +615,6 @@ watch(
       resizeObserver = new ResizeObserver(() => measureViewport(el))
       resizeObserver.observe(el)
     }
-    readScrollState(el)
     // 先同步贴一次边（此刻量到的宽度就是浏览器里的真实宽度），
     // 让首帧尽量少看到「停在最旧一端」的样子；量到真实视口后再贴一次。
     snapToNewest()
@@ -632,6 +645,7 @@ watch(
 )
 
 onBeforeUnmount(() => {
+  unbindPanWindowListeners()
   resizeObserver?.disconnect()
   resizeObserver = null
 })
@@ -1361,7 +1375,7 @@ const xTicks = computed(() => {
 })
 
 /* -------------------------------------------------------------------------- */
-/* 号码光标：滑动模式下左右手势移动的是它（非整图自由平移）                      */
+/* 号码光标 + 横向平移（按住拖动画布；方向键步进光标）                            */
 /* -------------------------------------------------------------------------- */
 
 /** 当前高亮：悬停优先，否则用粘性光标（滑动模式始终有光标） */
@@ -1416,12 +1430,12 @@ const gesture = reactive({
   pointerId: -1,
   startX: 0,
   startY: 0,
-  /** 锁轴：null=未判定，x=横向移光标，y=交给页面纵向滚动 */
+  /** 锁轴：null=未判定，x=横向平移画布，y=交给页面纵向滚动 */
   axis: null as null | 'x' | 'y',
-  /** 横向累计位移，满一格步进一次 */
+  /** 本次按下是否发生过横向平移（有则不算点击落点） */
+  panned: false,
+  /** 无溢出时累计位移，用于步进光标 */
   acc: 0,
-  /** 本次按下是否发生过横向步进（有则不算点击落点） */
-  stepped: false,
 })
 
 function clampIndex(index: number): number {
@@ -1429,18 +1443,49 @@ function clampIndex(index: number): number {
   return Math.min(max, Math.max(0, index))
 }
 
+/**
+ * 用「内容坐标」反查期下标（scrollLeft + 视口内偏移）。
+ * 必须走这条路径：拖动时 SVG 跟着滚，热区 getBoundingClientRect 会漂，不能再靠它算比例。
+ */
+function indexFromContentX(contentX: number): number | null {
+  if (!hasData.value || renderCount.value <= 0) return null
+  if (hasColumn.value && contentX >= plotRight.value) {
+    return clampIndex(columnSlotIndex.value)
+  }
+  if (renderCount.value <= 1) return clampIndex(renderStart.value)
+  const ratio = (contentX - plotLeft.value) / Math.max(1, plotWidth.value)
+  const clamped = Math.min(1, Math.max(0, ratio))
+  const index = renderStart.value + Math.round(clamped * (renderCount.value - 1))
+  if (hasColumn.value) {
+    return clampIndex(Math.min(columnSlotIndex.value - 1, Math.max(renderStart.value, index)))
+  }
+  return clampIndex(Math.min(pointCount.value - 1, Math.max(renderStart.value, index)))
+}
+
+function contentXFromClientX(clientX: number): number | null {
+  const el = scrollerEl.value
+  if (!el) return null
+  const bounds = el.getBoundingClientRect()
+  if (!bounds.width) return null
+  return scrollState.left + (clientX - bounds.left)
+}
+
+function indexFromScrollerClientX(clientX: number): number | null {
+  const contentX = contentXFromClientX(clientX)
+  if (contentX === null) return null
+  return indexFromContentX(contentX)
+}
+
+/** 非滑动模式：仍用热区 DOM 矩形比例（与改造前一致） */
 function indexFromClientX(clientX: number, target: Element): number | null {
   if (!hasData.value || renderCount.value <= 0) return null
+  if (props.scrollable) return indexFromScrollerClientX(clientX)
   const rect = target.getBoundingClientRect()
   if (!rect.width) return null
   const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width))
-  // 候选列模式：热区右边界只比序列绘图区多出一段号码标签留白（plotWidth + COLUMN_LABEL_ROOM），
-  // 先按比例还原成相对热区左边缘的像素偏移，再统一按**绘图区宽度**归一化到下标 ——
-  // 与 xAt 的等距映射严格一致（候选列就是最后一个普通下标，不再有固定带宽特例）。
   if (hasColumn.value) {
     const domainWidth = plotWidth.value + columnLabelRoom.value
     const svgOffset = ratio * domainWidth
-    // 偏移落在绘图区右边界之外（号码标签留白里）→ 直接命中候选列槽位
     if (svgOffset >= plotWidth.value) return clampIndex(columnSlotIndex.value)
     const index = renderStart.value
       + Math.round((svgOffset / Math.max(1, plotWidth.value)) * Math.max(1, renderCount.value - 1))
@@ -1450,37 +1495,41 @@ function indexFromClientX(clientX: number, target: Element): number | null {
   return clampIndex(Math.min(pointCount.value - 1, Math.max(renderStart.value, index)))
 }
 
-function cursorStepThreshold(): number {
-  return Math.max(CURSOR_STEP_MIN_PX, scrollStep.value * 0.65)
+function isCandidateHitTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false
+  return Boolean(target.closest('[data-candidate-hit]'))
 }
 
-/** 让粘性光标落在视口内（偏中）；只改 scrollLeft，不跟手拖动画布 */
+/** 拖动手势挂在 window 上，避免 SVG/子节点随滚动位移丢 pointermove */
+function bindPanWindowListeners() {
+  if (!import.meta.client) return
+  window.addEventListener('pointermove', onWindowPointerMove, { passive: false })
+  window.addEventListener('pointerup', onWindowPointerUp)
+  window.addEventListener('pointercancel', onWindowPointerUp)
+}
+
+function unbindPanWindowListeners() {
+  if (!import.meta.client) return
+  window.removeEventListener('pointermove', onWindowPointerMove)
+  window.removeEventListener('pointerup', onWindowPointerUp)
+  window.removeEventListener('pointercancel', onWindowPointerUp)
+}
+
+/** 让粘性光标落在视口内（偏中）；方向键步进后程序化跟随 */
 async function ensureCursorVisible(smooth = false) {
   if (!props.scrollable || !import.meta.client) return
   await nextTick()
-  const el = scrollerEl.value
   const index = cursorIndex.value
-  if (!el || index === null) return
+  if (index === null) return
   const x = xAt(index)
-  const viewLeft = el.scrollLeft
-  const viewRight = viewLeft + el.clientWidth
+  const viewLeft = scrollState.left
+  const viewRight = viewLeft + viewportWidth.value
   const margin = Math.max(32, scrollStep.value)
   if (x >= viewLeft + margin && x <= viewRight - margin) {
-    readScrollState(el)
+    refreshPanExtent(false)
     return
   }
-  const target = Math.max(0, Math.min(
-    Math.max(0, el.scrollWidth - el.clientWidth),
-    Math.round(x - el.clientWidth * 0.55),
-  ))
-  const useSmooth = smooth && shouldAnimate.value
-  el.scrollTo({ left: target, behavior: useSmooth ? 'smooth' : 'auto' })
-  if (useSmooth) {
-    scrollState.max = Math.max(0, Math.round(el.scrollWidth - el.clientWidth))
-    scrollState.left = target
-    return
-  }
-  readScrollState(el)
+  applyPan(Math.round(x - viewportWidth.value * 0.55), smooth)
 }
 
 function setCursor(index: number, pinScroll = true, smooth = false) {
@@ -1495,20 +1544,16 @@ function stepCursor(delta: number, smooth = false) {
   setCursor(base + delta, true, smooth)
 }
 
-function onPointerMove(event: PointerEvent) {
+function applyHoverFromClientX(clientX: number, target?: Element | null) {
   if (!props.showTooltip || !hasData.value || renderCount.value <= 0) return
-  // 横向移光标进行中：不要用指尖坐标抢光标，否则会和步进打架
-  if (props.scrollable && gesture.active && gesture.axis === 'x') return
-  const index = indexFromClientX(event.clientX, event.currentTarget as Element)
+  const index = target && !props.scrollable
+    ? indexFromClientX(clientX, target)
+    : indexFromScrollerClientX(clientX)
   if (index === null) return
-  if (props.scrollable) {
-    // 滑动模式：悬停只做短暂预览；未按下时同步粘性光标（桌面鼠标扫过）
-    hoverIndex.value = index
-    if (!gesture.active && event.pointerType === 'mouse') {
-      cursorIndex.value = index
-    }
-  } else {
-    hoverIndex.value = index
+  hoverIndex.value = index
+  // 滑动模式：未按下时桌面悬停同步粘性光标
+  if (props.scrollable && !gesture.active) {
+    cursorIndex.value = index
   }
 }
 
@@ -1517,28 +1562,55 @@ function clearHover() {
   hoverColumnPointValue.value = null
 }
 
-function onPointerDown(event: PointerEvent) {
-  onPointerMove(event)
+function onScrollerPointerLeave() {
+  if (!props.scrollable || gesture.active) return
+  clearHover()
+}
+
+/** 非滑动：热区悬停 */
+function onHitPointerMove(event: PointerEvent) {
+  if (props.scrollable) return
+  applyHoverFromClientX(event.clientX, event.currentTarget as Element)
+}
+
+function onHitPointerLeave() {
+  if (props.scrollable) return
+  clearHover()
+}
+
+/**
+ * 滑动模式：在滚动容器上按下，move/up 改挂 window
+ *（内容滚起来后 SVG 热区会跑偏，单靠元素内 pointermove / setPointerCapture 不可靠）。
+ */
+function onScrollerPointerDown(event: PointerEvent) {
   if (!props.scrollable || !hasData.value) return
+  if (event.button !== 0) return
+  // 候选圆点要留给 click 切换连线，不在这里开拖
+  if (isCandidateHitTarget(event.target)) return
+  unbindPanWindowListeners()
   gesture.active = true
   gesture.pointerId = event.pointerId
   gesture.startX = event.clientX
   gesture.startY = event.clientY
   gesture.axis = null
+  gesture.panned = false
   gesture.acc = 0
-  gesture.stepped = false
-  try {
-    (event.currentTarget as Element).setPointerCapture?.(event.pointerId)
-  } catch {
-    /* 部分环境无 capture，忽略 */
+  applyHoverFromClientX(event.clientX)
+  // 避免浏览器原生拖拽/选中打断横向拖
+  event.preventDefault()
+  bindPanWindowListeners()
+}
+
+/** 未按下时容器内扫过：同步光标；按下后的位移走 window 监听 */
+function onScrollerPointerMove(event: PointerEvent) {
+  if (!props.scrollable || gesture.active) return
+  if (event.pointerType === 'mouse' || event.buttons === 0) {
+    applyHoverFromClientX(event.clientX)
   }
 }
 
-function onPointerDrag(event: PointerEvent) {
-  if (!props.scrollable || !gesture.active || event.pointerId !== gesture.pointerId) {
-    onPointerMove(event)
-    return
-  }
+function onWindowPointerMove(event: PointerEvent) {
+  if (!gesture.active || event.pointerId !== gesture.pointerId) return
   const dx = event.clientX - gesture.startX
   const dy = event.clientY - gesture.startY
   if (!gesture.axis) {
@@ -1551,37 +1623,47 @@ function onPointerDrag(event: PointerEvent) {
     }
   }
   if (gesture.axis !== 'x') return
-  // 旧→新 = 左→右：手指左滑 → 光标往更新一侧（index+1）；右滑 → 更早（index-1）
   event.preventDefault()
-  gesture.acc += event.clientX - gesture.startX
+  const moveX = event.clientX - gesture.startX
   gesture.startX = event.clientX
-  const threshold = cursorStepThreshold()
+  if (!gesture.panned && Math.abs(moveX) < GESTURE_PAN_SLOP_PX) return
+
+  const max = panMax()
+  if (max > 2) {
+    // transform 轨道跟手平移
+    applyPan(scrollState.left - moveX)
+    gesture.panned = true
+    return
+  }
+  // 无溢出（一屏期数 ≥ 数据量）：退化为拖动步进光标，至少能扫期
+  gesture.acc += moveX
+  const threshold = Math.max(GESTURE_AXIS_LOCK_PX * 3, scrollStep.value * 0.5 || 28)
   while (gesture.acc <= -threshold) {
     gesture.acc += threshold
     stepCursor(1)
-    gesture.stepped = true
+    gesture.panned = true
   }
   while (gesture.acc >= threshold) {
     gesture.acc -= threshold
     stepCursor(-1)
-    gesture.stepped = true
+    gesture.panned = true
   }
 }
 
-function onPointerUp(event: PointerEvent) {
-  if (!props.scrollable || event.pointerId !== gesture.pointerId) {
-    return
-  }
-  // 轻点：光标落到按下位置对应的号码
-  if (!gesture.stepped && gesture.axis !== 'y') {
-    const index = indexFromClientX(event.clientX, event.currentTarget as Element)
+function onWindowPointerUp(event: PointerEvent) {
+  if (!gesture.active || event.pointerId !== gesture.pointerId) return
+  const index = indexFromScrollerClientX(event.clientX)
+  if (gesture.panned) {
+    if (index !== null) setCursor(index, false)
+  } else if (gesture.axis !== 'y') {
     if (index !== null) setCursor(index, true)
   }
+  unbindPanWindowListeners()
   gesture.active = false
   gesture.pointerId = -1
   gesture.axis = null
+  gesture.panned = false
   gesture.acc = 0
-  gesture.stepped = false
   hoverIndex.value = null
 }
 
@@ -1603,12 +1685,19 @@ function onKeyNavigate(event: KeyboardEvent) {
   }
 }
 
-/** 触控板横向滚轮：同样移光标，并拦住原生横向滚动 */
+/** 触控板横向滚轮 / 按住 Shift 的纵向滚轮：直接平移画布 */
 function onWheelNavigate(event: WheelEvent) {
   if (!props.scrollable || !hasData.value) return
-  if (Math.abs(event.deltaX) <= Math.abs(event.deltaY) || Math.abs(event.deltaX) < 2) return
+  let delta = 0
+  if (Math.abs(event.deltaX) > Math.abs(event.deltaY) && Math.abs(event.deltaX) >= 2) {
+    delta = event.deltaX
+  } else if (event.shiftKey && Math.abs(event.deltaY) >= 2) {
+    delta = event.deltaY
+  } else {
+    return
+  }
   event.preventDefault()
-  stepCursor(event.deltaX > 0 ? 1 : -1)
+  applyPan(scrollState.left + delta)
 }
 
 // 数据就绪 / 期数变化：光标默认落在最新位置（有候选段则落在最后一个候选；越界则收回）
@@ -1696,6 +1785,106 @@ const hoverInfo = computed(() => {
 
   if (!entries.length) return null
 
+  /** 路径/候选落点旁的短号码（1–49 补零；其余走轴格式） */
+  function focusValueLabel(value: number, explicit?: string): string {
+    if (explicit) return explicit
+    if (Number.isInteger(value) && value >= 1 && value <= 49) {
+      return String(value).padStart(2, '0')
+    }
+    return formatAxisValue(value)
+  }
+
+  /**
+   * 聚焦号码集合：
+   * - 竖列悬停到某号 → 只盯这一个；
+   * - 否则用已选竖列号（热力勾选同步过来的）；
+   * - 光标在路径某期 → 盯该期特码。
+   * 路径上历史同号全部回看标出（例：聚焦/勾选 23 → 前面出现过的 23 一并亮）。
+   */
+  const focusValues = new Set<number>()
+  if (column) {
+    if (hoverColumnPointValue.value !== null) {
+      focusValues.add(hoverColumnPointValue.value)
+    } else {
+      for (const point of column.points) focusValues.add(point.value)
+    }
+  } else {
+    for (const entry of entries) {
+      if (entry.isColumn || entry.textOverride !== undefined) continue
+      focusValues.add(entry.value)
+      break
+    }
+  }
+
+  // 十字准星：竖线用 guideX；水平虚线 = 各聚焦号的 y；路径同号全部打标
+  const guideYs: number[] = []
+  const focusMarks: Array<{
+    key: string
+    x: number
+    y: number
+    textX: number
+    textY: number
+    anchor: 'start' | 'end'
+    label: string
+    stroke: string
+    /** 是否为光标所在期 / 竖列焦点（其余是历史同号回看） */
+    primary: boolean
+  }> = []
+
+  const pointX = xAt(index)
+
+  if (focusValues.size > 0) {
+    for (const value of focusValues) {
+      const y = yAt(value)
+      if (!guideYs.some((prev) => Math.abs(prev - y) < 0.5)) guideYs.push(y)
+    }
+
+    // 路径回看：主序列里所有等于聚焦号的历史点
+    for (let seriesIndex = 0; seriesIndex < props.series.length; seriesIndex += 1) {
+      const item = props.series[seriesIndex]
+      const values = item.values ?? []
+      const colors = item.tone ? chartTone(item.tone) : chartToneAt(seriesIndex)
+      for (let i = renderStart.value; i < values.length; i += 1) {
+        const raw = values[i]
+        if (typeof raw !== 'number' || !Number.isFinite(raw)) continue
+        if (!focusValues.has(raw)) continue
+        const x = xAt(i)
+        const y = yAt(raw)
+        const primary = !column && i === index
+        const anchor: 'start' | 'end' = x > plotLeft.value + plotWidth.value / 2 ? 'end' : 'start'
+        focusMarks.push({
+          key: `path-echo-${seriesIndex}-${i}-${raw}`,
+          x,
+          y,
+          textX: anchor === 'end' ? x - 10 : x + 10,
+          textY: Math.min(plotBottom.value - 4, Math.max(plotTop + 11, y - 10)),
+          anchor,
+          label: focusValueLabel(raw),
+          stroke: colors.stroke,
+          primary,
+        })
+      }
+    }
+
+    // 竖列焦点：列上对应号再标一次
+    if (column) {
+      for (const point of column.points) {
+        if (!focusValues.has(point.value)) continue
+        focusMarks.push({
+          key: `focus-col-${point.key}`,
+          x: point.x,
+          y: point.y,
+          textX: point.x + COLUMN_LABEL_OFFSET,
+          textY: Math.min(plotBottom.value - 4, Math.max(plotTop + 11, point.y - 10)),
+          anchor: 'start',
+          label: focusValueLabel(point.value, point.label || undefined),
+          stroke: point.tone.stroke,
+          primary: true,
+        })
+      }
+    }
+  }
+
   // 整列提示不代表单个取值，不参与提示框纵向定位（用列顶槽位单独定位）
   const ys = entries
     .filter((entry) => entry.textOverride === undefined)
@@ -1706,7 +1895,6 @@ const hoverInfo = computed(() => {
   if (column?.points.length) {
     topY = Math.min(topY, ...column.points.map((point) => point.y))
   }
-  const pointX = xAt(index)
   // 滑动模式下 SVG 按 1:1 像素渲染，用 px 定位最准（百分比是按可视宽度算的，会随滚动漂移）；
   // 非滑动模式保持改造前的百分比定位，一个字都没变。
   // 提示框画在滚动容器外面（否则 overflow 会裁掉最右侧）。left 要减去 scrollLeft，
@@ -1738,6 +1926,8 @@ const hoverInfo = computed(() => {
     left,
     top: `${((topOffset + topY) / topBox) * 100}%`,
     guideX: pointX,
+    guideYs,
+    focusMarks,
     label: headerLabel,
     columnLines,
     entries: entries.map((entry) => ({
@@ -1753,24 +1943,29 @@ const hoverInfo = computed(() => {
 </script>
 
 <template>
-  <!-- 根节点沿用改造前的 class：外部 flex / grid 上下文里的尺寸计算与以前完全一致 -->
-  <div class="relative w-full">
-    <!-- 尺寸 / 滚动 host：滑动模式下的渐隐提示挂在这里（它不能跟着内容滚） -->
-    <div class="relative">
-      <!-- 图表视口：滑动模式下它就是横向滚动容器（原生 overflow-x，不写手势 JS） -->
+  <!-- min-w-0：避免外层 flex 把宽 SVG 撑破，导致视口跟着变宽、永远拖不动 -->
+  <div class="relative w-full min-w-0">
+    <!-- 尺寸 / 平移 host：滑动模式下的渐隐提示挂在这里（它不能跟着内容移） -->
+    <div class="relative min-w-0">
+      <!-- 图表视口：overflow hidden + 内层 transform 轨道（不依赖原生横向滚动） -->
       <div
         ref="scrollerEl"
-        class="relative w-full"
-        :class="props.scrollable ? 'chart-scroller overflow-x-auto overflow-y-hidden' : ''"
+        class="relative w-full min-w-0"
+        :class="[
+          props.scrollable ? 'chart-scroller overflow-x-hidden overflow-y-hidden' : '',
+          props.scrollable && gesture.active && gesture.axis === 'x' ? 'is-panning' : '',
+        ]"
         :style="props.scrollable
           ? { paddingTop: `${SCROLL_TOOLTIP_ROOM}px`, touchAction: 'pan-y' }
           : undefined"
         :tabindex="props.scrollable ? 0 : undefined"
         :role="props.scrollable ? 'group' : undefined"
         :aria-label="props.scrollable ? scrollerLabel : undefined"
-        @scroll.passive="onScroll"
         @keydown="onKeyNavigate"
         @wheel="onWheelNavigate"
+        @pointerdown="onScrollerPointerDown"
+        @pointermove="onScrollerPointerMove"
+        @pointerleave="onScrollerPointerLeave"
       >
         <!-- 空态：明确写「数据不足」，不编造曲线 -->
         <div
@@ -1782,12 +1977,25 @@ const hoverInfo = computed(() => {
           <span v-if="emptyHint" class="text-xs text-slate-500">{{ emptyHint }}</span>
         </div>
 
-        <template v-else>
+        <div
+          v-else
+          :class="props.scrollable ? 'chart-track' : undefined"
+          :style="props.scrollable
+            ? {
+                width: `${vbWidth}px`,
+                transform: `translate3d(${-scrollState.left}px, 0, 0)`,
+                transition: panSmooth ? 'transform 0.28s ease-out' : undefined,
+              }
+            : undefined"
+        >
           <svg
-            :class="props.scrollable ? 'block overflow-visible' : 'block h-auto w-full overflow-visible'"
+            :class="props.scrollable ? 'chart-scroller-svg block overflow-visible' : 'block h-auto w-full overflow-visible'"
             :viewBox="`0 0 ${vbWidth} ${vbHeight}`"
             :width="props.scrollable ? vbWidth : undefined"
             :height="props.scrollable ? vbHeight : undefined"
+            :style="props.scrollable
+              ? { width: `${vbWidth}px`, minWidth: `${vbWidth}px`, maxWidth: 'none', height: `${vbHeight}px` }
+              : undefined"
             preserveAspectRatio="xMidYMid meet"
             role="img"
           >
@@ -2106,13 +2314,24 @@ const hoverInfo = computed(() => {
               </text>
             </g>
 
-            <!-- 悬浮：竖向参考线 + 高亮点 -->
+            <!-- 悬浮：十字准星（竖+水平虚线）+ 路径号码聚焦 + 高亮点 -->
             <g v-if="hoverInfo">
               <line
                 :x1="hoverInfo.guideX"
                 :x2="hoverInfo.guideX"
                 :y1="plotTop"
                 :y2="plotBottom"
+                stroke="rgba(161, 241, 255, 0.45)"
+                stroke-width="1"
+                stroke-dasharray="3 4"
+              />
+              <line
+                v-for="(guideY, guideIndex) in hoverInfo.guideYs"
+                :key="`hguide-${guideIndex}`"
+                :x1="plotLeft"
+                :x2="hasColumn ? (columnX + COLUMN_LABEL_ROOM) : plotRight"
+                :y1="guideY"
+                :y2="guideY"
                 stroke="rgba(161, 241, 255, 0.45)"
                 stroke-width="1"
                 stroke-dasharray="3 4"
@@ -2156,12 +2375,39 @@ const hoverInfo = computed(() => {
                   stroke-width="1.5"
                 />
               </template>
+              <!-- 路径号码聚焦：当前点 + 历史上同号全部回看标出 -->
+              <g v-for="mark in hoverInfo.focusMarks" :key="mark.key" aria-hidden="true">
+                <circle
+                  :cx="mark.x"
+                  :cy="mark.y"
+                  :r="mark.primary ? 5.2 : 4.4"
+                  :fill="mark.stroke"
+                  stroke="rgba(5, 6, 15, 0.92)"
+                  :stroke-width="mark.primary ? 1.8 : 1.4"
+                  :opacity="mark.primary ? 1 : 0.92"
+                />
+                <text
+                  :x="mark.textX"
+                  :y="mark.textY"
+                  :text-anchor="mark.anchor"
+                  :font-size="mark.primary ? 12 : 11"
+                  font-weight="600"
+                  :fill="mark.stroke"
+                  class="num"
+                  paint-order="stroke"
+                  stroke="rgba(5, 6, 15, 0.92)"
+                  stroke-width="3.5"
+                  stroke-linejoin="round"
+                >
+                  {{ mark.label }}
+                </text>
+              </g>
             </g>
 
             <!--
-              交互热区。touch-action 一律 pan-y：纵向交给页面滚动；
-              滑动模式下横向由 JS 步进号码光标（非整图自由平移）。
-              候选列模式把热区右边界扩到号码标签留白（plotRight + COLUMN_LABEL_ROOM），点按/滑动才能落到这一列。
+              热区铺满绘图区，保证空白处也能命中。
+              滑动模式：不在此绑拖动手势（事件冒泡到外层 chart-scroller，由它 setPointerCapture + 改 scrollLeft）。
+              非滑动：仅悬停提示。
             -->
             <rect
               v-if="props.showTooltip"
@@ -2170,12 +2416,8 @@ const hoverInfo = computed(() => {
               :width="hasColumn ? (columnX + COLUMN_LABEL_ROOM - plotLeft) : plotWidth"
               :height="plotHeight"
               fill="transparent"
-              style="touch-action: pan-y"
-              @pointermove="onPointerDrag"
-              @pointerdown="onPointerDown"
-              @pointerup="onPointerUp"
-              @pointercancel="onPointerUp"
-              @pointerleave="clearHover"
+              @pointermove="onHitPointerMove"
+              @pointerleave="onHitPointerLeave"
             />
             <!-- 竖列点命中层：叠在热区之上，才能点选单个号码切换连线 -->
             <g v-if="columnGeometry">
@@ -2186,6 +2428,7 @@ const hoverInfo = computed(() => {
                 :cy="point.y"
                 r="7"
                 fill="transparent"
+                data-candidate-hit="1"
                 class="cursor-pointer"
                 @pointerenter="onCandidatePointEnter(point.value)"
                 @pointerleave="onCandidatePointLeave"
@@ -2193,10 +2436,10 @@ const hoverInfo = computed(() => {
               />
             </g>
           </svg>
-        </template>
+        </div>
       </div>
 
-      <!-- 提示框放在滚动容器外：容器 overflow-x/y 会把贴在最右侧的「本期候选」裁掉 -->
+      <!-- 提示框放在视口外：避免被 overflow 裁掉最右侧「本期候选」 -->
       <div
         v-if="hoverInfo"
         class="glass-panel-strong pointer-events-none absolute z-10 -translate-x-1/2 -translate-y-[115%] rounded-lg px-2.5 py-1.5 text-[11px]"
@@ -2272,8 +2515,8 @@ const hoverInfo = computed(() => {
       class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1"
     >
       <p class="text-[11px] text-slate-500">
-        <template v-if="canScroll">左右滑动移动号码光标（视口随光标跟随）；</template>
-        <template v-else>点按或左右方向键可移动号码光标；</template>
+        <template v-if="canScroll">按住左右拖可平移周期；</template>
+        <template v-else>当前一屏已铺满全部数据，可改成更少「期/屏」后再拖；或点按、方向键移动光标；</template>
         {{ props.axisHint }}
       </p>
       <div class="ml-auto flex flex-wrap items-center gap-1.5">
@@ -2305,13 +2548,24 @@ const hoverInfo = computed(() => {
 
 <style scoped>
 /*
- * 只作用于滑动模式的滚动容器。
- * overscroll-behavior-x: contain —— 划到两端时不要把横向手势继续传给页面（iOS 的返回手势 / 浏览器后退）。
- * 横向浏览靠号码光标步进 + 程序化 scrollLeft，不靠手指自由拖动画布。
+ * 滑动视口：overflow hidden + 内层 transform 轨道。
+ * min-width:0 由 class 保证，避免 flex 父级把内容撑开导致 panMax 恒为 0。
  */
 .chart-scroller {
   overscroll-behavior-x: contain;
-  -webkit-overflow-scrolling: touch;
-  scrollbar-width: thin;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.chart-scroller.is-panning {
+  cursor: grabbing;
+}
+.chart-track {
+  display: block;
+  will-change: transform;
+}
+.chart-scroller-svg {
+  max-width: none !important;
+  flex-shrink: 0;
 }
 </style>

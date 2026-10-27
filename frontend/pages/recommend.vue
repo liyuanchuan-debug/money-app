@@ -647,7 +647,7 @@ const tripleCopyFeedback = computed(
   () => copiedSource.value === 'triple' || copiedSource.value.startsWith('group-'),
 )
 
-const WAVE_TREND_WINDOW_DEFAULT = 100
+const WAVE_TREND_WINDOW_DEFAULT = 60
 const WAVE_TREND_WINDOW_OPTIONS = [30, 60, 100, 0]
 const waveTrendWindow = ref(WAVE_TREND_WINDOW_DEFAULT)
 
@@ -678,9 +678,14 @@ const waveTrendChart = computed(() => {
   const band = latticeBand.value
   if (!meta?.enabled || !band) return empty
   const newestFirst = normalizeDraws(rawDraws.value)
-  const window = typeof meta.window === 'number' ? meta.window : 0
-  const windowed = window > 0 ? newestFirst.slice(0, window) : newestFirst
-  const ordered = windowed.slice().reverse()
+  // 点阵走势用本池全部历史（最多 500）：「100 期」只表示一屏密度，
+  // 若仍按 lattice_window 截断，数据量≈一屏 → 永远拖不动。
+  // 预测带本身仍来自 lattice API（lattice_window 口径），与这里画多少期无关。
+  const CHART_HISTORY_CAP = 500
+  const forChart = newestFirst.length > CHART_HISTORY_CAP
+    ? newestFirst.slice(0, CHART_HISTORY_CAP)
+    : newestFirst
+  const ordered = forChart.slice().reverse()
   if (ordered.length < 2) return empty
   const specialValues: number[] = []
   const labels: string[] = []
@@ -1561,12 +1566,13 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
           </GlassPanel>
         </MotionReveal>
 
-        <MotionReveal v-if="lattice?.enabled && latticeBand && waveTrendChart.pointCount" :index="6">
-          <GlassPanel padding="lg" rounded="3xl" class="space-y-3">
+        <MotionReveal v-if="lattice?.enabled && latticeBand && waveTrendChart.pointCount" :index="6" class="min-w-0">
+          <GlassPanel padding="lg" rounded="3xl" class="min-w-0 space-y-3 overflow-hidden">
             <div class="space-y-1">
               <h2 class="text-lg font-medium text-white">预测点阵</h2>
               <p class="text-xs leading-relaxed text-slate-500">
                 连线随下方「01–49 出现热度」勾选同步：绿=带内预测，红=带外预测，紫=自选；未勾选不连线。
+                下方「N 期」是一屏显示多少期；历史多于一屏时可按住左右拖。
               </p>
             </div>
             <LineChart
