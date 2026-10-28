@@ -816,6 +816,17 @@ const waveTrendChart = computed(() => {
     labels.push(periodText(ordered[i]) || ordered[i].draw_date || `第${i + 1}点`)
   }
   const clampToLane = (value: number) => Math.min(49, Math.max(1, Math.round(value)))
+  /** 与 pushDiffBands 画出来的整数色带同一口径（避免浮点带宽 vs 圆整色带打架） */
+  const numberInPaintedBand = (num: number, anchor: number, low: number, high: number) => {
+    if (!Number.isFinite(anchor) || !Number.isFinite(low) || !Number.isFinite(high)) return false
+    const lowerFrom = clampToLane(anchor - high)
+    const lowerTo = clampToLane(anchor - low)
+    const upperFrom = clampToLane(anchor + low)
+    const upperTo = clampToLane(anchor + high)
+    const inLower = num >= Math.min(lowerFrom, lowerTo) && num <= Math.max(lowerFrom, lowerTo)
+    const inUpper = num >= Math.min(upperFrom, upperTo) && num <= Math.max(upperFrom, upperTo)
+    return inLower || inUpper
+  }
   const pushDiffBands = (
     list: ChartBand[],
     anchor: number,
@@ -849,25 +860,29 @@ const waveTrendChart = computed(() => {
   const bands: ChartBand[] = []
   let candidateColumn: ColumnCandidate[] = []
   let candidateColumnFromIndex: number | null = null
+  /** 回放文案 / 点色用的命中：跟画出来的色带一致 */
+  let displayHit: boolean | null = replay ? replay.hit : null
 
   if (useHistory && replay) {
     const low = replay.band.low
     const high = replay.band.high
+    // 点色跟「画出来的色带」走：带外实开必须是 bloom（红），不能因浮点命中仍亮绿
+    const actualInBand = numberInPaintedBand(replay.actual, replay.anchor, low, high)
+    displayHit = actualInBand
     pushDiffBands(
       bands,
       replay.anchor,
       low,
       high,
       `第${replay.anchorPeriod}期后的预测带`,
-      replay.hit ? 'emerald' : 'amber',
+      actualInBand ? 'emerald' : 'amber',
     )
     candidateColumn = Array.from({ length: 49 }, (_, index) => {
       const num = index + 1
-      const diff = Math.abs(num - replay.anchor)
-      const inBand = diff >= low && diff <= high
+      const inBand = numberInPaintedBand(num, replay.anchor, low, high)
       const isActual = num === replay.actual
       let tone: ColumnCandidate['tone'] = 'slate'
-      if (isActual) tone = replay.hit ? 'emerald' : 'bloom'
+      if (isActual) tone = actualInBand ? 'emerald' : 'bloom'
       else if (inBand) tone = 'amber'
       return {
         value: num,
@@ -940,7 +955,7 @@ const waveTrendChart = computed(() => {
           anchor: replay.anchor,
           actual: replay.actual,
           diff: replay.diff,
-          hit: replay.hit,
+          hit: displayHit === true,
           low: replay.band.low,
           high: replay.band.high,
         }

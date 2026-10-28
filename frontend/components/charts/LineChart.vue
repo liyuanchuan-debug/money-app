@@ -93,7 +93,7 @@ interface CandidatePoint {
  * - x：候选列就是**最后一个普通等距下标**（与真实期、预测点共用同一 x 步长），
  *   落在序列绘图区右边界上；其右侧留出号码标签宽度，不与右边缘贴死；
  * - y：默认绘图区内**等距槽位**（只为了让每个号码读得清，纵向不是数值/时间坐标）；
- *   传 candidateColumnByValue = true 时改为在绘图区内按取值线性落点（每档一格，边缘号不叠像素）；
+ *   传 candidateColumnByValue = true 时改为 y = yAt(value)（与预测带 / 主轴同一套纵轴，边缘号不叠像素）；
  * - 连线：从 candidateColumnFromIndex 指定的「最新真实数据点」分别连到每个候选点，算法与主走势同一套 linePath；
  * - 标签：槽位间距不足时整列隐藏标签，号码交给光标提示（绝不重叠）；``pinLabel`` 点始终单独出标签。
  * 口径：本期候选，非真实开奖；纵列等距时只为人眼读号码，不表示取值大小。
@@ -1218,23 +1218,11 @@ const candidateGeometry = computed(() => {
 })
 
 /**
- * 竖列按取值落点：直接映射到垫后的 [top, bottom]，保证值域内每个不同取值有不同 y。
- * 禁止先 yAt 再 clamp —— 那会把 01/02/03（以及 47/48/49）挤到同一条边线上。
- */
-function columnYByValue(value: number, top: number, bottom: number) {
-  const min = bounds.value.min
-  const max = bounds.value.max
-  const range = max - min || 1
-  const ratio = Math.min(1, Math.max(0, (value - min) / range))
-  return bottom - ratio * Math.max(1, bottom - top)
-}
-
-/**
  * 竖列候选几何（opt-in，默认空 = 不绘制）。
  * - x：全部候选共用 columnX = 最后一个等距下标（与真实期、预测点同一步长，是**单列**、不是横向铺开）；
  * - y：默认绘图区内**等距槽位**（slot 0 在上、slot n-1 在下）—— 纵向不是数值/时间坐标，
- *   只为让每个号码读得清；candidateColumnByValue = true 时在垫后绘图区按取值线性落点，
- *   纵轴同单位时这一列就是取值的点阵分布（边缘号不叠像素）；
+ *   只为让每个号码读得清；candidateColumnByValue = true 时用 ``yAt(value)``（与预测带同一纵轴），
+ *   **禁止再 clamp 到垫区** —— 否则 01/02/03 会叠像素，且实开点会对不齐带宽阴影；
  * - 预测折线：从 candidateColumnFromIndex 指定的「最新真实数据点」**分别**连到每个槽位，
  *   每条都用与主走势同一套 linePath（两点退化为直线段）；
  * - 标签：真实值模式下按 y 升序上下交替 + 固定步长确定性错开；最小步长过小或错不开时
@@ -1259,9 +1247,9 @@ const columnGeometry = computed(() => {
     return {
       key: `col-${i}`,
       x,
-      // 槽位 y：默认等距；byValue = 垫后区间线性映射（不用 yAt+clamp，避免 01/02/03 叠点）
+      // 槽位 y：默认等距；byValue = 与主轴/预测带同一 yAt（不 clamp，避免叠点与错位）
       y: byValue
-        ? columnYByValue(item.value, top, bottom)
+        ? yAt(item.value)
         : (count <= 1 ? (top + bottom) / 2 : top + (span * i) / (count - 1)),
       value: item.value,
       label: item.label ? String(item.label) : '',
