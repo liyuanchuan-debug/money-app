@@ -117,7 +117,11 @@ async function submit() {
   try {
     const summary = await api.importDraws(text.value)
     result.value = summary
-    infoMessage.value = `导入完成：新增 / 覆盖 ${summary.imported} 期，跳过 ${summary.skipped} 期`
+    const band = summary.lattice_band
+    const bandText = band && band.data_status === 'OK' && band.hit_rate != null
+      ? `；预测带命中 ${band.hits}/${band.evaluated}（${(band.hit_rate * 100).toFixed(1)}%）`
+      : ''
+    infoMessage.value = `导入完成：新增 / 覆盖 ${summary.imported} 期，跳过 ${summary.skipped} 期${bandText}`
     if (summary.imported > 0) importHit.fire()
     await refreshDraws()
     // 新导入的期次排在最前，直接回到第 1 页让用户看到结果

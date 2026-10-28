@@ -102,6 +102,7 @@ from services.lottery import (
     order_pool,
     plan_budget,
     predict_wave_band,
+    replay_predict_wave_band,
     random_allocation,
     random_amounts,
     recommend,
@@ -2518,6 +2519,63 @@ def test_lattice_primary_wave_picks_dominant_bucket():
     )
     # 无预测 → None（调用方回退旧轮取顺序）
     assert lattice_primary_wave(None) is None
+
+
+def test_replay_predict_wave_band_is_walk_forward():
+    """回放只读目标期之前；改未来不得改带；命中口径 = 差值落在当时带宽内。"""
+    # 最新在前；差值恒为 5 → 带宽 5~5
+    history = [35, 30, 25, 20, 15, 10]
+    replay = replay_predict_wave_band(history, target_index=0, window=0)
+    assert replay is not None
+    assert replay["anchor"] == 30
+    assert replay["actual"] == 35
+    assert replay["diff"] == 5
+    assert replay["hit"] is True
+    assert replay["band"]["low"] == pytest.approx(5.0)
+    assert replay["band"]["high"] == pytest.approx(5.0)
+
+    # 改目标期及更新的数据（这里只有目标期本身）不得改带
+    mutated = [1, *history[1:]]
+    again = replay_predict_wave_band(mutated, target_index=0, window=0)
+    assert again is not None
+    assert again["band"] == replay["band"]
+    assert again["anchor"] == replay["anchor"]
+    assert again["hit"] is False  # |1-30| 远超带宽
+
+    # 目标期之前不足两期 → 无预测
+    assert replay_predict_wave_band([9, 8], target_index=0, window=0) is None
+    assert replay_predict_wave_band(history, target_index=99, window=0) is None
+
+
+def test_lattice_band_hit_stats_walk_forward():
+    """带内命中率：恒定差值 5 → 带宽 5~5 → 每一可评估期都应命中。"""
+    from services.lottery import lattice_band_hit_stats
+
+    history = [35, 30, 25, 20, 15, 10]
+    periods = [106, 105, 104, 103, 102, 101]
+    stats = lattice_band_hit_stats(history, periods=periods, window=0)
+    assert stats["data_status"] == "OK"
+    # 可评估：target_index 0..3（共 4 期；最老两期不够估带）
+    assert stats["evaluated"] == 4
+    assert stats["hits"] == 4
+    assert stats["misses"] == 0
+    assert stats["hit_rate"] == pytest.approx(1.0)
+    assert stats["latest"]["period"] == 106
+    assert stats["latest"]["hit"] is True
+
+    # 最新一期差值拉飞 → 命中率下降，且改未来不影响更早各期的带
+    mutated = [1, *history[1:]]
+    again = lattice_band_hit_stats(mutated, periods=periods, window=0)
+    assert again["evaluated"] == 4
+    assert again["hits"] == 3
+    assert again["misses"] == 1
+    assert again["latest"]["hit"] is False
+    assert again["hit_rate"] == pytest.approx(0.75)
+
+    insufficient = lattice_band_hit_stats([9, 8], window=0)
+    assert insufficient["data_status"] == "INSUFFICIENT"
+    assert insufficient["evaluated"] == 0
+    assert insufficient["hit_rate"] is None
 
 
 def _long_history() -> list[int]:

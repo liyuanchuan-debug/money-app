@@ -1,7 +1,24 @@
 <script setup lang="ts">
-import type { DrawItem, NextPeriod } from '~/composables/useApi'
+import type { DrawItem, LatticeBandHitStatsPayload, NextPeriod } from '~/composables/useApi'
 import type { NormalizedDraw } from '~/composables/useDraws'
 import { normalizeDraw, padNumber, periodText, todayLocal, zodiacText } from '~/composables/useDraws'
+import { formatBandHitRate } from '~/utils/predictWaveBand'
+
+function latticeBandFeedback(stats: LatticeBandHitStatsPayload | null | undefined): string {
+  if (!stats || stats.data_status !== 'OK' || !stats.latest) {
+    return stats?.evaluated === 0
+      ? '；预测带命中率：样本不足（至少 3 期）'
+      : ''
+  }
+  const latest = stats.latest
+  const periodLabel = latest.period != null ? `第 ${latest.period} 期` : '本期'
+  const hitLabel = latest.hit ? '落在预测带内' : '落在预测带外'
+  return (
+    `；${periodLabel}${hitLabel}（差 ${latest.diff}，带 ${latest.low}–${latest.high}）`
+    + `；累计带内命中 ${stats.hits}/${stats.evaluated}`
+    + `（${formatBandHitRate(stats.hit_rate)}）`
+  )
+}
 
 definePageMeta({ role: 'ADMIN' })
 
@@ -231,6 +248,7 @@ async function submit() {
       infoMessage.value
         = `已纠正第 ${corrected.period} 期：特码 ${padNumber(corrected.old_special_number)} → ${padNumber(corrected.new_special_number)}`
         + `；重算采用快照 ${corrected.resettled_rounds} 条`
+        + latticeBandFeedback(corrected.lattice_band)
       hit.fire()
     } else {
       const response = await api.quickAddDraw({
@@ -249,7 +267,9 @@ async function submit() {
         zodiac_label: '',
       }
       savedDraw.value = normalized
-      infoMessage.value = `已保存：${periodText(normalized)} · 特码 ${padNumber(normalized.special_number)}`
+      infoMessage.value
+        = `已保存：${periodText(normalized)} · 特码 ${padNumber(normalized.special_number)}`
+        + latticeBandFeedback(response.lattice_band)
       hit.fire()
     }
 

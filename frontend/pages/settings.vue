@@ -23,23 +23,18 @@ import {
   ROLE_WEIGHT_PRESETS,
   ROLE_WEIGHT_PRIMARY_DEFAULT,
   ROLE_WEIGHT_SECONDARY_DEFAULT,
-  SOFT_WEIGHT_MAX,
-  SOFT_WEIGHT_MIN,
-  SOFT_WEIGHT_OPTIONS,
   STALE_PERIODS_DEFAULT,
   STALE_PERIODS_MAX,
   STALE_PERIODS_MIN,
   STALE_WEIGHT_DEFAULT,
   TOTAL_AMOUNT_MAX,
   TOTAL_AMOUNT_MIN,
-  TREND_BIAS_OPTIONS,
   TREND_WINDOW_DEFAULT,
   TREND_WINDOW_OPTIONS,
   previewEvenAmounts,
   WAVE_ALLOC_OPTIONS,
   type ChipMode,
   type PickSampling,
-  type TrendBias,
   type WaveAlloc,
 } from '~/composables/useApi'
 
@@ -53,8 +48,11 @@ definePageMeta({ role: 'USER' })
  *   - 「金额最小单位」是注码粒度：所有模式下每一注金额必须是它的正整数倍；
  *   - 各注金额按单位个数分配，总和 = 最大投注（须为最小单位的整数倍）。
  *
- * 默认值口径：本页保存的 mode / trend_bias 是全局默认值；
+ * 默认值口径：本页保存的 mode / 注数等是全局默认值；
  * 「波浪买入法」（/recommend）页里的临时切换只是当次预览，绝不写回这里。
+ *
+ * 假旋钮已下线：软降权系数、走势偏好（hot/cold/mid）对选号/金额无效，
+ * 本页不再提供可点控件；保存时固定回写引擎默认（兼容旧字段）。
  */
 const api = useApi()
 
@@ -65,21 +63,14 @@ const infoMessage = ref('')
 
 /** 筹码模式取值表来自 useApi（== 后端 services/lottery.py 的 MODES） */
 const chipModes = CHIP_MODE_OPTIONS
-const trendBiasOptions = TREND_BIAS_OPTIONS
 const trendWindowOptions = TREND_WINDOW_OPTIONS
 /** 波动桶注数分配取值表（== 后端 services/lottery.py 的 WAVE_ALLOCS） */
 const waveAllocOptions = WAVE_ALLOC_OPTIONS
 /** 桶内取号方式取值表（== 后端 services/lottery.py 的 PICK_SAMPLINGS） */
 const pickSamplingOptions = PICK_SAMPLING_OPTIONS
-/** 软降权权重档位（1.0 = 不降权） */
-const softWeightOptions = SOFT_WEIGHT_OPTIONS
 
 function isChipMode(value: unknown): value is ChipMode {
   return chipModes.some(option => option.value === value)
-}
-
-function isTrendBias(value: unknown): value is TrendBias {
-  return trendBiasOptions.some(option => option.value === value)
 }
 
 function isWaveAlloc(value: unknown): value is WaveAlloc {
@@ -91,7 +82,7 @@ function isPickSampling(value: unknown): value is PickSampling {
 }
 
 const form = reactive({
-  // 与后端 services/lottery.py 的 DEFAULT_SETTINGS 对齐（10 / 30 / neutral / 不避重肖）
+  // 与后端 services/lottery.py 的 DEFAULT_SETTINGS 对齐（10 / 30 / 不避重肖）
   small_max: 10,
   normal_max: 30,
   pick_count: 10,
@@ -101,17 +92,14 @@ const form = reactive({
   mode: 'even' as ChipMode,
   stake_top: 15 as 15 | 20,
   exclude_repeat_zodiac: false,
-  trend_bias: 'neutral' as TrendBias,
+  // 走势取样窗：仅影响「走势分布参考」展示，不改选号
   trend_window: TREND_WINDOW_DEFAULT,
-  // 避冷加权（自然日口径）：已被「按**期数**的软降权」取代，默认关闭
+  // 避冷加权（自然日口径）：仍生效；默认关闭
   avoid_cold_enabled: false,
   avoid_cold_days: AVOID_COLD_DEFAULT_DAYS,
-  // 三类软降权（重号 / 同肖 / 冷号）：不排除、只降权
+  // 候选池开关（真旋钮）+ 冷号徽章口径；降权系数已停用，不进表单
   include_repeat_number: true,
-  repeat_number_weight: REPEAT_NUMBER_WEIGHT_DEFAULT,
-  repeat_zodiac_weight: REPEAT_ZODIAC_WEIGHT_DEFAULT,
   stale_periods: STALE_PERIODS_DEFAULT,
-  stale_weight: STALE_WEIGHT_DEFAULT,
   // 预测波动线 + 号码点阵（定义抽样概率分布：带内号码概率更高）；默认开启（2026-10-09）
   lattice_enabled: true,
   lattice_window: LATTICE_WINDOW_DEFAULT,
@@ -227,18 +215,9 @@ async function load() {
     // 缺字号 / 旧后端：默认不避开重肖、保留重号（与 DEFAULT_SETTINGS 一致）
     form.exclude_repeat_zodiac = settings.exclude_repeat_zodiac === true
     form.include_repeat_number = settings.include_repeat_number !== false
-    form.repeat_number_weight = typeof settings.repeat_number_weight === 'number'
-      ? settings.repeat_number_weight
-      : REPEAT_NUMBER_WEIGHT_DEFAULT
-    form.repeat_zodiac_weight = typeof settings.repeat_zodiac_weight === 'number'
-      ? settings.repeat_zodiac_weight
-      : REPEAT_ZODIAC_WEIGHT_DEFAULT
     form.stale_periods = typeof settings.stale_periods === 'number'
       ? settings.stale_periods
       : STALE_PERIODS_DEFAULT
-    form.stale_weight = typeof settings.stale_weight === 'number'
-      ? settings.stale_weight
-      : STALE_WEIGHT_DEFAULT
     form.lattice_enabled = settings.lattice_enabled === true
     form.lattice_window = typeof settings.lattice_window === 'number'
       ? settings.lattice_window
@@ -258,7 +237,6 @@ async function load() {
     // 只在后端返回合法枚举时覆盖，避免把状态搞成取值之外的脏值
     if (isChipMode(settings.mode)) form.mode = settings.mode
     form.stake_top = settings.stake_top === 20 ? 20 : 15
-    if (isTrendBias(settings.trend_bias)) form.trend_bias = settings.trend_bias
     if (typeof settings.trend_window === 'number') form.trend_window = settings.trend_window
     // 缺字段 / 旧后端 → 默认关闭避冷（与 DEFAULT_SETTINGS 一致），阈值回退 60
     form.avoid_cold_enabled = settings.avoid_cold_enabled === true
@@ -309,20 +287,6 @@ function validate(): string | null {
   for (const field of fields) {
     if (!Number.isInteger(field.value) || field.value < field.min || field.value > field.max) {
       return `${field.label}需为 ${field.min}-${field.max} 之间的整数`
-    }
-  }
-  const weights: Array<{ label: string; value: number }> = [
-    { label: '重号降权系数', value: form.repeat_number_weight },
-    { label: '同肖降权系数', value: form.repeat_zodiac_weight },
-    { label: '冷号降权系数', value: form.stale_weight },
-  ]
-  for (const item of weights) {
-    if (
-      !Number.isFinite(item.value)
-      || item.value < SOFT_WEIGHT_MIN
-      || item.value > SOFT_WEIGHT_MAX
-    ) {
-      return `${item.label}需为 ${SOFT_WEIGHT_MIN}-${SOFT_WEIGHT_MAX} 之间的数字`
     }
   }
   // 金额最小单位按 5 元一档（注码粒度）
@@ -386,10 +350,11 @@ async function save() {
       stake_top: form.stake_top,
       exclude_repeat_zodiac: form.exclude_repeat_zodiac,
       include_repeat_number: form.include_repeat_number,
-      repeat_number_weight: form.repeat_number_weight,
-      repeat_zodiac_weight: form.repeat_zodiac_weight,
+      // 假旋钮固定回写默认：引擎已停用为权重，不再提供可调 UI
+      repeat_number_weight: REPEAT_NUMBER_WEIGHT_DEFAULT,
+      repeat_zodiac_weight: REPEAT_ZODIAC_WEIGHT_DEFAULT,
       stale_periods: form.stale_periods,
-      stale_weight: form.stale_weight,
+      stale_weight: STALE_WEIGHT_DEFAULT,
       lattice_enabled: form.lattice_enabled,
       lattice_window: form.lattice_window,
       wave_alloc: form.wave_alloc,
@@ -397,7 +362,7 @@ async function save() {
       role_w_primary: form.role_w_primary,
       role_w_secondary: form.role_w_secondary,
       role_w_defense: form.role_w_defense,
-      trend_bias: form.trend_bias,
+      trend_bias: 'neutral',
       trend_window: form.trend_window,
       avoid_cold_enabled: form.avoid_cold_enabled,
       avoid_cold_days: form.avoid_cold_days,
@@ -410,18 +375,9 @@ async function save() {
     form.odds = typeof settings.odds === 'number' ? settings.odds : 47
     form.exclude_repeat_zodiac = settings.exclude_repeat_zodiac === true
     form.include_repeat_number = settings.include_repeat_number !== false
-    form.repeat_number_weight = typeof settings.repeat_number_weight === 'number'
-      ? settings.repeat_number_weight
-      : REPEAT_NUMBER_WEIGHT_DEFAULT
-    form.repeat_zodiac_weight = typeof settings.repeat_zodiac_weight === 'number'
-      ? settings.repeat_zodiac_weight
-      : REPEAT_ZODIAC_WEIGHT_DEFAULT
     form.stale_periods = typeof settings.stale_periods === 'number'
       ? settings.stale_periods
       : STALE_PERIODS_DEFAULT
-    form.stale_weight = typeof settings.stale_weight === 'number'
-      ? settings.stale_weight
-      : STALE_WEIGHT_DEFAULT
     form.lattice_enabled = settings.lattice_enabled === true
     form.lattice_window = typeof settings.lattice_window === 'number'
       ? settings.lattice_window
@@ -440,7 +396,6 @@ async function save() {
       : ROLE_WEIGHT_DEFENSE_DEFAULT
     if (isChipMode(settings.mode)) form.mode = settings.mode
     form.stake_top = settings.stake_top === 20 ? 20 : 15
-    if (isTrendBias(settings.trend_bias)) form.trend_bias = settings.trend_bias
     if (typeof settings.trend_window === 'number') form.trend_window = settings.trend_window
     form.avoid_cold_enabled = settings.avoid_cold_enabled === true
     form.avoid_cold_days = typeof settings.avoid_cold_days === 'number'
@@ -798,8 +753,7 @@ const readonlyInputClass
                     </p>
                     <p class="text-xs leading-relaxed text-slate-500">
                       开启后，财富密码与回测的候选池会排除「最新一期特码的全部同肖号码」。
-                      关闭（默认）时，同肖号可以入选，但会按下方「同肖降权」压低排序与金额。
-                      被选中时会标「同肖」徽章。
+                      关闭（默认）时同肖号可以入选；被选中时仍会标「同肖」徽章（只作标签，不降权）。
                     </p>
                   </div>
                   <GlassButton
@@ -815,21 +769,18 @@ const readonlyInputClass
                 </div>
               </div>
 
-              <!-- 三类软降权：重号 / 同肖 / 冷号（已停用为权重，仅保留信息徽章） -->
+              <!-- 候选池 / 号码标签：只保留真旋钮；软降权系数已下线 -->
               <div class="space-y-4 rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-4">
                 <div class="space-y-1">
                   <p class="text-sm font-medium text-slate-200">
-                    号码标签（不再降权）
+                    候选池与号码标签
                   </p>
                   <p class="text-xs leading-relaxed text-slate-500">
-                    三类号码（重号 / 同肖 / 冷号）的系数<span class="text-slate-300">不再</span>影响排序或金额，
-                    命中时仍会在推荐卡片上标出对应徽章。
-                    「近 100 期未出现就剔除」的硬规则已停用，冷号仍可进入财富密码。
-                    下面三项系数与冷号口径只生成徽章，不会改变选号或金额。
+                    下面两项会改候选池或徽章口径。重号 / 同肖 / 冷号的「降权系数」已停用，
+                    不再提供旋钮——命中时仍只打徽章，不改排序或金额。
                   </p>
                 </div>
 
-                <!-- 上期出过的号（重号）是否保留 -->
                 <div class="flex flex-wrap items-center justify-between gap-3">
                   <div class="space-y-1">
                     <p id="include-repeat-number-label" class="text-sm font-medium text-slate-200">
@@ -837,7 +788,7 @@ const readonlyInputClass
                     </p>
                     <p class="text-xs leading-relaxed text-slate-500">
                       开启（默认）：上期特码本身留在候选池内，命中时标「重号」徽章。
-                      关闭 = 旧行为，直接把上期特码本身排除。
+                      关闭 = 直接把上期特码本身排除。
                     </p>
                   </div>
                   <GlassButton
@@ -852,68 +803,9 @@ const readonlyInputClass
                   </GlassButton>
                 </div>
 
-                <!-- 重号降权系数 -->
-                <div class="space-y-2">
-                  <p id="repeat-number-weight-label" class="text-sm font-medium text-slate-200">
-                    重号降权系数
-                  </p>
-                  <div
-                    role="radiogroup"
-                    aria-labelledby="repeat-number-weight-label"
-                    class="flex flex-wrap gap-2"
-                  >
-                    <GlassButton
-                      v-for="option in softWeightOptions"
-                      :key="`rn-${option.value}`"
-                      role="radio"
-                      :aria-checked="form.repeat_number_weight === option.value"
-                      :variant="form.repeat_number_weight === option.value ? 'primary' : 'glass'"
-                      class="min-h-[44px] px-4 text-base"
-                      @click="form.repeat_number_weight = option.value"
-                    >
-                      {{ option.label }}
-                    </GlassButton>
-                  </div>
-                  <p class="text-xs text-slate-500">
-                    当前 <span class="num text-slate-300">{{ form.repeat_number_weight }}</span>
-                    （默认 0.5）。<span class="text-slate-300">仅生成徽章</span>：
-                    上期特码本身命中时标「重号」，不再影响排序或金额。
-                  </p>
-                </div>
-
-                <!-- 同肖降权系数 -->
-                <div class="space-y-2">
-                  <p id="repeat-zodiac-weight-label" class="text-sm font-medium text-slate-200">
-                    同肖降权系数
-                  </p>
-                  <div
-                    role="radiogroup"
-                    aria-labelledby="repeat-zodiac-weight-label"
-                    class="flex flex-wrap gap-2"
-                  >
-                    <GlassButton
-                      v-for="option in softWeightOptions"
-                      :key="`rz-${option.value}`"
-                      role="radio"
-                      :aria-checked="form.repeat_zodiac_weight === option.value"
-                      :variant="form.repeat_zodiac_weight === option.value ? 'primary' : 'glass'"
-                      class="min-h-[44px] px-4 text-base"
-                      @click="form.repeat_zodiac_weight = option.value"
-                    >
-                      {{ option.label }}
-                    </GlassButton>
-                  </div>
-                  <p class="text-xs text-slate-500">
-                    当前 <span class="num text-slate-300">{{ form.repeat_zodiac_weight }}</span>
-                    （默认 0.8）。<span class="text-slate-300">仅生成徽章</span>：
-                    与上期特码同肖、但不等于上期特码的号命中时标「同肖」，不再影响排序或金额。
-                  </p>
-                </div>
-
-                <!-- 冷号：按期数，仅生成徽章 -->
                 <div class="space-y-2">
                   <label for="stale-periods" class="block text-sm font-medium text-slate-200">
-                    冷号口径（最近 N 期没出现过）
+                    冷号徽章口径（最近 N 期没出现过）
                   </label>
                   <input
                     id="stale-periods"
@@ -927,36 +819,8 @@ const readonlyInputClass
                   <p class="text-xs leading-relaxed text-slate-500">
                     按<span class="text-slate-300">期数</span>（不是自然日）：本池样本内最近
                     <span class="num text-slate-300">{{ form.stale_periods }}</span>
-                    期都没出现过的号命中时标「冷号」徽章（默认 60 期），不再影响排序或金额。
-                    样本不足该期数时无法证明「一直没出现」，此时不打冷号标签，避免把短样本里的号误判成冷号。
-                  </p>
-                </div>
-
-                <div class="space-y-2">
-                  <p id="stale-weight-label" class="text-sm font-medium text-slate-200">
-                    冷号降权系数
-                  </p>
-                  <div
-                    role="radiogroup"
-                    aria-labelledby="stale-weight-label"
-                    class="flex flex-wrap gap-2"
-                  >
-                    <GlassButton
-                      v-for="option in softWeightOptions"
-                      :key="`sw-${option.value}`"
-                      role="radio"
-                      :aria-checked="form.stale_weight === option.value"
-                      :variant="form.stale_weight === option.value ? 'primary' : 'glass'"
-                      class="min-h-[44px] px-4 text-base"
-                      @click="form.stale_weight = option.value"
-                    >
-                      {{ option.label }}
-                    </GlassButton>
-                  </div>
-                  <p class="text-xs text-slate-500">
-                    当前 <span class="num text-slate-300">{{ form.stale_weight }}</span>
-                    （默认 0.3）。<span class="text-slate-300">仅生成徽章</span>：
-                    冷号命中时标「冷号」，不再影响排序或金额，号码始终会列出。
+                    期都没出现过的号命中时标「冷号」徽章（默认 60 期）。
+                    只改标签，不改选号或金额。样本不足该期数时不打冷号标签。
                   </p>
                 </div>
               </div>
@@ -1071,39 +935,25 @@ const readonlyInputClass
                 </p>
               </div>
 
-              <!-- 近期走势加权：已停用为选择权重；选项仅影响走势分布参考展示 -->
+              <!-- 走势分布取样窗：仅改展示参考，不改选号 -->
               <div class="space-y-2">
-                <p id="trend-bias-setting-label" class="text-sm font-medium text-slate-200">
-                  近期走势加权（已停用）
+                <p id="trend-window-setting-label" class="text-sm font-medium text-slate-200">
+                  走势分布取样窗（仅展示）
                 </p>
-                <p
-                  class="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-200"
-                >
-                  近期走势加权已停用：下面的热号 / 中频 / 冷号偏好与近窗档位
-                  <strong class="font-semibold">都不会改变推荐号码或金额</strong>，
-                  只用于「走势分布参考」对照阅读。选号只看波动配额 + 点阵概率 + 期号种子随机。
+                <p class="text-xs leading-relaxed text-slate-500">
+                  热号 / 冷号偏好加权已停用，本页不再提供。这里只决定「走势分布参考」用近多少期统计，
+                  <span class="text-slate-300">不会改变推荐号码或金额</span>。
                 </p>
                 <div
                   role="radiogroup"
-                  aria-labelledby="trend-bias-setting-label"
+                  aria-labelledby="trend-window-setting-label"
                   class="flex flex-wrap gap-2"
                 >
                   <GlassButton
-                    v-for="option in trendBiasOptions"
-                    :key="option.value"
-                    role="radio"
-                    :aria-checked="form.trend_bias === option.value"
-                    :variant="form.trend_bias === option.value ? 'primary' : 'glass'"
-                    class="min-h-[44px] px-4 text-base"
-                    @click="form.trend_bias = option.value"
-                  >
-                    {{ option.label }}
-                  </GlassButton>
-                </div>
-                <div class="flex flex-wrap gap-2">
-                  <GlassButton
                     v-for="option in trendWindowOptions"
                     :key="option.value"
+                    role="radio"
+                    :aria-checked="form.trend_window === option.value"
                     :variant="form.trend_window === option.value ? 'primary' : 'glass'"
                     class="min-h-[40px] px-3 text-sm"
                     @click="form.trend_window = option.value"
@@ -1111,63 +961,56 @@ const readonlyInputClass
                     {{ option.label }}
                   </GlassButton>
                 </div>
-                <p class="text-xs leading-relaxed text-slate-400">
-                  走势偏好键仍可保存（兼容旧配置），但引擎侧恒按「不加权」选号。
-                  避冷加权是另一套独立开关，仍可把冷号排后并压低金额。
-                </p>
-                <p class="text-xs leading-relaxed text-slate-500">
-                  默认「不加权」。这是本池近窗经验频率的展示，不是真实概率，也不承诺提高命中率。
-                </p>
+              </div>
 
-                <!-- 避冷加权：本组内的**独立开关**（不是第 5 个走势加权选项，互不排斥） -->
-                <div class="mt-1 space-y-2 rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-3">
-                  <div class="flex flex-wrap items-center justify-between gap-3">
-                    <div class="space-y-1">
-                      <p id="avoid-cold-label" class="text-sm font-medium text-slate-200">
-                        {{ AVOID_COLD_LABEL }}
-                      </p>
-                      <p class="text-xs leading-relaxed text-slate-500">
-                        冷号排后 + 金额封顶：距上次出现超过「避冷阈值」的号码（含本池样本内从未出现的号码）
-                        排到候选队列末尾；间隔越久权重越低、配置金额越低，最多只给「保本金额」
-                        （1 个金额最小单位 = {{ form.amount_unit }} 元）；不足 1 个最小单位的注金额记 0
-                        （号码仍列出），省下的预算不补给其它注。
-                      </p>
-                    </div>
-                    <GlassButton
-                      role="switch"
-                      :aria-checked="form.avoid_cold_enabled"
-                      aria-labelledby="avoid-cold-label"
-                      :variant="form.avoid_cold_enabled ? 'primary' : 'glass'"
-                      class="min-h-[44px] shrink-0 px-4 text-base"
-                      @click="form.avoid_cold_enabled = !form.avoid_cold_enabled"
-                    >
-                      {{ form.avoid_cold_enabled ? '已开启' : '已关闭' }}
-                    </GlassButton>
-                  </div>
-                  <div class="flex flex-wrap items-start gap-3">
-                    <div class="space-y-1.5">
-                      <label for="avoid-cold-days" class="block text-xs text-slate-400">
-                        避冷阈值（天）
-                      </label>
-                      <input
-                        id="avoid-cold-days"
-                        v-model.number="form.avoid_cold_days"
-                        type="number"
-                        :min="AVOID_COLD_DAYS_MIN"
-                        :max="AVOID_COLD_DAYS_MAX"
-                        inputmode="numeric"
-                        :disabled="!form.avoid_cold_enabled"
-                        :class="form.avoid_cold_enabled ? inputClass : readonlyInputClass"
-                      >
-                    </div>
-                    <p class="max-w-md text-xs leading-relaxed text-slate-500">
-                      距上次出现 ≤ {{ form.avoid_cold_days }} 天不惩罚（正好等于阈值也不惩罚），
-                      超过则权重 = 阈值 ÷ 天数（{{ form.avoid_cold_days }} 天=1.0、
-                      {{ form.avoid_cold_days * 2 }} 天≈0.5、{{ form.avoid_cold_days * 4 }} 天≈0.25）；
-                      本池样本内从未出现的号按最冷处理（金额记 0）。
-                      这是样本内偏好，不是概率，也不承诺提高命中率或收益。
+              <!-- 避冷加权：仍生效的真旋钮（与已停用的走势偏好无关） -->
+              <div class="space-y-2 rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-4">
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                  <div class="space-y-1">
+                    <p id="avoid-cold-label" class="text-sm font-medium text-slate-200">
+                      {{ AVOID_COLD_LABEL }}
+                    </p>
+                    <p class="text-xs leading-relaxed text-slate-500">
+                      冷号排后 + 金额封顶：距上次出现超过「避冷阈值」的号码（含本池样本内从未出现的号码）
+                      排到候选队列末尾；间隔越久权重越低、配置金额越低，最多只给「保本金额」
+                      （1 个金额最小单位 = {{ form.amount_unit }} 元）；不足 1 个最小单位的注金额记 0
+                      （号码仍列出），省下的预算不补给其它注。
                     </p>
                   </div>
+                  <GlassButton
+                    role="switch"
+                    :aria-checked="form.avoid_cold_enabled"
+                    aria-labelledby="avoid-cold-label"
+                    :variant="form.avoid_cold_enabled ? 'primary' : 'glass'"
+                    class="min-h-[44px] shrink-0 px-4 text-base"
+                    @click="form.avoid_cold_enabled = !form.avoid_cold_enabled"
+                  >
+                    {{ form.avoid_cold_enabled ? '已开启' : '已关闭' }}
+                  </GlassButton>
+                </div>
+                <div class="flex flex-wrap items-start gap-3">
+                  <div class="space-y-1.5">
+                    <label for="avoid-cold-days" class="block text-xs text-slate-400">
+                      避冷阈值（天）
+                    </label>
+                    <input
+                      id="avoid-cold-days"
+                      v-model.number="form.avoid_cold_days"
+                      type="number"
+                      :min="AVOID_COLD_DAYS_MIN"
+                      :max="AVOID_COLD_DAYS_MAX"
+                      inputmode="numeric"
+                      :disabled="!form.avoid_cold_enabled"
+                      :class="form.avoid_cold_enabled ? inputClass : readonlyInputClass"
+                    >
+                  </div>
+                  <p class="max-w-md text-xs leading-relaxed text-slate-500">
+                    距上次出现 ≤ {{ form.avoid_cold_days }} 天不惩罚（正好等于阈值也不惩罚），
+                    超过则权重 = 阈值 ÷ 天数（{{ form.avoid_cold_days }} 天=1.0、
+                    {{ form.avoid_cold_days * 2 }} 天≈0.5、{{ form.avoid_cold_days * 4 }} 天≈0.25）；
+                    本池样本内从未出现的号按最冷处理（金额记 0）。
+                    这是样本内偏好，不是概率，也不承诺提高命中率或收益。
+                  </p>
                 </div>
               </div>
 

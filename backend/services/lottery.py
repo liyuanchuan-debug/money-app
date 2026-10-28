@@ -1125,6 +1125,142 @@ def predict_wave_band(
     }
 
 
+def replay_predict_wave_band(
+    history_numbers: Sequence[int],
+    *,
+    target_index: int,
+    window: int = DEFAULT_LATTICE_WINDOW,
+    small_max: int = 10,
+    normal_max: int = 30,
+) -> dict[str, Any] | None:
+    """回放「预测第 ``target_index`` 期」当时的预测波动带（严格无未来函数）。
+
+    ``history_numbers`` 最新在前：下标 0 = 最新一期。
+    预测下标 ``i`` 时只用 ``history[i+1:]``；锚点 = ``history[i+1]``（当时的最新号）；
+    实际开奖 = ``history[i]``。改动 ``history[:i+1]`` 以外的过去数据才会改带；
+    改动目标期及更新的数据不得改带（由单测锁死）。
+
+    样本不足以估带时返回 ``None``（不得编造）。
+    """
+    series = [int(n) for n in history_numbers]
+    index = int(target_index)
+    if index < 0 or index >= len(series):
+        return None
+    available = series[index + 1 :]
+    if len(available) < 2:
+        return None
+    band = predict_wave_band(
+        available,
+        window=window,
+        small_max=small_max,
+        normal_max=normal_max,
+    )
+    if band is None:
+        return None
+    anchor = int(available[0])
+    actual = int(series[index])
+    low = float(band["low"])
+    high = float(band["high"])
+    diff = abs(actual - anchor)
+    hit = low <= float(diff) <= high
+    band_from = max(NUMBER_MIN, min(NUMBER_MAX, int(round(anchor - high))))
+    band_to = max(NUMBER_MIN, min(NUMBER_MAX, int(round(anchor - low))))
+    if band_from > band_to:
+        band_from, band_to = band_to, band_from
+    return {
+        "target_index": index,
+        "anchor": anchor,
+        "actual": actual,
+        "diff": diff,
+        "hit": hit,
+        "band_from": band_from,
+        "band_to": band_to,
+        "band": band,
+        "rule": (
+            "回放预测带只使用目标期之前的开奖；"
+            "命中 = 实际特码与锚点之差落在当时的 P25~P75 带宽内。"
+            "这是样本内对照，不是概率，也不承诺提高命中率。"
+        ),
+    }
+
+
+def lattice_band_hit_stats(
+    history_numbers: Sequence[int],
+    *,
+    periods: Sequence[int] | None = None,
+    window: int = DEFAULT_LATTICE_WINDOW,
+    small_max: int = 10,
+    normal_max: int = 30,
+    recent_limit: int = 20,
+) -> dict[str, Any]:
+    """对本池样本做 walk-forward：统计「实开差值落在当时预测带」的命中率。
+
+    ``history_numbers`` 最新在前。每一期只用该期之前的开奖估带（同
+    ``replay_predict_wave_band``），无未来函数。样本不足以评估任一期时
+    ``data_status=INSUFFICIENT``，``hit_rate=None``（不得编造）。
+
+    这是本池样本内经验对照，不是真实概率，也不承诺提高命中率。
+    """
+    series = [int(n) for n in history_numbers]
+    period_list: list[int | None]
+    if periods is None:
+        period_list = [None] * len(series)
+    else:
+        period_list = [int(p) for p in periods]
+        if len(period_list) != len(series):
+            raise ValueError("periods 长度必须与 history_numbers 一致")
+
+    recent_cap = max(0, int(recent_limit))
+    rows: list[dict[str, Any]] = []
+    # 最新在前：从最近已开奖期往更早翻，需目标期 + 锚点 + 至少再 1 期
+    for target_index in range(0, max(0, len(series) - 2)):
+        replay = replay_predict_wave_band(
+            series,
+            target_index=target_index,
+            window=window,
+            small_max=small_max,
+            normal_max=normal_max,
+        )
+        if replay is None:
+            continue
+        band = replay["band"]
+        rows.append(
+            {
+                "target_index": target_index,
+                "period": period_list[target_index],
+                "anchor": replay["anchor"],
+                "actual": replay["actual"],
+                "diff": replay["diff"],
+                "hit": bool(replay["hit"]),
+                "low": float(band["low"]),
+                "high": float(band["high"]),
+            }
+        )
+
+    evaluated = len(rows)
+    hits = sum(1 for row in rows if row["hit"])
+    misses = evaluated - hits
+    hit_rate = (hits / evaluated) if evaluated else None
+    latest = rows[0] if rows else None
+    data_status = "OK" if evaluated > 0 else "INSUFFICIENT"
+    return {
+        "scope": "本池已导入样本",
+        "data_status": data_status,
+        "sample_size": len(series),
+        "evaluated": evaluated,
+        "hits": hits,
+        "misses": misses,
+        "hit_rate": hit_rate,
+        "lattice_window": int(window or 0),
+        "rule": (
+            "命中 = 实际特码与锚点之差落在当时 P25~P75 预测带内；"
+            "严格只用目标期之前的开奖估带。这是本池样本内对照，不是概率。"
+        ),
+        "latest": latest,
+        "recent": rows[:recent_cap],
+    }
+
+
 def lattice_weight(diff: int, band: dict[str, Any] | None) -> float:
     """号码点阵权重：差值落在预测波动带内 = 1.0，带外按距离衰减。
 
@@ -3400,6 +3536,7 @@ def recommend(
             },
         },
         # 预测波动线 + 号码点阵（点阵覆盖 1..49，供前端画点阵）
+        # hit_stats：对本池样本 walk-forward 的带内命中率（与 /api/lattice/hit-rate 同口径）
         "lattice": {
             "enabled": lattice_enabled,
             "window": int(cfg["lattice_window"]),
@@ -3412,6 +3549,12 @@ def recommend(
             "numbers": lattice_rows,
             # 说明点阵的新语义：只定义抽样概率分布，不参与排序
             "role": "sampling_distribution",
+            "hit_stats": lattice_band_hit_stats(
+                history,
+                window=int(cfg["lattice_window"]),
+                small_max=int(cfg["small_max"]),
+                normal_max=int(cfg["normal_max"]),
+            ),
         },
         # 三中三：从本期预测带内选 3 组 × 每组 3 号（纯展示；英文 status）
         "triple_sets": triple_sets,

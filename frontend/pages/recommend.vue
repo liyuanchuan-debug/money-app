@@ -5,22 +5,25 @@ import {
   MIN_BET_AMOUNT,
   SOFT_REASON_LABELS,
   TOTAL_AMOUNT_MAX,
-  TREND_BIAS_OPTIONS,
   TREND_WINDOW_DEFAULT,
   TREND_WINDOW_OPTIONS,
   avoidColdDaysText,
   avoidColdWeightText,
   periodsSinceLastText,
-  softWeightText,
   type ChipMode,
   type Pick,
   type RecommendResult,
-  type TrendBias,
   type TrendNumberStat,
   type TrendWaveRoles,
 } from '~/composables/useApi'
 import { normalizeDraws, periodText, scopeLabel, zodiacText } from '~/composables/useDraws'
 import { STATS_SAMPLE_LIMIT_OPTIONS } from '~/composables/useStats'
+import {
+  formatBandHitRate,
+  latticeBandHitStats,
+  maxReplayOffset,
+  replayWaveBandAt,
+} from '~/utils/predictWaveBand'
 
 definePageMeta({ role: 'VIP' })
 
@@ -28,9 +31,10 @@ definePageMeta({ role: 'VIP' })
  * 波浪买入法（财富密码）—— 只读消费 POST /api/recommend 的结果，展示层归一化。
  *
  * 写入语义（重要）：
- *   - 默认筹码模式 / 默认注数 / 走势加权**只在设置页持久化**；
- *   - 本页的筹码模式、注数、走势加权切换是**临时预览**：只影响本页这一次查看，绝不写回设置
+ *   - 默认筹码模式 / 默认注数**只在设置页持久化**；
+ *   - 本页的筹码模式、注数切换是**临时预览**：只影响本页这一次查看，绝不写回设置
  *     （本页从不调用 PUT /api/settings）。
+ *   - 走势偏好加权已停用：本页不再提供热号/冷号旋钮；走势取样窗只改「走势分布参考」展示。
  *
  * 口径：本页所有数字都只描述「本池已导入」的开奖记录，样本不足就说「数据不足」。
  * 走势分布 = 近窗经验频率，不是真实概率，也不承诺提高命中率。
@@ -51,11 +55,7 @@ const betCount = ref(8)
 /** 档位尖刀：15 或 20，只影响第一注主攻 */
 const stakeTop = ref<15 | 20>(15)
 const stakeTopOptions = [15, 20] as const
-/**
- * 临时预览：走势加权（默认跟设置走；本页切换不写库）。
- * 设置页读取口径：没手动设置过就是「不加权」（neutral），所以这里默认也是 neutral。
- */
-const trendBias = ref<TrendBias>('neutral')
+/** 走势分布参考取样窗（仅展示；不改选号；本页切换不写库） */
 const trendWindow = ref(TREND_WINDOW_DEFAULT)
 const activeWaveTab = ref<'small' | 'normal' | 'big'>('small')
 /** 下方「走势分布参考」大区块默认折叠，避免与卡片内同角色参考号重复刷屏 */
@@ -100,9 +100,6 @@ const [{ data: settings }, { data: rawDraws }] = await Promise.all([
 ])
 if (settings.value?.stake_top === 20) {
   stakeTop.value = 20
-}
-if (settings.value?.trend_bias) {
-  trendBias.value = settings.value.trend_bias as TrendBias
 }
 if (typeof settings.value?.trend_window === 'number') {
   trendWindow.value = settings.value.trend_window
@@ -263,7 +260,8 @@ const {
     mode: mode.value,
     bet_count: betCount.value,
     amount_seed: amountSeed.value,
-    trend_bias: trendBias.value,
+    // 走势偏好已停用：固定 neutral；trend_window 只影响走势分布参考展示
+    trend_bias: 'neutral',
     trend_window: trendWindow.value,
     stake_top: mode.value === 'ladder' ? stakeTop.value : undefined,
   }),
@@ -590,7 +588,7 @@ function trendCountLabel(item: TrendNumberStat): string {
 }
 
 /* ---------------------------------------------------------------------- */
-/* 三类软降权徽章：重号 / 同肖 / 冷号（不排除号码，只降权 + 打标）           */
+/* 号码标签徽章：重号 / 同肖 / 冷号（只打标，不降权）                        */
 /* ---------------------------------------------------------------------- */
 
 /** 徽章色调：英文码 → StatChip tone（重号=暖红、同肖=琥珀、冷号=冷色） */
@@ -601,16 +599,15 @@ const SOFT_REASON_TONES: Record<string, 'bloom' | 'amber' | 'aqua'> = {
 }
 
 /**
- * 本注命中的软降权标记。
- * 口径由后端判定（repeat_number / repeat_zodiac / stale），这里只做展示过滤，
- * 前端不重复判定，避免与后端口径打架。
+ * 本注命中的号码标签。
+ * 口径由后端判定（repeat_number / repeat_zodiac / stale），这里只做展示过滤。
  */
 function pickSoftReasons(pick: Pick): string[] {
   const reasons = pick.soft_reasons ?? []
   return reasons.filter(reason => reason in SOFT_REASON_LABELS)
 }
 
-/** 三类软降权本次生效摘要（旧后端缺字段 → null，照实不展示） */
+/** 号码标签摘要（旧后端缺字段 → null，照实不展示） */
 const softSummary = computed(() => result.value?.soft_weights ?? null)
 
 const lattice = computed(() => result.value?.lattice ?? null)
@@ -650,6 +647,98 @@ const tripleCopyFeedback = computed(
 const WAVE_TREND_WINDOW_DEFAULT = 60
 const WAVE_TREND_WINDOW_OPTIONS = [30, 60, 100, 0]
 const waveTrendWindow = ref(WAVE_TREND_WINDOW_DEFAULT)
+/**
+ * 预测带往前步数：0 = 本期（最新日后的前瞻）；
+ * 1 = 最近已开奖那一期当时的预测；越大越早，可一直往前翻。
+ */
+const latticeHistoryOffset = ref(0)
+
+const latticeReplayWindow = computed(() => {
+  const newestFirst = normalizeDraws(rawDraws.value)
+  const CHART_HISTORY_CAP = 500
+  const sample = newestFirst.length > CHART_HISTORY_CAP
+    ? newestFirst.slice(0, CHART_HISTORY_CAP)
+    : newestFirst
+  const window = typeof settings.value?.lattice_window === 'number'
+    ? settings.value.lattice_window
+    : 30
+  return { sample, window, maxOffset: maxReplayOffset(sample.length) }
+})
+
+const historyReplay = computed(() => {
+  const offset = latticeHistoryOffset.value
+  if (offset <= 0) return null
+  const { sample, window, maxOffset } = latticeReplayWindow.value
+  if (offset > maxOffset) return null
+  return replayWaveBandAt(
+    sample.map(item => item.special_number),
+    sample.map(item => Number(item.period) || 0),
+    offset - 1,
+    window,
+  )
+})
+
+/** 本池预测带命中率：优先用已加载开奖即时重算（录入后 refresh draws-sample 即更新） */
+const latticeHitStats = computed(() => {
+  const fromApi = result.value?.lattice?.hit_stats
+  const { sample, window } = latticeReplayWindow.value
+  const local = latticeBandHitStats(
+    sample.map(item => item.special_number),
+    sample.map(item => item.period),
+    window,
+    12,
+  )
+  // 样本与后端一致时优先本地，保证录入刷新后不依赖再跑一次 recommend
+  if (local.dataStatus === 'OK') return local
+  if (fromApi && fromApi.data_status === 'OK') {
+    return {
+      dataStatus: 'OK' as const,
+      sampleSize: fromApi.sample_size,
+      evaluated: fromApi.evaluated,
+      hits: fromApi.hits,
+      misses: fromApi.misses,
+      hitRate: fromApi.hit_rate,
+      latticeWindow: fromApi.lattice_window,
+      latest: fromApi.latest
+        ? {
+            targetIndex: fromApi.latest.target_index,
+            period: fromApi.latest.period,
+            anchor: fromApi.latest.anchor,
+            actual: fromApi.latest.actual,
+            diff: fromApi.latest.diff,
+            hit: fromApi.latest.hit,
+            low: fromApi.latest.low,
+            high: fromApi.latest.high,
+          }
+        : null,
+      recent: [],
+    }
+  }
+  return local
+})
+
+function goLivePrediction() {
+  latticeHistoryOffset.value = 0
+}
+
+function stepHistoryEarlier() {
+  const { maxOffset } = latticeReplayWindow.value
+  if (maxOffset <= 0) return
+  latticeHistoryOffset.value = Math.min(maxOffset, latticeHistoryOffset.value + 1)
+}
+
+function stepHistoryLater() {
+  latticeHistoryOffset.value = Math.max(0, latticeHistoryOffset.value - 1)
+}
+
+watch(
+  () => latticeReplayWindow.value.maxOffset,
+  (maxOffset) => {
+    if (latticeHistoryOffset.value > maxOffset) {
+      latticeHistoryOffset.value = maxOffset
+    }
+  },
+)
 
 const waveTrendChart = computed(() => {
   type ColumnCandidate = {
@@ -663,97 +752,189 @@ const waveTrendChart = computed(() => {
     index: number
     value: number
     label: string
-    tone: 'slate'
+    tone: 'slate' | 'emerald' | 'bloom'
+  }
+  type ChartBand = {
+    from: number
+    to: number
+    label: string
+    tone?: 'aqua' | 'amber' | 'emerald' | 'bloom'
   }
   const empty = {
     series: [] as Array<{ name: string, values: Array<number | null>, tone?: 'aqua' }>,
     labels: [] as string[],
-    bands: [] as Array<{ from: number, to: number, label: string }>,
+    bands: [] as ChartBand[],
     candidateColumn: [] as ColumnCandidate[],
     candidateColumnFromIndex: null as number | null,
     annotations: [] as Annotation[],
     pointCount: 0,
+    historySummary: null as null | {
+      offset: number
+      maxOffset: number
+      anchorPeriod: number
+      targetPeriod: number
+      anchor: number
+      actual: number
+      diff: number
+      hit: boolean
+      low: number
+      high: number
+    },
   }
   const meta = lattice.value
   const band = latticeBand.value
-  if (!meta?.enabled || !band) return empty
-  const newestFirst = normalizeDraws(rawDraws.value)
-  // 点阵走势用本池全部历史（最多 500）：「100 期」只表示一屏密度，
-  // 若仍按 lattice_window 截断，数据量≈一屏 → 永远拖不动。
-  // 预测带本身仍来自 lattice API（lattice_window 口径），与这里画多少期无关。
-  const CHART_HISTORY_CAP = 500
-  const forChart = newestFirst.length > CHART_HISTORY_CAP
-    ? newestFirst.slice(0, CHART_HISTORY_CAP)
-    : newestFirst
+  const offset = latticeHistoryOffset.value
+  const replay = historyReplay.value
+  const useHistory = offset > 0
+  if (!meta?.enabled) return empty
+  if (!useHistory && !band) return empty
+  if (useHistory && !replay) return empty
+
+  const { sample, maxOffset } = latticeReplayWindow.value
+  // offset>0：切到更早开奖日，走势去掉更新的 offset 期，末端 = 当时锚点
+  let forChart = useHistory ? sample.slice(offset) : sample
   const ordered = forChart.slice().reverse()
   if (ordered.length < 2) return empty
+
   const specialValues: number[] = []
   const labels: string[] = []
   for (let i = 0; i < ordered.length; i += 1) {
     specialValues.push(ordered[i].special_number)
     labels.push(periodText(ordered[i]) || ordered[i].draw_date || `第${i + 1}点`)
   }
-  const low = Number(band.low)
-  const high = Number(band.high)
   const clampToLane = (value: number) => Math.min(49, Math.max(1, Math.round(value)))
-  const newestDraw = ordered[ordered.length - 1]
-  const newestValue = newestDraw.special_number
-  const newestValid = Number.isFinite(newestValue)
-  const bandValid = newestValid && Number.isFinite(low) && Number.isFinite(high)
-  const bandFrom = bandValid ? clampToLane(newestValue - high) : null
-  const bandTo = bandValid ? clampToLane(newestValue - low) : null
-  const selectedSet = new Set(latticeSelected.value)
-  const pickSet = latticePickSet.value
-  /** 本期预测号是否落在预测带内（沿用 picks.in_lattice_band；带外仍画 bloom 红点） */
-  const pickInBand = new Map<number, boolean>()
-  for (const pick of result.value?.picks ?? []) {
-    const n = Number(pick.number)
-    if (!Number.isFinite(n)) continue
-    pickInBand.set(Math.trunc(n), pick.in_lattice_band === true)
-  }
-  /** 01–49 全列：选中才连线；带内预测绿、带外预测红、自选紫、未选淡灰 */
-  const candidateColumn: ColumnCandidate[] = Array.from({ length: 49 }, (_, index) => {
-    const num = index + 1
-    const selected = selectedSet.has(num)
-    const isPick = pickSet.has(num)
-    let tone: ColumnCandidate['tone'] = 'slate'
-    if (selected && isPick) tone = pickInBand.get(num) ? 'emerald' : 'bloom'
-    else if (selected) tone = 'nebula'
-    const zodiac = heatZodiacLabelByNumber.value.get(num) ?? ''
-    return {
-      value: num,
-      label: pad(num),
-      zodiac: zodiac || undefined,
+  const pushDiffBands = (
+    list: ChartBand[],
+    anchor: number,
+    low: number,
+    high: number,
+    label: string,
+    tone: ChartBand['tone'],
+  ) => {
+    if (!Number.isFinite(anchor) || !Number.isFinite(low) || !Number.isFinite(high)) return
+    const lowerFrom = clampToLane(anchor - high)
+    const lowerTo = clampToLane(anchor - low)
+    list.push({
+      from: Math.min(lowerFrom, lowerTo),
+      to: Math.max(lowerFrom, lowerTo),
+      label,
       tone,
-      selected,
-    }
-  })
-  const hasSelected = candidateColumn.some(item => item.selected)
-  labels.push('')
+    })
+    const upperFrom = clampToLane(anchor + low)
+    const upperTo = clampToLane(anchor + high)
+    list.push({
+      from: Math.min(upperFrom, upperTo),
+      to: Math.max(upperFrom, upperTo),
+      label: '',
+      tone,
+    })
+  }
+
+  const endDraw = ordered[ordered.length - 1]
+  const endValue = endDraw.special_number
   const annotations: Annotation[] = []
-  if (newestDraw && typeof newestValue === 'number' && Number.isFinite(newestValue)) {
+  const bands: ChartBand[] = []
+  let candidateColumn: ColumnCandidate[] = []
+  let candidateColumnFromIndex: number | null = null
+
+  if (useHistory && replay) {
+    const low = replay.band.low
+    const high = replay.band.high
+    pushDiffBands(
+      bands,
+      replay.anchor,
+      low,
+      high,
+      `第${replay.anchorPeriod}期后的预测带`,
+      replay.hit ? 'emerald' : 'amber',
+    )
+    candidateColumn = Array.from({ length: 49 }, (_, index) => {
+      const num = index + 1
+      const diff = Math.abs(num - replay.anchor)
+      const inBand = diff >= low && diff <= high
+      const isActual = num === replay.actual
+      let tone: ColumnCandidate['tone'] = 'slate'
+      if (isActual) tone = replay.hit ? 'emerald' : 'bloom'
+      else if (inBand) tone = 'amber'
+      return {
+        value: num,
+        label: pad(num),
+        zodiac: heatZodiacLabelByNumber.value.get(num) || undefined,
+        tone,
+        selected: inBand || isActual,
+      }
+    })
+    candidateColumnFromIndex = specialValues.length - 1
     annotations.push({
       index: specialValues.length - 1,
-      value: newestValue,
-      label: `最新一期 ${periodText(newestDraw)} · 特码 ${pad(newestValue)}`,
+      value: replay.anchor,
+      label: `第 ${replay.anchorPeriod} 期 · 特码 ${pad(replay.anchor)}`,
+      tone: 'slate',
+    })
+  } else if (band) {
+    pushDiffBands(bands, endValue, Number(band.low), Number(band.high), '本期预测带', 'aqua')
+    const selectedSet = new Set(latticeSelected.value)
+    const pickSet = latticePickSet.value
+    const pickInBand = new Map<number, boolean>()
+    for (const pick of result.value?.picks ?? []) {
+      const n = Number(pick.number)
+      if (!Number.isFinite(n)) continue
+      pickInBand.set(Math.trunc(n), pick.in_lattice_band === true)
+    }
+    candidateColumn = Array.from({ length: 49 }, (_, index) => {
+      const num = index + 1
+      const selected = selectedSet.has(num)
+      const isPick = pickSet.has(num)
+      let tone: ColumnCandidate['tone'] = 'slate'
+      if (selected && isPick) tone = pickInBand.get(num) ? 'emerald' : 'bloom'
+      else if (selected) tone = 'nebula'
+      return {
+        value: num,
+        label: pad(num),
+        zodiac: heatZodiacLabelByNumber.value.get(num) || undefined,
+        tone,
+        selected,
+      }
+    })
+    if (candidateColumn.some(item => item.selected)) {
+      candidateColumnFromIndex = specialValues.length - 1
+    }
+    annotations.push({
+      index: specialValues.length - 1,
+      value: endValue,
+      label: `最新一期 ${periodText(endDraw)} · 特码 ${pad(endValue)}`,
       tone: 'slate',
     })
   }
+
+  labels.push('')
   return {
     series: [{ name: '特码走势', values: specialValues, tone: 'aqua' as const }],
     labels,
-    bands: bandFrom !== null && bandTo !== null
-      ? [{ from: bandFrom, to: bandTo, label: '预测带' }]
-      : [],
+    bands,
     candidateColumn,
-    candidateColumnFromIndex: hasSelected ? specialValues.length - 1 : null,
+    candidateColumnFromIndex,
     annotations,
     pointCount: specialValues.length,
+    historySummary: replay
+      ? {
+          offset,
+          maxOffset,
+          anchorPeriod: replay.anchorPeriod,
+          targetPeriod: replay.targetPeriod,
+          anchor: replay.anchor,
+          actual: replay.actual,
+          diff: replay.diff,
+          hit: replay.hit,
+          low: replay.band.low,
+          high: replay.band.high,
+        }
+      : null,
   }
 })
 
 /**
- * 切换筹码模式 / 注数 / 走势加权 = 只重算本页（临时预览）。
+ * 切换筹码模式 / 注数 / 走势取样窗 = 只重算本页（临时预览）。
  * ⚠️ 这里刻意**不调用** api.updateSettings：默认值只在设置页改。
  */
 function clearCopyFeedback() {
@@ -762,7 +943,7 @@ function clearCopyFeedback() {
   copyError.value = ''
 }
 
-watch([mode, betCount, trendBias, trendWindow, stakeTop], async () => {
+watch([mode, betCount, trendWindow, stakeTop], async () => {
   clearCopyFeedback()
   rerollCount.value = 0
   await refresh()
@@ -816,7 +997,6 @@ const roleTones: Record<string, 'aqua' | 'neutral' | 'nebula'> = {
 
 /** 取值表与设置页共用同一份（composables/useApi.ts） */
 const chipModes = CHIP_MODE_OPTIONS
-const trendBiasOptions = TREND_BIAS_OPTIONS
 const trendWindowOptions = TREND_WINDOW_OPTIONS
 
 async function writeClipboard(
@@ -998,7 +1178,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
           <!-- 主行动：显式重新生成（首屏自动生成一次的行为保留；按钮常驻，任何状态下都能点） -->
           <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <p class="text-xs leading-relaxed text-slate-500">
-              打开本页会自动生成一次；点右侧按钮即按当前筹码模式与走势加权重新生成。
+              打开本页会自动生成一次；点右侧按钮即按当前筹码模式重新生成。
               这里不会改动设置页保存的默认值。
             </p>
             <div class="relative inline-flex shrink-0 rounded-[14px]">
@@ -1190,27 +1370,20 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               避冷加权已关闭：距上次出现多久都不影响选号与金额（可在设置页开启）。
             </p>
 
-            <!-- 三类软降权（重号 / 同肖 / 冷号）：不排除号码，只降排序与金额，如实说明 -->
+            <!-- 重号 / 同肖 / 冷号：仅徽章；软降权系数已停用 -->
             <p v-if="softSummary" class="text-xs leading-relaxed text-slate-500">
-              软降权已生效（<strong class="font-semibold text-slate-400">不排除任何号码</strong>，只降排序与金额）：
-              重号 ×{{ softSummary.repeat_number_weight }}、同肖 ×{{ softSummary.repeat_zodiac_weight }}、
-              冷号（{{ softSummary.stale_periods }} 期未出现）×{{ softSummary.stale_weight }}；
-              降权后每注最低仍为 {{ softSummary.min_bet_amount }} 元。
+              号码标签（不改排序或金额）：冷号口径为近
+              {{ softSummary.stale_periods }} 期未出现。
               <template
                 v-if="softSummary.repeat_number_picks.length
                   || softSummary.repeat_zodiac_picks.length
                   || softSummary.stale_picks.length"
               >
-                本次命中：重号 {{ softSummary.repeat_number_picks.length }} 注、
+                本次：重号 {{ softSummary.repeat_number_picks.length }} 注、
                 同肖 {{ softSummary.repeat_zodiac_picks.length }} 注、
                 冷号 {{ softSummary.stale_picks.length }} 注。
               </template>
-              <template v-if="softSummary.penalized_picks > 0">
-                本次 {{ softSummary.penalized_picks }} 注被降权压低金额，合计少投
-                {{ softSummary.reduced_total }} 元（不补给其它注）。
-              </template>
-              <template v-else>本次命中的注金额未受影响。</template>
-              这是样本内偏好，不是概率，也不承诺提高命中率或收益。
+              <template v-else>本次无重号 / 同肖 / 冷号标签。</template>
             </p>
 
             <!-- 各注金额一览（随机分配下通常不等，如实列出） -->
@@ -1254,61 +1427,6 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 重新随机
               </GlassButton>
             </div>
-          </GlassPanel>
-        </MotionReveal>
-
-        <!-- 走势加权：已停用；切换仅改走势分布参考展示 -->
-        <MotionReveal :index="4">
-          <GlassPanel padding="lg" rounded="3xl" class="space-y-3">
-            <div class="flex flex-wrap items-center justify-between gap-2">
-              <h2 id="trend-bias-label" class="text-lg font-medium text-white">近期走势加权（已停用）</h2>
-              <StatChip tone="neutral" size="sm">仅展示 · 不改号码</StatChip>
-            </div>
-
-            <div
-              role="radiogroup"
-              aria-labelledby="trend-bias-label"
-              class="flex flex-wrap gap-2"
-            >
-              <GlassButton
-                v-for="option in trendBiasOptions"
-                :key="option.value"
-                role="radio"
-                :aria-checked="trendBias === option.value"
-                :variant="trendBias === option.value ? 'primary' : 'glass'"
-                class="min-h-[44px] px-4 text-base"
-                @click="trendBias = option.value"
-              >
-                {{ option.label }}
-              </GlassButton>
-            </div>
-
-            <div class="flex flex-wrap gap-2">
-              <GlassButton
-                v-for="option in trendWindowOptions"
-                :key="option.value"
-                :variant="trendWindow === option.value ? 'primary' : 'glass'"
-                class="min-h-[40px] px-3 text-sm"
-                @click="trendWindow = option.value"
-              >
-                {{ option.label }}
-              </GlassButton>
-            </div>
-
-            <div class="flex flex-wrap items-center gap-2">
-              <StatChip tone="aqua" size="sm">
-                {{ result.trend_bias_label || '走势加权已停用' }}
-              </StatChip>
-              <StatChip tone="neutral" size="sm">{{ trendWindowLabel }}</StatChip>
-            </div>
-
-            <p
-              class="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-200"
-            >
-              近期走势加权已停用：切换热号 / 中频 / 冷号或近窗档位
-              <strong class="font-semibold">不会改变推荐号码或金额</strong>，
-              只影响下方走势分布参考的展示。
-            </p>
           </GlassPanel>
         </MotionReveal>
 
@@ -1417,10 +1535,6 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   <div v-if="pick.is_stale" class="flex items-center justify-between gap-1">
                     <dt class="text-slate-500">冷号</dt>
                     <dd class="text-slate-200">{{ periodsSinceLastText(pick.periods_since_last) }}</dd>
-                  </div>
-                  <div v-if="pick.soft_penalized" class="flex items-center justify-between gap-1">
-                    <dt class="text-slate-500">降权</dt>
-                    <dd class="text-amber-200">{{ softWeightText(pick.soft_weight) }}</dd>
                   </div>
                   <div v-if="pick.avoid_cold_penalized" class="col-span-2 flex items-center justify-between gap-1">
                     <dt class="text-slate-500">避冷加权</dt>
@@ -1568,13 +1682,84 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
 
         <MotionReveal v-if="lattice?.enabled && latticeBand && waveTrendChart.pointCount" :index="6" class="min-w-0">
           <GlassPanel padding="lg" rounded="3xl" class="min-w-0 space-y-3 overflow-hidden">
-            <div class="space-y-1">
-              <h2 class="text-lg font-medium text-white">预测点阵</h2>
-              <p class="text-xs leading-relaxed text-slate-500">
-                连线随下方「01–49 出现热度」勾选同步：绿=带内预测，红=带外预测，紫=自选；未勾选不连线。
-                下方「N 期」是一屏显示多少期；历史多于一屏时可按住左右拖。
-              </p>
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div class="space-y-1">
+                <h2 class="text-lg font-medium text-white">预测点阵</h2>
+                <p class="text-xs leading-relaxed text-slate-500">
+                  「本期」= 最新开奖日之后的预测；「更早 / 更新」可一期一期往前或往后翻，按当天重画预测带与右侧号码连线，实开号会高亮。
+                  下方「N 期」是一屏显示多少期。命中率 = 实开差值落在当时预测带内的本池样本对照，不是概率。
+                </p>
+                <p
+                  v-if="latticeHitStats.dataStatus === 'OK'"
+                  class="text-sm text-slate-200"
+                >
+                  带内命中
+                  <span class="font-medium text-aqua-200">
+                    {{ latticeHitStats.hits }}/{{ latticeHitStats.evaluated }}
+                  </span>
+                  （{{ formatBandHitRate(latticeHitStats.hitRate) }}）
+                  <span
+                    v-if="latticeHitStats.latest"
+                    class="ml-1 text-xs"
+                    :class="latticeHitStats.latest.hit ? 'text-emerald-300/90' : 'text-rose-300/90'"
+                  >
+                    · 最近第 {{ latticeHitStats.latest.period ?? '—' }} 期
+                    {{ latticeHitStats.latest.hit ? '落在带内' : '落在带外' }}
+                  </span>
+                </p>
+                <p v-else class="text-xs text-amber-200/90">
+                  本池至少要 3 期开奖记录，才能统计预测带命中率。
+                </p>
+              </div>
+              <div class="flex flex-wrap items-center gap-1" role="group" aria-label="预测带日期">
+                <button
+                  type="button"
+                  class="inline-flex min-h-[32px] items-center justify-center rounded-lg border px-2.5 text-xs font-medium transition-colors"
+                  :class="latticeHistoryOffset === 0
+                    ? 'border-aqua-400/60 bg-aqua-400/15 text-aqua-100'
+                    : 'border-white/10 bg-white/5 text-slate-300 active:bg-white/15'"
+                  :aria-pressed="latticeHistoryOffset === 0"
+                  @click="goLivePrediction"
+                >
+                  本期
+                </button>
+                <button
+                  type="button"
+                  class="inline-flex min-h-[32px] items-center justify-center rounded-lg border border-white/10 bg-white/5 px-2.5 text-xs font-medium text-slate-300 transition-colors active:bg-white/15 disabled:cursor-not-allowed disabled:opacity-40"
+                  :disabled="latticeHistoryOffset <= 0"
+                  @click="stepHistoryLater"
+                >
+                  更新
+                </button>
+                <button
+                  type="button"
+                  class="inline-flex min-h-[32px] items-center justify-center rounded-lg border px-2.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+                  :class="latticeHistoryOffset > 0
+                    ? 'border-amber-400/60 bg-amber-400/15 text-amber-100'
+                    : 'border-white/10 bg-white/5 text-slate-300 active:bg-white/15'"
+                  :disabled="latticeHistoryOffset >= latticeReplayWindow.maxOffset"
+                  @click="stepHistoryEarlier"
+                >
+                  更早
+                </button>
+              </div>
             </div>
+            <p
+              v-if="waveTrendChart.historySummary"
+              class="text-xs leading-relaxed"
+              :class="waveTrendChart.historySummary.hit ? 'text-emerald-300/90' : 'text-rose-300/90'"
+            >
+              已往前 {{ waveTrendChart.historySummary.offset }} 期
+              （可再往前 {{ waveTrendChart.historySummary.maxOffset - waveTrendChart.historySummary.offset }} 期）：
+              锚点第 {{ waveTrendChart.historySummary.anchorPeriod }} 期特码 {{ waveTrendChart.historySummary.anchor }}，
+              下一期（第 {{ waveTrendChart.historySummary.targetPeriod }} 期）实开
+              {{ waveTrendChart.historySummary.actual }}（差 {{ waveTrendChart.historySummary.diff }}），
+              {{ waveTrendChart.historySummary.hit ? '落在带内' : '落在带外' }}。
+              右侧连线高亮 = 当时带宽 {{ waveTrendChart.historySummary.low }}–{{ waveTrendChart.historySummary.high }} 内的号码。
+            </p>
+            <p v-else-if="latticeReplayWindow.maxOffset <= 0" class="text-xs text-amber-200/90">
+              本池至少要 3 期开奖记录，才能往前翻看历史预测带。
+            </p>
             <LineChart
               :series="waveTrendChart.series"
               :labels="waveTrendChart.labels"
@@ -1683,6 +1868,28 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               id="trend-dist-panel"
               class="space-y-4 border-t border-white/5 pt-3"
             >
+              <div class="space-y-2">
+                <p class="text-[11px] leading-relaxed text-slate-500">
+                  取样窗只改本块统计展示，不改上方财富密码号码或金额。热号 / 冷号偏好加权已停用。
+                </p>
+                <div
+                  role="radiogroup"
+                  aria-label="走势分布取样窗"
+                  class="flex flex-wrap gap-2"
+                >
+                  <GlassButton
+                    v-for="option in trendWindowOptions"
+                    :key="option.value"
+                    role="radio"
+                    :aria-checked="trendWindow === option.value"
+                    :variant="trendWindow === option.value ? 'primary' : 'glass'"
+                    class="min-h-[40px] px-3 text-sm"
+                    @click="trendWindow = option.value"
+                  >
+                    {{ option.label }}
+                  </GlassButton>
+                </div>
+              </div>
               <p class="text-[11px] leading-relaxed text-slate-500">
                 {{ result.trend_distributions.rule }}
               </p>

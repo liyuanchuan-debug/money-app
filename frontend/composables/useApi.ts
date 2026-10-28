@@ -323,6 +323,8 @@ export interface RecommendResult {
       in_band: boolean
       is_latest: boolean
     }>
+    /** 本池 walk-forward：实开落在当时预测带的命中统计 */
+    hit_stats?: LatticeBandHitStatsPayload | null
   }
   /**
    * 三中三：从本期预测带内选 3 组、每组 3 个号（纯展示）。
@@ -919,6 +921,74 @@ export interface DrawItem {
   zodiac_label?: string | null
 }
 
+/** 预测带 walk-forward 命中统计（recommend.lattice.hit_stats / 录入回执 / hit-rate） */
+export interface LatticeBandHitLatest {
+  target_index: number
+  period: number | null
+  anchor: number
+  actual: number
+  diff: number
+  hit: boolean
+  low: number
+  high: number
+}
+
+export interface LatticeBandHitStatsPayload {
+  scope: string
+  data_status: 'OK' | 'INSUFFICIENT' | string
+  sample_size: number
+  evaluated: number
+  hits: number
+  misses: number
+  hit_rate: number | null
+  lattice_window: number
+  rule: string
+  latest?: LatticeBandHitLatest | null
+  recent?: LatticeBandHitLatest[]
+}
+
+export interface LatticeHitRate extends LatticeBandHitStatsPayload {
+  ok: boolean
+  code: string
+  message: string
+}
+
+/** GET /api/lattice/replay：回放某一期「当时」的预测波动带 */
+export interface LatticeReplay {
+  ok: boolean
+  code: string
+  message: string
+  target_period: number
+  target_date?: string | null
+  target_index: number
+  anchor_period?: number | null
+  anchor_date?: string | null
+  replay: {
+    target_index: number
+    anchor: number
+    actual: number
+    diff: number
+    hit: boolean
+    band_from: number
+    band_to: number
+    band: {
+      window: number
+      used_window: number
+      samples: number
+      center: number
+      center_number: number
+      low: number
+      high: number
+      wave_type: 'small' | 'normal' | 'big'
+      wave_label: string
+      small_max: number
+      normal_max: number
+      rule: string
+    }
+    rule: string
+  } | null
+}
+
 /**
  * GET /api/draws/next-period 的返回体：快捷录入表单的预填值。
  * 期号 / 日期的推导口径与 ``add_draw`` 的缺省值同源（期号 = max(period)+1、
@@ -952,6 +1022,11 @@ export interface DrawCorrectPayload {
   draw_date?: string | null
 }
 
+/** 快捷录入回执：开奖对象 + 预测带命中即时统计 */
+export interface DrawQuickResult extends DrawItem {
+  lattice_band?: LatticeBandHitStatsPayload | null
+}
+
 /** 纠正开奖回执：含新旧特码与重算条数 */
 export interface DrawCorrectResult {
   draw: DrawItem
@@ -964,6 +1039,7 @@ export interface DrawCorrectResult {
   new_draw_date: string
   resettled_rounds: number
   correction_id?: number | null
+  lattice_band?: LatticeBandHitStatsPayload | null
 }
 
 export interface DrawImportError {
@@ -977,6 +1053,7 @@ export interface DrawImportResult {
   skipped: number
   warnings: string[]
   errors: DrawImportError[]
+  lattice_band?: LatticeBandHitStatsPayload | null
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1176,6 +1253,23 @@ export function useApi() {
         body: options,
       }),
 
+    /**
+     * 回放某一期当时的预测波动带（严格无未来函数）。
+     * offset=1 = 最近已开奖那一期（「上一期 / 昨天」）；也可传 period 指定期号。
+     */
+    latticeReplay: (options: { period?: number, offset?: number } = {}) => {
+      const query: Record<string, number> = {}
+      if (options.period != null) query.period = options.period
+      else query.offset = options.offset ?? 1
+      return apiFetch<LatticeReplay>('/api/lattice/replay', { query })
+    },
+
+    /** 本池预测带 walk-forward 命中率（录入后自动随 draws 变化，无需落库） */
+    latticeHitRate: (recentLimit = 20) =>
+      apiFetch<LatticeHitRate>('/api/lattice/hit-rate', {
+        query: { recent_limit: recentLimit },
+      }),
+
     /* ---------------- 出票单（选号工具） ---------------- */
 
     /**
@@ -1239,7 +1333,7 @@ export function useApi() {
      * period / draw_date 留空即交给后端自动补全；同 period 重复提交 = upsert（修正录错）。
      */
     quickAddDraw: (payload: QuickDrawPayload) =>
-      apiFetch<DrawItem>('/api/draws/quick', {
+      apiFetch<DrawQuickResult>('/api/draws/quick', {
         method: 'POST',
         body: {
           ...(payload.period ? { period: payload.period } : {}),

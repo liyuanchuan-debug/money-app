@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from dependencies import actor_user_id, require_actor, require_admin
 from repository import DRAW_ACTION_CORRECT, get_store
+from services.lottery import lattice_band_hit_stats
 from services.mark_six import (
     APP_TIMEZONE_NAME,
     decorate_draw,
@@ -77,6 +78,40 @@ class DrawOut(BaseModel):
     zodiac_label: str | None = None
 
 
+class LatticeBandLatestOut(BaseModel):
+    """刚录入 / 纠正的那一期，相对「当时预测带」是否命中。"""
+
+    target_index: int
+    period: int | None = None
+    anchor: int
+    actual: int
+    diff: int
+    hit: bool
+    low: float
+    high: float
+
+
+class LatticeBandHitStatsOut(BaseModel):
+    """本池预测带 walk-forward 命中统计（与 GET /api/lattice/hit-rate 同口径）。"""
+
+    scope: str
+    data_status: str
+    sample_size: int
+    evaluated: int
+    hits: int
+    misses: int
+    hit_rate: float | None = None
+    lattice_window: int
+    rule: str
+    latest: LatticeBandLatestOut | None = None
+
+
+class DrawQuickOut(DrawOut):
+    """快捷录入回执：开奖对象 + 本期是否落在录入前预测带内 + 累计命中率。"""
+
+    lattice_band: LatticeBandHitStatsOut | None = None
+
+
 class DrawCorrectOut(BaseModel):
     """纠正开奖回执：含新旧特码与重算条数。"""
 
@@ -90,6 +125,7 @@ class DrawCorrectOut(BaseModel):
     new_draw_date: date
     resettled_rounds: int
     correction_id: int | None = None
+    lattice_band: LatticeBandHitStatsOut | None = None
 
 
 class NextPeriodOut(BaseModel):
@@ -113,13 +149,61 @@ class DrawImportResult(BaseModel):
     skipped: int
     warnings: list[str] = Field(default_factory=list)
     errors: list[DrawImportErrorOut] = Field(default_factory=list)
+    lattice_band: LatticeBandHitStatsOut | None = None
+
+
+async def _lattice_band_after_write(
+    store,
+    *,
+    user_id: int | None,
+    focus_period: int | None = None,
+) -> dict | None:
+    """录入 / 纠正 / 导入后即时重算预测带命中（不落库，按最新 draws）。"""
+    draws = await store.list_draws()
+    if len(draws) < 3:
+        return None
+    settings = await store.get_settings(user_id)
+    # recent 要覆盖 focus_period，纠正老期时不能只留最近 20 条
+    stats = lattice_band_hit_stats(
+        [int(draw["special_number"]) for draw in draws],
+        periods=[int(draw["period"]) for draw in draws],
+        window=int(settings.get("lattice_window") or 0),
+        small_max=int(settings["small_max"]),
+        normal_max=int(settings["normal_max"]),
+        recent_limit=len(draws),
+    )
+    latest = stats.get("latest")
+    if focus_period is not None:
+        focused = next(
+            (
+                row
+                for row in stats.get("recent") or []
+                if row.get("period") == int(focus_period)
+            ),
+            None,
+        )
+        if focused is not None:
+            latest = focused
+    # 响应体不附带整段 recent，避免快捷录入回执过重
+    return {
+        "scope": stats["scope"],
+        "data_status": stats["data_status"],
+        "sample_size": stats["sample_size"],
+        "evaluated": stats["evaluated"],
+        "hits": stats["hits"],
+        "misses": stats["misses"],
+        "hit_rate": stats["hit_rate"],
+        "lattice_window": stats["lattice_window"],
+        "rule": stats["rule"],
+        "latest": latest,
+    }
 
 
 # --------------------------------------------------------------------------- #
 # 开奖总表
 # --------------------------------------------------------------------------- #
 @router.post("/draws/import", response_model=DrawImportResult)
-async def import_draws(payload: DrawImportIn, _admin=Depends(require_admin)):
+async def import_draws(payload: DrawImportIn, admin=Depends(require_admin)):
     """批量导入开奖总表：逐行解析，单行失败只记入 errors，不中断整批。"""
     store = await get_store()
 
@@ -129,6 +213,9 @@ async def import_draws(payload: DrawImportIn, _admin=Depends(require_admin)):
     summary = await store.import_draws(
         draw_payloads, replace_existing=payload.replace_existing
     )
+    lattice_band = await _lattice_band_after_write(
+        store, user_id=actor_user_id(admin)
+    )
     return {
         "imported": summary["imported"] + summary["updated"],
         "skipped": summary["skipped"],
@@ -137,6 +224,7 @@ async def import_draws(payload: DrawImportIn, _admin=Depends(require_admin)):
             {"line": item.line, "text": item.text, "message": item.message}
             for item in parse_errors
         ],
+        "lattice_band": lattice_band,
     }
 
 
@@ -178,14 +266,14 @@ async def get_next_period(_actor=Depends(require_actor)):
     }
 
 
-@router.post("/draws/quick", response_model=DrawOut)
-async def quick_add_draw(payload: DrawQuickIn, _admin=Depends(require_admin)):
+@router.post("/draws/quick", response_model=DrawQuickOut)
+async def quick_add_draw(payload: DrawQuickIn, admin=Depends(require_admin)):
     """快捷录入一期特码，直接写进唯一事实来源 ``draws``。
 
     - 期号 / 日期留空则自动补（期号 = max(period)+1；日期 = 今天起第一个空闲日）；
     - 同一日期且未换期号（或显式同一期号）已存在 → 覆盖修正，不产生重复行；
     - 同一天再报**另一个**期号 → 自动顺延到下一个空闲日期并新增（绝不改名顶掉旧期）；
-    - 返回补好生肖的一期，前端可直接展示「最新特码 / 生肖」。
+    - 返回补好生肖的一期，并附带「该期是否落在录入前预测带内」与累计命中率。
 
     返回 200（而非 201）：本接口是 upsert，可能只是更新既有的一期。
     显式纠正已有期请优先用 ``POST /api/draws/{id}/correct``（带新旧号回执与审计）。
@@ -199,7 +287,13 @@ async def quick_add_draw(payload: DrawQuickIn, _admin=Depends(require_admin)):
         )
     except ValueError as exc:  # 特码越界 / 期号或日期冲突
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return decorate_draw(draw)
+    decorated = decorate_draw(draw)
+    lattice_band = await _lattice_band_after_write(
+        store,
+        user_id=actor_user_id(admin),
+        focus_period=int(decorated["period"]),
+    )
+    return {**decorated, "lattice_band": lattice_band}
 
 
 @router.post("/draws/{draw_id}/correct", response_model=DrawCorrectOut)
@@ -239,8 +333,14 @@ async def correct_draw(
         result.get("resettled_rounds"),
         result.get("correction_id"),
     )
+    lattice_band = await _lattice_band_after_write(
+        store,
+        user_id=actor_user_id(admin),
+        focus_period=int(result["period"]),
+    )
     return {
         **result,
+        "lattice_band": lattice_band,
         "draw": decorate_draw(result["draw"]),
     }
 

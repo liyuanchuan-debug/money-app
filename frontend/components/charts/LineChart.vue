@@ -45,7 +45,14 @@ interface ReferenceBand {
   from: number
   to: number
   label?: string
+  /** 显式色调；缺省按序号自动分配 */
   tone?: ChartTone
+  /**
+   * 可选：只画在 [fromIndex, toIndex] 的 x 区间（含两端）。
+   * 缺省 = 整幅绘图区（与改造前一致）。
+   */
+  fromIndex?: number | null
+  toIndex?: number | null
 }
 
 /**
@@ -707,6 +714,22 @@ const bounds = computed(() => {
  * plotLeft + plotWidth = plotRight（= columnX）上。
  * 只有 1 个点时居中；其余与非候选列场景下的公式逐字节一致。
  */
+function bandX(band: ReferenceBand) {
+  const hasFrom = typeof band.fromIndex === 'number' && Number.isFinite(band.fromIndex)
+  const hasTo = typeof band.toIndex === 'number' && Number.isFinite(band.toIndex)
+  if (!hasFrom && !hasTo) {
+    return { x: plotLeft.value, width: plotWidth.value }
+  }
+  const leftIndex = hasFrom ? Number(band.fromIndex) : Number(band.toIndex)
+  const rightIndex = hasTo ? Number(band.toIndex) : Number(band.fromIndex)
+  const x0 = xAt(Math.min(leftIndex, rightIndex))
+  const x1 = xAt(Math.max(leftIndex, rightIndex))
+  const pad = Math.max(6, pointStep.value * 0.35)
+  const x = Math.max(plotLeft.value, x0 - pad)
+  const right = Math.min(plotRight.value, x1 + pad)
+  return { x, width: Math.max(1, right - x) }
+}
+
 function xAt(index: number) {
   const count = renderCount.value
   if (count <= 1) return plotLeft.value + plotWidth.value / 2
@@ -2014,23 +2037,26 @@ const hoverInfo = computed(() => {
               </linearGradient>
             </defs>
 
-            <!-- 参考带 -->
+            <!-- 参考带：整幅或按 fromIndex/toIndex 裁切；色调优先用 band.tone；描边保证看得见 -->
             <g v-for="(band, bandIndex) in props.bands" :key="`band-${bandIndex}`">
               <rect
-                :x="plotLeft"
+                :x="bandX(band).x"
                 :y="Math.min(yAt(band.from), yAt(band.to))"
-                :width="plotWidth"
-                :height="Math.abs(yAt(band.to) - yAt(band.from))"
-                :fill="chartToneAt(bandIndex + 1).fillFrom"
-                opacity="0.35"
+                :width="bandX(band).width"
+                :height="Math.max(3, Math.abs(yAt(band.to) - yAt(band.from)))"
+                :fill="(band.tone ? chartTone(band.tone) : chartToneAt(bandIndex + 1)).fillFrom"
+                :stroke="(band.tone ? chartTone(band.tone) : chartToneAt(bandIndex + 1)).stroke"
+                stroke-width="1.25"
+                opacity="0.62"
               />
               <text
                 v-if="band.label"
-                :x="plotRight - 4"
-                :y="Math.min(yAt(band.from), yAt(band.to)) + 11"
+                :x="bandX(band).x + bandX(band).width - 4"
+                :y="Math.min(yAt(band.from), yAt(band.to)) + 12"
                 text-anchor="end"
-                font-size="9"
-                fill="rgba(226, 232, 240, 0.55)"
+                font-size="11"
+                font-weight="600"
+                fill="rgba(254, 243, 199, 0.95)"
               >
                 {{ band.label }}
               </text>

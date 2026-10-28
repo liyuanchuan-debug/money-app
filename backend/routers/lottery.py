@@ -45,12 +45,128 @@ from services.lottery import (
     WAVE_LABELS,
     SettingsValidationError,
     classify_wave,
+    lattice_band_hit_stats,
     recommend,
+    replay_predict_wave_band,
     with_derived_settings,
 )
 from services.pnl import apply_settlement, build_pending_round
 
 router = APIRouter(prefix="/api", tags=["lottery"])
+
+
+@router.get("/lattice/replay")
+async def get_lattice_replay(
+    period: int | None = Query(
+        default=None, ge=1, description="要回放的已开奖期号；与 offset 二选一"
+    ),
+    offset: int = Query(
+        default=1,
+        ge=1,
+        le=500,
+        description="最新在前的下标偏移：1=上一期（最近已开奖那一期）",
+    ),
+    actor=Depends(current_user_optional),
+):
+    """回放某一期「当时」的预测波动带（严格无未来函数）。
+
+    默认 ``offset=1``：回放最近已开奖那一期 —— 也就是「昨天 / 上一期」当时看到的预测带，
+    并用该期实开特码标出是否落在带内。匿名可读。
+    """
+    store = await get_store()
+    draws = await store.list_draws()  # 最新在前
+    if len(draws) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="本池至少要 3 期开奖记录才能回放预测带（目标期 + 之前至少两期）",
+        )
+    settings = await store.get_settings(actor_user_id(actor))
+    specials = [int(draw["special_number"]) for draw in draws]
+    if period is not None:
+        target_index = next(
+            (
+                index
+                for index, draw in enumerate(draws)
+                if int(draw["period"]) == int(period)
+            ),
+            None,
+        )
+        if target_index is None:
+            raise HTTPException(status_code=404, detail="找不到该期开奖记录")
+    else:
+        target_index = int(offset) - 1
+        if target_index >= len(draws):
+            raise HTTPException(status_code=400, detail="offset 超出本池期数")
+
+    replay = replay_predict_wave_band(
+        specials,
+        target_index=target_index,
+        window=int(settings.get("lattice_window") or 0),
+        small_max=int(settings["small_max"]),
+        normal_max=int(settings["normal_max"]),
+    )
+    target = draws[target_index]
+    anchor_draw = draws[target_index + 1] if target_index + 1 < len(draws) else None
+    if replay is None:
+        return {
+            "ok": False,
+            "code": "INSUFFICIENT",
+            "message": "目标期之前不足两期，无法估出当时的预测带",
+            "target_period": int(target["period"]),
+            "target_date": target.get("draw_date"),
+            "target_index": target_index,
+            "anchor_period": int(anchor_draw["period"]) if anchor_draw else None,
+            "replay": None,
+        }
+    return {
+        "ok": True,
+        "code": "OK",
+        "message": "已回放目标期之前的预测带",
+        "target_period": int(target["period"]),
+        "target_date": target.get("draw_date"),
+        "target_index": target_index,
+        "anchor_period": int(anchor_draw["period"]) if anchor_draw else None,
+        "anchor_date": anchor_draw.get("draw_date") if anchor_draw else None,
+        "replay": replay,
+    }
+
+
+@router.get("/lattice/hit-rate")
+async def get_lattice_hit_rate(
+    recent_limit: int = Query(
+        default=20,
+        ge=0,
+        le=200,
+        description="recent 列表最多返回多少期（最新在前）；0 = 不附明细",
+    ),
+    actor=Depends(current_user_optional),
+):
+    """统计本池「实开差值落在当时预测带」的命中率（walk-forward，无未来函数）。
+
+    用当前用户的 ``lattice_window`` / 波动阈值；匿名取全局默认。
+    录入 / 纠正 / 导入开奖后无需落库缓存——下次读取即按最新 ``draws`` 重算。
+    """
+    store = await get_store()
+    draws = await store.list_draws()  # 最新在前
+    settings = await store.get_settings(actor_user_id(actor))
+    stats = lattice_band_hit_stats(
+        [int(draw["special_number"]) for draw in draws],
+        periods=[int(draw["period"]) for draw in draws],
+        window=int(settings.get("lattice_window") or 0),
+        small_max=int(settings["small_max"]),
+        normal_max=int(settings["normal_max"]),
+        recent_limit=recent_limit,
+    )
+    return {
+        "ok": stats["data_status"] == "OK",
+        "code": stats["data_status"],
+        "message": (
+            f"本池已评估 {stats['evaluated']} 期，带内命中 {stats['hits']} 期"
+            if stats["evaluated"]
+            else "本池至少要 3 期开奖记录才能统计预测带命中率"
+        ),
+        **stats,
+    }
 
 
 @router.get("/history", response_model=list[HistoryRecordOut])
@@ -190,6 +306,17 @@ async def post_recommend(
         period=period,
         history_dates=history_dates,
     )
+
+    # 带内命中率只统计本池真实开奖（假设号码预览不得污染）；与 GET /api/lattice/hit-rate 同口径
+    lattice_block = result.get("lattice")
+    if isinstance(lattice_block, dict):
+        lattice_block["hit_stats"] = lattice_band_hit_stats(
+            specials,
+            periods=[int(draw["period"]) for draw in draws],
+            window=int(settings.get("lattice_window") or 0),
+            small_max=int(settings["small_max"]),
+            normal_max=int(settings["normal_max"]),
+        )
 
     # 真实推荐（非「假设号码」预览）自动采用：按目标期 upsert 快照。
     # 目标期 = max(period)+1；开奖入库后按同 period 回填命中。
