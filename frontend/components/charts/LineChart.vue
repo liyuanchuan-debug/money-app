@@ -93,9 +93,9 @@ interface CandidatePoint {
  * - x：候选列就是**最后一个普通等距下标**（与真实期、预测点共用同一 x 步长），
  *   落在序列绘图区右边界上；其右侧留出号码标签宽度，不与右边缘贴死；
  * - y：默认绘图区内**等距槽位**（只为了让每个号码读得清，纵向不是数值/时间坐标）；
- *   传 candidateColumnByValue = true 时改为 y = yAt(value)：纵轴同单位时这一列即取值的点阵分布；
+ *   传 candidateColumnByValue = true 时改为在绘图区内按取值线性落点（每档一格，边缘号不叠像素）；
  * - 连线：从 candidateColumnFromIndex 指定的「最新真实数据点」分别连到每个候选点，算法与主走势同一套 linePath；
- * - 标签：槽位间距不足时整列隐藏标签，号码交给光标提示（绝不重叠）。
+ * - 标签：槽位间距不足时整列隐藏标签，号码交给光标提示（绝不重叠）；``pinLabel`` 点始终单独出标签。
  * 口径：本期候选，非真实开奖；纵列等距时只为人眼读号码，不表示取值大小。
  */
 interface ColumnCandidate {
@@ -112,6 +112,11 @@ interface ColumnCandidate {
    * false：淡点可点，不画线。
    */
   selected?: boolean
+  /**
+   * 强制出号码标签并后绘置顶（如回放「实开号」）。
+   * 不受整列标签间距降级影响，避免 01/02/03 等边缘号被挤没。
+   */
+  pinLabel?: boolean
 }
 
 /**
@@ -220,6 +225,12 @@ const props = withDefaults(
      * 例：[30, 60, 100, 0]
      */
     windowOptions?: number[]
+    /**
+     * 方向键语义（opt-in）：
+     * - ``series``（默认）：左右步进走势光标（改造前）
+     * - ``column-period``：上下移动竖列号码焦点；左右发出 period-step（更早 / 更新）
+     */
+    keyboardMode?: 'series' | 'column-period'
   }>(),
   {
     series: () => [],
@@ -246,6 +257,7 @@ const props = withDefaults(
     scrollable: false,
     windowSize: 30,
     windowOptions: () => [],
+    keyboardMode: 'series',
   },
 )
 
@@ -253,6 +265,13 @@ const emit = defineEmits<{
   'update:windowSize': [value: number]
   /** 竖列候选点被点按（号码取值）；调用方用来切换选中 */
   'candidate-click': [payload: { value: number }]
+  /**
+   * 竖列期数步进（仅 keyboardMode=column-period）：
+   * ``delta > 0`` = 更早；``delta < 0`` = 更新（靠近本期）。
+   */
+  'period-step': [payload: { delta: number }]
+  /** 键盘上下移动竖列焦点时的当前号码 */
+  'column-focus': [payload: { value: number }]
 }>()
 
 const VB_WIDTH = 720
@@ -529,6 +548,12 @@ function windowLabel(option: number) {
 }
 
 const scrollerLabel = computed(() => {
+  if (props.keyboardMode === 'column-period' && hasColumn.value) {
+    return (
+      `预测点阵，共 ${pointCount.value} 个点（末端为竖列候选）；`
+      + '上下键移动竖列号码，左右键切换更早或更新的期数，回车切换选中'
+    )
+  }
   // 无候选段 / 无候选列时保持改造前的措辞（其余调用方的 aria 文案不变）
   const suffix = hasColumn.value
     ? '（末端为竖列候选）'
@@ -1193,15 +1218,27 @@ const candidateGeometry = computed(() => {
 })
 
 /**
+ * 竖列按取值落点：直接映射到垫后的 [top, bottom]，保证值域内每个不同取值有不同 y。
+ * 禁止先 yAt 再 clamp —— 那会把 01/02/03（以及 47/48/49）挤到同一条边线上。
+ */
+function columnYByValue(value: number, top: number, bottom: number) {
+  const min = bounds.value.min
+  const max = bounds.value.max
+  const range = max - min || 1
+  const ratio = Math.min(1, Math.max(0, (value - min) / range))
+  return bottom - ratio * Math.max(1, bottom - top)
+}
+
+/**
  * 竖列候选几何（opt-in，默认空 = 不绘制）。
  * - x：全部候选共用 columnX = 最后一个等距下标（与真实期、预测点同一步长，是**单列**、不是横向铺开）；
  * - y：默认绘图区内**等距槽位**（slot 0 在上、slot n-1 在下）—— 纵向不是数值/时间坐标，
- *   只为让每个号码读得清；candidateColumnByValue = true 时改为按真实取值 yAt(value) 定位，
- *   纵轴同单位时这一列就是取值的点阵分布；调用方传的 value 两种模式都保留给提示框；
+ *   只为让每个号码读得清；candidateColumnByValue = true 时在垫后绘图区按取值线性落点，
+ *   纵轴同单位时这一列就是取值的点阵分布（边缘号不叠像素）；
  * - 预测折线：从 candidateColumnFromIndex 指定的「最新真实数据点」**分别**连到每个槽位，
  *   每条都用与主走势同一套 linePath（两点退化为直线段）；
  * - 标签：真实值模式下按 y 升序上下交替 + 固定步长确定性错开；最小步长过小或错不开时
- *   整列隐藏标签，号码交给光标提示（绝不重叠）。
+ *   整列隐藏标签（``pinLabel`` 点除外），号码交给光标提示（绝不重叠）。
  * candidateColumn 为空时返回 null，模板整段不渲染（其余调用方零影响）。
  */
 const columnGeometry = computed(() => {
@@ -1218,20 +1255,20 @@ const columnGeometry = computed(() => {
   const x = columnX.value
   const points = list.map((item, i) => {
     const selected = item.selected !== false
+    const pinLabel = item.pinLabel === true
     return {
       key: `col-${i}`,
       x,
-      // 槽位 y：默认等距（纵向只为人眼读号码，不是数值轴）；
-      // candidateColumnByValue = true 时按真实取值 yAt(value)（纵轴同单位 → 这一列就是取值的点阵分布），
-      // 并夹在绘图区内（防御：取值越界时不画到图外）。value 两种模式都保留给光标提示。
+      // 槽位 y：默认等距；byValue = 垫后区间线性映射（不用 yAt+clamp，避免 01/02/03 叠点）
       y: byValue
-        ? Math.min(bottom, Math.max(top, yAt(item.value)))
+        ? columnYByValue(item.value, top, bottom)
         : (count <= 1 ? (top + bottom) / 2 : top + (span * i) / (count - 1)),
       value: item.value,
       label: item.label ? String(item.label) : '',
       zodiac: item.zodiac ? String(item.zodiac) : '',
       tone: item.tone ? chartTone(item.tone) : chartTone(props.candidateTone),
       selected,
+      pinLabel,
       /** 标签基线 y：等距模式沿用改造前的「圆点右侧、纵向居中」（下方赋值）；
        *  真实值模式由下方确定性错开给出；错不开 / 步长过小则整列隐藏标签。 */
       labelY: 0,
@@ -1241,9 +1278,11 @@ const columnGeometry = computed(() => {
   /**
    * 标签只给**选中点**：全量 01–49 时若按全部点算间距，标签永远被压掉。
    * 真实值模式 = 相邻选中点的最小纵向间距；过小则整列隐藏标签（号码交给光标提示）。
+   * pinLabel 点（如回放实开）始终单独出标签，不参与「整列关掉」。
    */
-  const labelSources = points.filter((point) => point.selected)
+  const labelSources = points.filter((point) => point.selected && !point.pinLabel)
   const labelCount = labelSources.length
+  const pinned = points.filter((point) => point.pinLabel && point.label)
   let minStep = spacing
   if (byValue && labelCount > 1) {
     const ys = labelSources.map((point) => point.y).sort((a, b) => a - b)
@@ -1254,9 +1293,9 @@ const columnGeometry = computed(() => {
   }
   let separated = true
   if (byValue) {
-    // 真实值定位：圆点必须留在真实取值上，只把**选中点标签**错开 ——
+    // 真实值定位：圆点留在取值映射上，只把**选中点标签**错开 ——
     // 按 y 升序排名上下交替（偶数在上、奇数在下），同一侧按固定步长拉开；
-    // 全部确定性（无 Math.random）。同侧仍压不住则整列隐藏标签，绝不重叠。
+    // 全部确定性（无 Math.random）。同侧仍压不住则整列隐藏普通标签，绝不重叠。
     for (const point of points) point.labelY = point.y + 3.2
     const ranked = labelSources
       .map((point, i) => ({ i, y: point.y, point }))
@@ -1280,6 +1319,10 @@ const columnGeometry = computed(() => {
       if (pool.some((prev) => Math.abs(prev - labelY) < COLUMN_LABEL_STEP)) separated = false
       pool.push(labelY)
       point.labelY = labelY
+    }
+    // 置顶标签：贴在圆点旁，必要时轻微上移躲开边
+    for (const point of pinned) {
+      point.labelY = Math.min(bottom, Math.max(top, point.y + 3.2))
     }
   } else {
     // 默认等距模式：与改造前逐字节一致 —— 标签就写在圆点右侧、纵向居中
@@ -1331,13 +1374,20 @@ const columnGeometry = computed(() => {
       }))
     : []
 
+  // 绘制顺序：淡点 → 普通选中 → pinLabel 置顶，避免实开号被邻号盖住
+  const drawPoints = [...points].sort((a, b) => {
+    const rank = (point: typeof points[number]) => (point.pinLabel ? 2 : point.selected ? 1 : 0)
+    return rank(a) - rank(b) || a.value - b.value
+  })
+
   return {
     x,
     points,
+    drawPoints,
     from,
     lines,
     count,
-    // 间距足够、且真实值模式下标签能错开才画号码；否则整列只画点，号码交给光标提示（确定性降级，绝不重叠）
+    // 间距足够、且真实值模式下标签能错开才画普通号码；pinLabel 另算
     showLabels: labelCount <= 1 || (minStep >= COLUMN_LABEL_MIN_SPACING && separated),
   }
 })
@@ -1690,8 +1740,88 @@ function onWindowPointerUp(event: PointerEvent) {
   hoverIndex.value = null
 }
 
+/** 竖列可聚焦号码（升序）；无竖列时为空 */
+function columnFocusValues(): number[] {
+  const seen = new Set<number>()
+  const values: number[] = []
+  for (const item of props.candidateColumn ?? []) {
+    const value = Number(item.value)
+    if (!Number.isFinite(value) || seen.has(value)) continue
+    seen.add(value)
+    values.push(value)
+  }
+  values.sort((a, b) => a - b)
+  return values
+}
+
+function defaultColumnFocusValue(values: number[]): number | null {
+  if (!values.length) return null
+  const pinned = (props.candidateColumn ?? []).find(item => item.pinLabel === true)?.value
+  if (pinned != null && values.includes(pinned)) return pinned
+  const selected = (props.candidateColumn ?? []).find(item => item.selected !== false)?.value
+  if (selected != null && values.includes(selected)) return selected
+  return values[Math.floor((values.length - 1) / 2)] ?? null
+}
+
+/**
+ * 上下移动竖列号码焦点。
+ * ArrowUp = 号码变大（图上往上）；ArrowDown = 号码变小。
+ */
+function stepColumnFocus(delta: number) {
+  const values = columnFocusValues()
+  if (!values.length) return
+  const current = hoverColumnPointValue.value
+  let index = current == null ? -1 : values.indexOf(current)
+  if (index < 0) {
+    const fallback = defaultColumnFocusValue(values)
+    index = fallback == null ? 0 : Math.max(0, values.indexOf(fallback))
+  } else {
+    index = Math.min(values.length - 1, Math.max(0, index + delta))
+  }
+  const value = values[index]
+  if (value == null) return
+  hoverColumnPointValue.value = value
+  hoverIndex.value = columnSlotIndex.value
+  if (props.scrollable) cursorIndex.value = columnSlotIndex.value
+  emit('column-focus', { value })
+}
+
 function onKeyNavigate(event: KeyboardEvent) {
   if (!props.scrollable || !hasData.value) return
+  const columnPeriod = props.keyboardMode === 'column-period' && hasColumn.value
+
+  if (columnPeriod) {
+    if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      stepColumnFocus(1)
+      return
+    }
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      stepColumnFocus(-1)
+      return
+    }
+    if (event.key === 'ArrowLeft') {
+      // 时间轴向左 = 更早
+      event.preventDefault()
+      emit('period-step', { delta: 1 })
+      return
+    }
+    if (event.key === 'ArrowRight') {
+      // 时间轴向右 = 更新（靠近本期）
+      event.preventDefault()
+      emit('period-step', { delta: -1 })
+      return
+    }
+    if (event.key === 'Enter' || event.key === ' ') {
+      const value = hoverColumnPointValue.value
+      if (value == null) return
+      event.preventDefault()
+      emit('candidate-click', { value })
+      return
+    }
+  }
+
   if (event.key === 'ArrowLeft') {
     event.preventDefault()
     stepCursor(-1, true)
@@ -1741,6 +1871,22 @@ watch(
     }
   },
   { immediate: true },
+)
+
+/** 竖列数据换了（如回放翻期）：焦点若失效则落到实开 / 默认号 */
+watch(
+  () => (props.candidateColumn ?? []).map(item => `${item.value}:${item.pinLabel ? 1 : 0}`).join(','),
+  () => {
+    if (props.keyboardMode !== 'column-period' || !hasColumn.value) return
+    const values = columnFocusValues()
+    if (!values.length) {
+      hoverColumnPointValue.value = null
+      return
+    }
+    const current = hoverColumnPointValue.value
+    if (current != null && values.includes(current)) return
+    hoverColumnPointValue.value = defaultColumnFocusValue(values)
+  },
 )
 
 const hoverInfo = computed(() => {
@@ -2275,26 +2421,45 @@ const hoverInfo = computed(() => {
                   stroke-linejoin="round"
                 />
               </g>
-              <g v-for="point in columnGeometry.points" :key="point.key">
+              <g v-for="point in columnGeometry.drawPoints" :key="point.key">
+                <circle
+                  v-if="hoverColumnPointValue === point.value"
+                  :cx="point.x"
+                  :cy="point.y"
+                  r="8"
+                  fill="none"
+                  stroke="rgba(125, 211, 252, 0.95)"
+                  stroke-width="1.6"
+                  opacity="0.95"
+                />
                 <circle
                   :cx="point.x"
                   :cy="point.y"
-                  :r="point.selected ? 3.6 : 2.2"
+                  :r="point.pinLabel ? 5 : (point.selected ? 3.6 : 2.2)"
                   :fill="point.tone.stroke"
-                  :opacity="point.selected ? 1 : 0.28"
+                  :opacity="point.selected || point.pinLabel || hoverColumnPointValue === point.value ? 1 : 0.28"
                   stroke="rgba(5, 6, 15, 0.85)"
-                  :stroke-width="point.selected ? 1.4 : 0.9"
+                  :stroke-width="point.pinLabel ? 1.8 : (point.selected ? 1.4 : 0.9)"
                 />
                 <text
-                  v-if="point.selected && point.label && columnGeometry.showLabels"
+                  v-if="point.label && (
+                    point.pinLabel
+                    || hoverColumnPointValue === point.value
+                    || (point.selected && columnGeometry.showLabels)
+                  )"
                   :x="point.x + COLUMN_LABEL_OFFSET"
                   :y="point.labelY"
                   text-anchor="start"
-                  font-size="9.5"
+                  :font-size="point.pinLabel || hoverColumnPointValue === point.value ? 11 : 9.5"
+                  font-weight="600"
                   :fill="point.tone.text"
                   class="num"
+                  paint-order="stroke"
+                  stroke="rgba(5, 6, 15, 0.92)"
+                  stroke-width="3"
+                  stroke-linejoin="round"
                 >
-                  {{ point.label }}
+                  {{ point.pinLabel ? `实开 ${point.label}` : point.label }}
                 </text>
               </g>
               <!-- 列下方一行小注：等距模式点明纵向只是排布；真实值模式点明纵轴即取值轴 -->
@@ -2305,7 +2470,9 @@ const hoverInfo = computed(() => {
                 font-size="8.5"
                 fill="rgba(148, 163, 184, 0.6)"
               >
-                {{ props.candidateColumnByValue ? '竖列候选 · 点选连线' : '竖列候选 · 非数值轴' }}
+                {{ props.keyboardMode === 'column-period'
+                  ? '↑↓ 号码 · ←→ 期数'
+                  : (props.candidateColumnByValue ? '竖列候选 · 点选连线' : '竖列候选 · 非数值轴') }}
               </text>
             </g>
 

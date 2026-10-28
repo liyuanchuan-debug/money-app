@@ -731,6 +731,18 @@ function stepHistoryLater() {
   latticeHistoryOffset.value = Math.max(0, latticeHistoryOffset.value - 1)
 }
 
+/** 点阵图左右键：delta>0 更早，delta<0 更新 */
+function onLatticePeriodStep(payload: { delta: number }) {
+  if (payload.delta > 0) stepHistoryEarlier()
+  else if (payload.delta < 0) stepHistoryLater()
+}
+
+/** 竖列点选 / 回车：仅「本期」可改选中；回放只浏览 */
+function onLatticeCandidateClick(payload: { value: number }) {
+  if (latticeHistoryOffset.value > 0) return
+  toggleLatticeNumber(payload.value)
+}
+
 watch(
   () => latticeReplayWindow.value.maxOffset,
   (maxOffset) => {
@@ -747,6 +759,7 @@ const waveTrendChart = computed(() => {
     zodiac?: string
     tone: 'emerald' | 'bloom' | 'nebula' | 'slate'
     selected: boolean
+    pinLabel?: boolean
   }
   type Annotation = {
     index: number
@@ -862,6 +875,8 @@ const waveTrendChart = computed(() => {
         zodiac: heatZodiacLabelByNumber.value.get(num) || undefined,
         tone,
         selected: inBand || isActual,
+        // 实开号强制出标签并置顶，避免 01/02/03 等边缘号被邻点盖住
+        pinLabel: isActual,
       }
     })
     candidateColumnFromIndex = specialValues.length - 1
@@ -1687,6 +1702,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 <h2 class="text-lg font-medium text-white">预测点阵</h2>
                 <p class="text-xs leading-relaxed text-slate-500">
                   「本期」= 最新开奖日之后的预测；「更早 / 更新」可一期一期往前或往后翻，按当天重画预测带与右侧号码连线，实开号会高亮。
+                  点进图后：↑↓ 移动竖列号码，←→ 切换更早 / 更新，回车切换选中（仅本期）。
                   下方「N 期」是一屏显示多少期。命中率 = 实开差值落在当时预测带内的本池样本对照，不是概率。
                 </p>
                 <p
@@ -1755,7 +1771,8 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               下一期（第 {{ waveTrendChart.historySummary.targetPeriod }} 期）实开
               {{ waveTrendChart.historySummary.actual }}（差 {{ waveTrendChart.historySummary.diff }}），
               {{ waveTrendChart.historySummary.hit ? '落在带内' : '落在带外' }}。
-              右侧连线高亮 = 当时带宽 {{ waveTrendChart.historySummary.low }}–{{ waveTrendChart.historySummary.high }} 内的号码。
+              右侧连线高亮 = 当时带宽 {{ waveTrendChart.historySummary.low }}–{{ waveTrendChart.historySummary.high }} 内的号码；
+              「实开 {{ pad(waveTrendChart.historySummary.actual) }}」单独标出。
             </p>
             <p v-else-if="latticeReplayWindow.maxOffset <= 0" class="text-xs text-amber-200/90">
               本池至少要 3 期开奖记录，才能往前翻看历史预测带。
@@ -1772,10 +1789,13 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               :y-min="1"
               :y-max="49"
               scrollable
+              keyboard-mode="column-period"
               v-model:window-size="waveTrendWindow"
               :window-options="WAVE_TREND_WINDOW_OPTIONS"
               empty-text="数据不足"
               empty-hint="本池至少要 2 期开奖记录才能连成预测波动线"
+              @period-step="onLatticePeriodStep"
+              @candidate-click="onLatticeCandidateClick"
             />
           </GlassPanel>
         </MotionReveal>
