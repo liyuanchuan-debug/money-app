@@ -644,7 +644,7 @@ const tripleCopyFeedback = computed(
   () => copiedSource.value === 'triple' || copiedSource.value.startsWith('group-'),
 )
 
-const WAVE_TREND_WINDOW_DEFAULT = 60
+const WAVE_TREND_WINDOW_DEFAULT = 100
 const WAVE_TREND_WINDOW_OPTIONS = [30, 60, 100, 0]
 const waveTrendWindow = ref(WAVE_TREND_WINDOW_DEFAULT)
 /**
@@ -1073,7 +1073,8 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
 
 <template>
   <main class="relative px-5 py-10 text-slate-100 sm:py-14">
-    <div class="mx-auto flex max-w-3xl flex-col gap-7">
+    <!-- PC 加宽：点阵 100 期一屏时内容区太窄会挤；手机仍用 3xl -->
+    <div class="mx-auto flex w-full max-w-3xl flex-col gap-7 lg:max-w-6xl">
       <!-- 头部 -->
       <MotionReveal :index="0" class="flex flex-wrap items-start justify-between gap-4">
         <div class="space-y-2.5">
