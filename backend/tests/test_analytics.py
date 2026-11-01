@@ -54,6 +54,8 @@ LEGACY_ENGINE_OFF: dict = {
     "include_repeat_number": False,
     "wave_alloc": WAVE_ALLOC_DRAIN,
     "pick_sampling": PICK_SAMPLING_RANKED,
+    # 旧已知答案用例不叠加近期生肖硬过滤（短样本会把池收窄到个位数）
+    "restrict_recent_zodiacs": False,
 }
 REAL_DRAWS_FILE = BACKEND_DIR / "data" / "draws_70_269.txt"
 
@@ -73,6 +75,8 @@ def memory_store_env(monkeypatch):
     但会补上被删掉的）。详见 tests/conftest.py 的说明。
     """
     monkeypatch.setenv("DATABASE_URL", "")
+    # 冻结快照 / 已知答案用例不叠加近期生肖硬过滤
+    monkeypatch.setitem(DEFAULT_SETTINGS, "restrict_recent_zodiacs", False)
     yield
 
 
@@ -334,10 +338,22 @@ def test_backtest_exclude_repeat_zodiac_shrinks_pool():
     """开启避开重肖时，平均可用号码应从 48 降到约 45（去掉整组同肖）。"""
     draws = _draws([10, 20, 19, 5])
     off = backtest_stats(
-        draws, mode="even", pick_count=1, base_settings={"exclude_repeat_zodiac": False}
+        draws,
+        mode="even",
+        pick_count=1,
+        base_settings={
+            "exclude_repeat_zodiac": False,
+            "restrict_recent_zodiacs": False,
+        },
     )
     on = backtest_stats(
-        draws, mode="even", pick_count=1, base_settings={"exclude_repeat_zodiac": True}
+        draws,
+        mode="even",
+        pick_count=1,
+        base_settings={
+            "exclude_repeat_zodiac": True,
+            "restrict_recent_zodiacs": False,
+        },
     )
     # 默认保留重号：每次可用号码 = 全部 49 个（既不排重号也不排重肖）
     assert off["average_available_numbers"] == pytest.approx(49.0)
@@ -351,7 +367,11 @@ def test_backtest_exclude_repeat_zodiac_shrinks_pool():
         draws,
         mode="even",
         pick_count=1,
-        base_settings={"exclude_repeat_zodiac": False, "include_repeat_number": False},
+        base_settings={
+            "exclude_repeat_zodiac": False,
+            "include_repeat_number": False,
+            "restrict_recent_zodiacs": False,
+        },
     )
     assert legacy["average_available_numbers"] == pytest.approx(48.0)
 

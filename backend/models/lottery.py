@@ -18,6 +18,8 @@ from services.lottery import (
     PICK_COUNT_MIN,
     PICK_SAMPLING_PATTERN,
     PICK_STRATEGY_PATTERN,
+    RECENT_ZODIAC_LIMIT_MAX,
+    RECENT_ZODIAC_LIMIT_MIN,
     ROLE_WEIGHT_MAX,
     ROLE_WEIGHT_MIN,
     SOFT_WEIGHT_MAX,
@@ -50,6 +52,10 @@ class SettingsOut(BaseModel):
     odds: float
     # 避开重肖：True=候选池排除最新同肖；默认 False
     exclude_repeat_zodiac: bool
+    # 近期生肖硬过滤：True=预测号必须属于最近开出的 N 个不重复生肖；默认 True
+    restrict_recent_zodiacs: bool
+    # 近期生肖个数上限（1..12）；默认 6
+    recent_zodiac_limit: int
     # 上期出过的号（重号）是否保留在候选池：True=不避开、只降权（默认）
     include_repeat_number: bool
     # 三类软降权权重（0..1；1.0 = 不降权）
@@ -115,6 +121,16 @@ class SettingsPatch(BaseModel):
     )
     exclude_repeat_zodiac: bool | None = Field(
         default=None, description="True=避开最新一期同肖；默认 False"
+    )
+    restrict_recent_zodiacs: bool | None = Field(
+        default=None,
+        description="True=预测号必须属于最近开出的 N 个不重复生肖；默认 True",
+    )
+    recent_zodiac_limit: int | None = Field(
+        default=None,
+        ge=RECENT_ZODIAC_LIMIT_MIN,
+        le=RECENT_ZODIAC_LIMIT_MAX,
+        description="近期生肖个数上限（1..12）；默认 6",
     )
     include_repeat_number: bool | None = Field(
         default=None,

@@ -139,6 +139,8 @@ LEGACY_PENALTY_OFF: dict = {
     "lattice_enabled": False,
     # 旧口径：候选池排除上期特码本身（重号）
     "include_repeat_number": False,
+    # 旧口径用例不叠加「近期生肖硬过滤」，避免候选池被默认收窄干扰其它断言
+    "restrict_recent_zodiacs": False,
     "pick_sampling": PICK_SAMPLING_RANKED,
 }
 
@@ -162,6 +164,9 @@ def memory_store_env(monkeypatch):
     # 本模块的接口用例按「开发旁路」书写：显式关闭鉴权开关，避免本地 .env 里的
     # AUTH_ENFORCED=true 让匿名 GET/PUT 变成 401（auth_enforced() 在请求时读环境变量）。
     monkeypatch.setenv("AUTH_ENFORCED", "false")
+    # 默认关闭近期生肖硬过滤：多数旧用例用短历史，池会被收窄到个位数。
+    # 专门覆盖该开关的用例在 settings 里显式传 True。
+    monkeypatch.setitem(DEFAULT_SETTINGS, "restrict_recent_zodiacs", False)
     yield
 
 
@@ -229,6 +234,8 @@ def test_recommend_sweep(
             "repeat_number_weight": 1.0,
             "repeat_zodiac_weight": 1.0,
             "stale_weight": 1.0,
+            # 短历史（1～2 期）不足以覆盖 6 生肖；本用例不测硬过滤
+            "restrict_recent_zodiacs": False,
         },
         mode=mode,
     )
@@ -1102,6 +1109,156 @@ def test_settings_api_exclude_repeat_zodiac_roundtrip():
         assert restored["mode"] == body["mode"]
         assert restored["normal_max"] == body["normal_max"]
         assert restored["pick_count"] == body["pick_count"]
+
+
+# --------------------------------------------------------------------------- #
+# 11b. 近期生肖硬过滤（默认开启，N=6）
+# --------------------------------------------------------------------------- #
+def test_recent_special_zodiac_groups_newest_first_unique():
+    from services.lottery import recent_special_zodiac_groups, zodiac_group
+
+    # 最新在前：1→组0，13→同组跳过，2→组1，14→跳过，3→组2
+    history = [1, 13, 2, 14, 3, 15, 4]
+    groups = recent_special_zodiac_groups(history, limit=3)
+    assert groups == [zodiac_group(1), zodiac_group(2), zodiac_group(3)]
+
+
+def test_build_candidate_pools_respects_allowed_zodiac_groups():
+    from services.lottery import build_candidate_pools, zodiac_group
+
+    latest = 22
+    allowed = [zodiac_group(1), zodiac_group(2)]  # 组 0、1 → 号 1/13/25/37/49 与 2/14/26/38
+    pools = build_candidate_pools(
+        latest,
+        10,
+        30,
+        include_repeat_number=True,
+        allowed_zodiac_groups=allowed,
+    )
+    nums = {item["number"] for pool in pools.values() for item in pool}
+    assert nums
+    assert all(zodiac_group(n) in set(allowed) for n in nums)
+    # 组外号必须被滤掉
+    assert 3 not in nums
+    assert 22 not in nums  # latest 组 9，不在 allowed
+
+
+def test_recommend_restricts_to_recent_zodiacs_by_default():
+    from services.lottery import recent_special_zodiac_groups, zodiac_group
+
+    # 历史只覆盖 3 个生肖组；默认开启硬过滤 → 预测号只能落在这 3 组
+    history = [1, 2, 3, 1, 2, 3, 1, 2, 3]
+    allowed = set(recent_special_zodiac_groups(history, limit=6))
+    assert allowed == {zodiac_group(1), zodiac_group(2), zodiac_group(3)}
+
+    result = recommend(
+        latest=1,
+        previous=2,
+        history_numbers=history,
+        settings={
+            "restrict_recent_zodiacs": True,
+            "recent_zodiac_limit": 6,
+            "pick_count": 6,
+            "include_repeat_number": True,
+            "exclude_repeat_zodiac": False,
+            "lattice_enabled": False,
+            "avoid_cold_enabled": False,
+            "pick_sampling": "ranked",
+        },
+    )
+    assert result["settings"]["restrict_recent_zodiacs"] is True
+    assert result["settings"]["recent_zodiac_limit"] == 6
+    assert result["recent_zodiacs"]["applied"] is True
+    assert set(result["recent_zodiacs"]["groups"]) == allowed
+    picked = [pick["number"] for pick in result["picks"]]
+    assert picked
+    assert all(zodiac_group(n) in allowed for n in picked)
+
+
+def test_recommend_can_disable_recent_zodiac_restriction():
+    from services.lottery import (
+        build_candidate_pools,
+        resolve_allowed_zodiac_groups,
+        zodiac_group,
+    )
+
+    history = [1, 2, 3, 1, 2, 3]
+    settings = {
+        "restrict_recent_zodiacs": False,
+        "pick_count": 8,
+        "include_repeat_number": True,
+        "exclude_repeat_zodiac": False,
+        "lattice_enabled": False,
+        "avoid_cold_enabled": False,
+        "pick_sampling": "ranked",
+    }
+    result = recommend(
+        latest=1,
+        previous=2,
+        history_numbers=history,
+        settings=settings,
+    )
+    assert result["settings"]["restrict_recent_zodiacs"] is False
+    assert result["recent_zodiacs"]["applied"] is False
+    assert result["recent_zodiacs"]["groups"] == []
+    cfg = clamp_settings(settings)
+    assert resolve_allowed_zodiac_groups(cfg, history) is None
+    pools = build_candidate_pools(
+        1, cfg["small_max"], cfg["normal_max"], include_repeat_number=True
+    )
+    nums = {item["number"] for pool in pools.values() for item in pool}
+    # 关闭硬过滤后，候选池应包含历史未开出的生肖组
+    assert any(zodiac_group(n) not in {0, 1, 2} for n in nums)
+
+
+def test_clamp_settings_recent_zodiac_defaults_and_bounds():
+    from services.lottery import (
+        DEFAULT_RECENT_ZODIAC_LIMIT,
+        DEFAULT_RESTRICT_RECENT_ZODIACS,
+    )
+
+    # 产品默认（模块常量）仍是开启；本文件 autouse 会把 DEFAULT_SETTINGS 临时关掉
+    assert DEFAULT_RESTRICT_RECENT_ZODIACS is True
+    assert DEFAULT_RECENT_ZODIAC_LIMIT == 6
+    assert clamp_settings({"restrict_recent_zodiacs": True})[
+        "restrict_recent_zodiacs"
+    ] is True
+    assert clamp_settings({"restrict_recent_zodiacs": False})[
+        "restrict_recent_zodiacs"
+    ] is False
+    assert clamp_settings({"recent_zodiac_limit": 0})["recent_zodiac_limit"] == 1
+    assert clamp_settings({"recent_zodiac_limit": 99})["recent_zodiac_limit"] == 12
+    assert clamp_settings({"recent_zodiac_limit": "abc"})["recent_zodiac_limit"] == 6
+
+
+def test_settings_api_recent_zodiac_roundtrip(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from main import app
+    from services import lottery as lottery_mod
+
+    # API 用例要验证产品默认（开启），临时恢复 DEFAULT_SETTINGS
+    monkeypatch.setitem(lottery_mod.DEFAULT_SETTINGS, "restrict_recent_zodiacs", True)
+
+    with TestClient(app) as client:
+        body = client.get("/api/settings").json()
+        assert body["restrict_recent_zodiacs"] is True
+        assert body["recent_zodiac_limit"] == 6
+
+        updated = client.put(
+            "/api/settings",
+            json={"restrict_recent_zodiacs": False, "recent_zodiac_limit": 4},
+        ).json()
+        assert updated["restrict_recent_zodiacs"] is False
+        assert updated["recent_zodiac_limit"] == 4
+
+        restored = client.put(
+            "/api/settings",
+            json={"restrict_recent_zodiacs": True, "recent_zodiac_limit": 6},
+        ).json()
+        assert restored["restrict_recent_zodiacs"] is True
+        assert restored["recent_zodiac_limit"] == 6
+        assert restored["total_amount"] == body["total_amount"]
 
 
 # --------------------------------------------------------------------------- #

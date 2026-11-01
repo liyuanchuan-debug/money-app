@@ -111,6 +111,8 @@ LIVE_SETTINGS: dict[str, Any] = {
     "pick_count": 10,
     "odds": 47.0,
     "exclude_repeat_zodiac": True,
+    # 冻结快照口径：未开近期生肖过滤时的命中率 / 敏感度
+    "restrict_recent_zodiacs": False,
     "include_repeat_number": True,
     # 三项软降权（2026-10-09「降权去除」后**保留键、不再生效**：只留信息标签）
     "repeat_number_weight": 0.5,
@@ -220,6 +222,8 @@ SETTING_SWEEPS: dict[str, tuple[Any, ...]] = {
     "pick_count": (5, 6, 8, 9),
     "odds": (40.0, 49.0, 60.0),
     "exclude_repeat_zodiac": (False,),
+    "restrict_recent_zodiacs": (False,),
+    "recent_zodiac_limit": (3, 4, 8, 12),
     "include_repeat_number": (False,),
     "repeat_number_weight": (0.0, 1.0),
     "repeat_zodiac_weight": (0.0, 1.0),
@@ -250,6 +254,7 @@ SETTING_SWEEPS: dict[str, tuple[Any, ...]] = {
 BOOL_SETTING_KEYS: frozenset[str] = frozenset(
     {
         "exclude_repeat_zodiac",
+        "restrict_recent_zodiacs",
         "include_repeat_number",
         "lattice_enabled",
         "avoid_cold_enabled",
@@ -300,7 +305,9 @@ SETTING_GATES: dict[str, str] = {
     "mode": "MODE_SINGLE 会把有效注数压到 1（effective_pick_count:540）；其余模式只改金额",
     "pick_count": "选号数量（recommend:1896）",
     "odds": "只进 pnl / 兑付展示；recommend 不读赔率 → 不改变号码与金额",
-    "exclude_repeat_zodiac": "候选池整组剔除最新同肖（build_candidate_pools:607）",
+    "exclude_repeat_zodiac": "候选池整组剔除最新同肖（build_candidate_pools）",
+    "restrict_recent_zodiacs": "候选池只保留近期最新开出的 N 个不重复生肖（默认开）",
+    "recent_zodiac_limit": "近期生肖硬过滤的 N（默认 6，范围 1..12）",
     "include_repeat_number": "候选池是否保留上期特码；exclude_repeat_zodiac=True 时该号已被剔除",
     "repeat_number_weight": "**已停用（2026-10-09 降权去除）**：值仍被 clamp 接受并回显，但不参与选号 / 金额",
     "repeat_zodiac_weight": "**已停用（2026-10-09 降权去除）**：同上；同肖仍照常打标签",

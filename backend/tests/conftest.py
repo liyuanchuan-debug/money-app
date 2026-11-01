@@ -25,6 +25,8 @@ from __future__ import annotations
 import asyncpg
 import pytest
 
+from services.lottery import DEFAULT_SETTINGS
+
 
 @pytest.fixture(autouse=True)
 def force_memory_store(monkeypatch):
@@ -40,4 +42,7 @@ def force_memory_store(monkeypatch):
     # 因此正常用例（空串 → 直接返回 None）不受影响。
     monkeypatch.setattr(asyncpg, "create_pool", _blocked_create_pool)
     monkeypatch.setenv("DATABASE_URL", "")
+    # 产品默认开启「近期生肖硬过滤」；测试里默认关掉，避免短历史 / 冻结快照被收窄。
+    # 需要覆盖该开关的用例在 settings 里显式传 True（或临时 setitem 恢复）。
+    monkeypatch.setitem(DEFAULT_SETTINGS, "restrict_recent_zodiacs", False)
     yield

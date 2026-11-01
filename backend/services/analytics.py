@@ -45,6 +45,8 @@ from services.lottery import (
     classify_wave,
     derive_big_min,
     recommend,
+    resolve_allowed_zodiac_groups,
+    zodiac_group,
     zodiac_numbers as same_group_numbers,
 )
 from services.mark_six import (
@@ -677,13 +679,18 @@ def backtest_stats(
         prev_wave = outcome["prev_wave"]
         # 候选池与推荐引擎同口径：默认**保留**上期特码本身（重号，只降权不排除）；
         # ``include_repeat_number=False`` 时才回到旧的「排除最新号」；
-        # ``exclude_repeat_zodiac`` 开启时再排除整组同肖。
+        # ``exclude_repeat_zodiac`` 开启时再排除整组同肖；
+        # ``restrict_recent_zodiacs`` 开启时再只保留近期最新开出的 N 个生肖。
         # 实际特码落在池外时引擎不可能命中 —— 这构成命中率的理论上限。
         pool = set(range(NUMBER_MIN, NUMBER_MAX + 1))
         if not cfg.get("include_repeat_number", True):
             pool -= {latest}
         if cfg["exclude_repeat_zodiac"]:
             pool -= set(same_group_numbers(latest))
+        allowed_groups = resolve_allowed_zodiac_groups(cfg, history)
+        if allowed_groups is not None:
+            allowed_set = set(allowed_groups)
+            pool = {n for n in pool if zodiac_group(n) in allowed_set}
         available_sum += len(pool)
         if actual in pool:
             actual_in_pool_hits += 1
@@ -794,6 +801,8 @@ def backtest_stats(
                     "mode",
                     "pick_count",
                     "exclude_repeat_zodiac",
+                    "restrict_recent_zodiacs",
+                    "recent_zodiac_limit",
                     # 走势加权：扫描与单次回测都要如实回报生效值
                     "trend_bias",
                     "trend_window",
@@ -829,7 +838,13 @@ def backtest_stats(
             + (
                 "（当前开启避开重肖：池外含最新同肖整组。）"
                 if cfg["exclude_repeat_zodiac"]
-                else "（当前未避开重肖：池外仅含上期特码本身。）"
+                else "（当前未避开重肖。）"
+            )
+            + (
+                f"（当前开启近期生肖硬过滤：只保留最近开出的 "
+                f"{cfg['recent_zodiac_limit']} 个不重复生肖。）"
+                if cfg.get("restrict_recent_zodiacs")
+                else ""
             )
         ),
         "notes": notes,
@@ -1319,6 +1334,8 @@ WALK_FORWARD_AXES: dict[str, tuple[Any, ...]] = {
     "avoid_cold_days": (30, 60),
     "include_repeat_number": (True, False),
     "exclude_repeat_zodiac": (True, False),
+    "restrict_recent_zodiacs": (True, False),
+    "recent_zodiac_limit": (4, 6, 8),
     "score_w_focus": (0.0, 1.0, 2.0),
     "score_w_mid": (0.0, 2.0, 3.0),
     "score_w_omit": (-1.0, 0.0),

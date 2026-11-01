@@ -153,6 +153,15 @@ SOFT_WEIGHT_MIN = 0.0
 SOFT_WEIGHT_MAX = 1.0
 
 # --------------------------------------------------------------------------- #
+# 近期生肖硬过滤：预测号码必须落在「特码历史里最新出现过的 N 个不重复生肖」内。
+# 默认开启、N=6；关闭后候选池恢复为全号段（仍受重号/重肖开关约束）。
+# --------------------------------------------------------------------------- #
+DEFAULT_RESTRICT_RECENT_ZODIACS = True
+DEFAULT_RECENT_ZODIAC_LIMIT = 6
+RECENT_ZODIAC_LIMIT_MIN = 1
+RECENT_ZODIAC_LIMIT_MAX = ZODIAC_STEP
+
+# --------------------------------------------------------------------------- #
 # 角色金额配额（主推 / 次选 / 防守）
 #
 # 「均注」不再严格均分：先给每注保底 1 个注码单位（= 每注最低金额），剩余预算按
@@ -334,6 +343,8 @@ SAMPLING_SEED_SETTING_KEYS = (
     "normal_max",
     "exclude_repeat_zodiac",
     "include_repeat_number",
+    # 近期生肖硬过滤不进种子：开关 / 限额一变会改候选池成员，抽样结果本就会变；
+    # 再写入种子会让「关闭时」的种子哈希相对历史快照漂移，冻住的命中率守卫失真。
 )
 
 # --------------------------------------------------------------------------- #
@@ -479,6 +490,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "odds": DEFAULT_ODDS,
     # 避开重肖：默认关闭（同肖号可以入选）；旧数据缺失该字段时也回退为 False
     "exclude_repeat_zodiac": False,
+    # 近期生肖硬过滤：默认开启；预测号必须属于最近开出的 N 个不重复生肖
+    "restrict_recent_zodiacs": DEFAULT_RESTRICT_RECENT_ZODIACS,
+    "recent_zodiac_limit": DEFAULT_RECENT_ZODIAC_LIMIT,
     # 走势加权：已停用为选择权重；默认 neutral，窗口仅影响展示
     "trend_bias": TREND_BIAS_NEUTRAL,
     "trend_window": DEFAULT_TREND_WINDOW,
@@ -644,6 +658,18 @@ def clamp_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     merged["exclude_repeat_zodiac"] = coerce_bool(
         merged.get("exclude_repeat_zodiac"),
         default=bool(DEFAULT_SETTINGS["exclude_repeat_zodiac"]),
+    )
+    # 近期生肖硬过滤：缺失 / 脏值回退默认 True；限额钳到 1..12
+    merged["restrict_recent_zodiacs"] = coerce_bool(
+        merged.get("restrict_recent_zodiacs"),
+        default=bool(DEFAULT_SETTINGS["restrict_recent_zodiacs"]),
+    )
+    try:
+        recent_zodiac_limit = int(merged["recent_zodiac_limit"])
+    except (TypeError, ValueError):
+        recent_zodiac_limit = DEFAULT_RECENT_ZODIAC_LIMIT
+    merged["recent_zodiac_limit"] = min(
+        RECENT_ZODIAC_LIMIT_MAX, max(RECENT_ZODIAC_LIMIT_MIN, recent_zodiac_limit)
     )
 
     bias = str(merged.get("trend_bias") or "").strip().lower()
@@ -851,6 +877,63 @@ def with_derived_settings(cfg: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # 候选池
 # --------------------------------------------------------------------------- #
+def recent_special_zodiac_groups(
+    history_numbers: Sequence[int],
+    *,
+    limit: int = DEFAULT_RECENT_ZODIAC_LIMIT,
+) -> list[int]:
+    """从特码历史（最新在前）收集最近 ``limit`` 个不重复生肖分组键。
+
+    顺序 = 出现先后（最新开出的生肖排前）。样本不足 ``limit`` 个不同生肖时
+    返回已收集到的全部，不编造补齐。
+    """
+    try:
+        capped = int(limit)
+    except (TypeError, ValueError):
+        capped = DEFAULT_RECENT_ZODIAC_LIMIT
+    capped = min(RECENT_ZODIAC_LIMIT_MAX, max(RECENT_ZODIAC_LIMIT_MIN, capped))
+
+    seen: list[int] = []
+    seen_set: set[int] = set()
+    for raw in history_numbers:
+        try:
+            number = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if number < NUMBER_MIN or number > NUMBER_MAX:
+            continue
+        group = zodiac_group(number)
+        if group in seen_set:
+            continue
+        seen.append(group)
+        seen_set.add(group)
+        if len(seen) >= capped:
+            break
+    return seen
+
+
+def resolve_allowed_zodiac_groups(
+    cfg: Mapping[str, Any] | None,
+    history_numbers: Sequence[int],
+) -> list[int] | None:
+    """按设置解析候选池允许的生肖组；``None`` = 不限制。
+
+    开启但历史为空 / 无法解析出任何组时返回 ``None``（不把候选池清空）。
+    """
+    settings = cfg or DEFAULT_SETTINGS
+    if not coerce_bool(
+        settings.get("restrict_recent_zodiacs"),
+        default=bool(DEFAULT_SETTINGS["restrict_recent_zodiacs"]),
+    ):
+        return None
+    try:
+        limit = int(settings.get("recent_zodiac_limit", DEFAULT_RECENT_ZODIAC_LIMIT))
+    except (TypeError, ValueError):
+        limit = DEFAULT_RECENT_ZODIAC_LIMIT
+    groups = recent_special_zodiac_groups(history_numbers, limit=limit)
+    return groups if groups else None
+
+
 def build_candidate_pools(
     latest: int,
     small_max: int,
@@ -858,6 +941,7 @@ def build_candidate_pools(
     *,
     exclude_repeat_zodiac: bool = False,
     include_repeat_number: bool = False,
+    allowed_zodiac_groups: Sequence[int] | None = None,
 ) -> dict[str, list[dict[str, int]]]:
     """构造三类波动候选池。
 
@@ -866,14 +950,23 @@ def build_candidate_pools(
       即「上期出过的号不避开，但降权」。
     - ``exclude_repeat_zodiac=True``：排除最新号的全部同肖（重肖）号码；
       默认 ``False``：同肖号可以入选（只标记、不排除）。
+    - ``allowed_zodiac_groups``：非 ``None`` 时只保留这些生肖分组键内的号码
+      （「近期最新开过的 N 个生肖」硬过滤）；``None`` = 不限制。
     """
     latest_group = zodiac_group(latest)
+    allowed_set = (
+        {int(group) for group in allowed_zodiac_groups}
+        if allowed_zodiac_groups is not None
+        else None
+    )
     pools: dict[str, list[dict[str, int]]] = {wave: [] for wave in WAVE_ORDER}
 
     for number in range(NUMBER_MIN, NUMBER_MAX + 1):
         if number == latest and not include_repeat_number:
             continue
         if exclude_repeat_zodiac and zodiac_group(number) == latest_group:
+            continue
+        if allowed_set is not None and zodiac_group(number) not in allowed_set:
             continue
         diff = abs(number - latest)
         wave = classify_wave(diff, small_max, normal_max)
@@ -2910,6 +3003,7 @@ def recommend(
         else 0.0
     )
 
+    allowed_zodiac_groups = resolve_allowed_zodiac_groups(cfg, history)
     pools = build_candidate_pools(
         latest,
         cfg["small_max"],
@@ -2917,6 +3011,7 @@ def recommend(
         exclude_repeat_zodiac=bool(cfg["exclude_repeat_zodiac"]),
         # 上期出过的号不避开（只打「重号」信息标签），所以候选池保留重号
         include_repeat_number=bool(cfg["include_repeat_number"]),
+        allowed_zodiac_groups=allowed_zodiac_groups,
     )
     # 出现热度硬排除已停用：近 100 期未出现的号仍可进入财富密码（只打「冷号」信息标签）。
     heat_window = HEAT_ABSENT_WINDOW
@@ -3342,6 +3437,32 @@ def recommend(
         "（历史权重值 0.5 / 0.8 / 0.3 已停用；写入这些设置也不会改变选号或金额。）"
     )
 
+    # 近期生肖硬过滤：候选池只保留最近开出的 N 个不重复生肖
+    if allowed_zodiac_groups is not None:
+        limit_n = int(cfg["recent_zodiac_limit"])
+        zodiac_bits: list[str] = []
+        for group in allowed_zodiac_groups:
+            reference = int(group) + 1
+            code = (
+                zodiac_of(reference, zodiac_date) if zodiac_date is not None else None
+            )
+            label = zodiac_label(code)
+            zodiac_bits.append(label or f"组{group}")
+        notes.append(
+            f"近期生肖硬过滤已开启：预测号码必须属于最近开出的 "
+            f"{len(allowed_zodiac_groups)}/{limit_n} 个不重复生肖"
+            f"（{'、'.join(zodiac_bits)}）；其它生肖整组不入候选池。"
+            "这是样本内硬约束，不是概率，也不承诺提高命中率。"
+        )
+    elif bool(cfg["restrict_recent_zodiacs"]):
+        notes.append(
+            "近期生肖硬过滤已开启，但本池样本尚无法解析出生肖组，本期未收窄候选池。"
+        )
+    else:
+        notes.append(
+            "近期生肖硬过滤已关闭：候选池不按「最近开出的生肖」收窄。"
+        )
+
     # 角色金额配额（均注模式）：说明主推/次选/防守的分配口径
     if mode == MODE_EVEN and not role_weights_are_uniform(role_weights):
         role_text = "、".join(
@@ -3484,6 +3605,29 @@ def recommend(
             "applied": False,
             "excluded_count": 0,
             "excluded_numbers": sorted(heat_absent),
+        },
+        # 近期生肖硬过滤摘要（只增不改）：enabled + 实际生效的分组键 / 汉字
+        "recent_zodiacs": {
+            "enabled": bool(cfg["restrict_recent_zodiacs"]),
+            "limit": int(cfg["recent_zodiac_limit"]),
+            "applied": allowed_zodiac_groups is not None,
+            "groups": list(allowed_zodiac_groups or []),
+            "codes": [
+                (
+                    zodiac_of(int(group) + 1, zodiac_date)
+                    if zodiac_date is not None
+                    else None
+                )
+                for group in (allowed_zodiac_groups or [])
+            ],
+            "labels": [
+                zodiac_label(
+                    zodiac_of(int(group) + 1, zodiac_date)
+                    if zodiac_date is not None
+                    else None
+                )
+                for group in (allowed_zodiac_groups or [])
+            ],
         },
         "avoid_cold": {
             "enabled": cold_enabled,

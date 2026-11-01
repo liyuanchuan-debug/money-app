@@ -91,6 +91,7 @@ from services.lottery import (
     predict_wave_band,
     recent_number_frequency,
     recommend,
+    resolve_allowed_zodiac_groups,
     resolve_zodiac_date,
     role_amount_weights,
     soft_penalty_weight,
@@ -370,6 +371,9 @@ def _engine_ranking(
         cfg["normal_max"],
         exclude_repeat_zodiac=bool(cfg["exclude_repeat_zodiac"]),
         include_repeat_number=bool(cfg["include_repeat_number"]),
+        allowed_zodiac_groups=resolve_allowed_zodiac_groups(
+            cfg, ctx.get("history") or []
+        ),
     )
     cold_enabled = bool(cfg["avoid_cold_enabled"])
     ordered = {
@@ -563,6 +567,7 @@ def _coverage(
     cfg: dict[str, Any],
     latest: int,
     zodiac_date: date | None,
+    history_numbers: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     picks = sorted({int(n) for n in numbers})
     pools = build_candidate_pools(
@@ -571,6 +576,9 @@ def _coverage(
         cfg["normal_max"],
         exclude_repeat_zodiac=bool(cfg["exclude_repeat_zodiac"]),
         include_repeat_number=bool(cfg["include_repeat_number"]),
+        allowed_zodiac_groups=resolve_allowed_zodiac_groups(
+            cfg, history_numbers or []
+        ),
     )
     universe = sorted({int(row["number"]) for rows in pools.values() for row in rows})
     universe_set = set(universe)
@@ -972,6 +980,7 @@ def build_ticket(
         cfg=cfg,
         latest=latest,
         zodiac_date=ctx["zodiac_date"],
+        history_numbers=history,
     )
     in_sample = _in_sample(draws_asc, cfg)
     honest = _honest_footer(

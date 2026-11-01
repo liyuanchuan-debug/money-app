@@ -178,36 +178,36 @@ VERDICT_LABELS: dict[str, str] = {
 # PRNG 抽出。因此下面的引用描述的是**新机制**，旧门控路径（wave_pass_order 以
 # lattice_primary 开头）已从 recommend 中移除。
 LATTICE_CODE_PATH: dict[str, str] = {
-    "band": "services/lottery.py:1003-1049  predict_wave_band：近窗相邻差值的 P25/P50/P75 → "
+    "band": "services/lottery.py:1173-1240  predict_wave_band：近窗相邻差值的 P25/P50/P75 → "
             "预测波动带（样本内经验分布，不是真实概率）",
-    "lattice_weight": "services/lottery.py:1051-1065  lattice_weight：带内 1.0、带外 1/(1+距离/6)"
+    "lattice_weight": "services/lottery.py:1357-1371  lattice_weight：带内 1.0、带外 1/(1+距离/6)"
                       "（**只当抽样概率**，不再当排序键）",
-    "primary_wave": "services/lottery.py:1067-1089  lattice_primary_wave = 预测带中心所在的波动桶"
+    "primary_wave": "services/lottery.py:1373-1395  lattice_primary_wave = 预测带中心所在的波动桶"
                     "（**仅展示**：前端徽章 / 文案，不参与取号）",
-    "pass_order": "services/lottery.py:2618-2705  取号分派（**旧门控已移除**）：不再有以 lattice_primary "
-                  "开头的 wave_pass_order；balanced 走配额内抽样（2629-2670 期号种子随机 / "
-                  "2671-2689 确定性名次），drain 走旧逐桶取满",
-    "round_robin": "services/lottery.py:2671-2689  ranked 口径：按配额逐桶轮转，桶内取「离已选号码最远」的号",
-    "drain": "services/lottery.py:2690-2705  旧 drain 口径：固定按 WAVE_ORDER 逐桶取满（仅历史审计复现）",
-    "neutral_take": "services/lottery.py:2589-2599  _take_one 恒取 ordered_pools[wave][0]（走势加权已停用）",
-    "role_take": "services/lottery.py:2589-2599  角色带取号路径已移除（trend_bias 不再参与选号；带仅展示）",
-    "spread_take": "services/lottery.py:2601-2615  _take_spread_one ranked：池内取最分散的号（忽略角色带）",
-    "sort_prefix": "services/lottery.py:1340-1355  _trend_sort_prefix 仍供展示带切分；"
-                   "services/lottery.py:1358-1404 order_pool **已忽略**走势前缀（避冷 → 遗漏 → 回落）",
-    "band_rank": "services/lottery.py:1177-1259  _band_rank_prefix / split_pool_into_role_bands "
+    "pass_order": "services/lottery.py:3162-3251  取号分派（**旧门控已移除**）：不再有以 lattice_primary "
+                  "开头的 wave_pass_order；balanced 走配额内抽样（3175-3216 期号种子随机 / "
+                  "3217-3235 确定性名次），drain 走旧逐桶取满",
+    "round_robin": "services/lottery.py:3217-3235  ranked 口径：按配额逐桶轮转，桶内取「离已选号码最远」的号",
+    "drain": "services/lottery.py:3236-3251  旧 drain 口径：固定按 WAVE_ORDER 逐桶取满（仅历史审计复现）",
+    "neutral_take": "services/lottery.py:3133-3143  _take_one 恒取 ordered_pools[wave][0]（走势加权已停用）",
+    "role_take": "services/lottery.py:3133-3143  角色带取号路径已移除（trend_bias 不再参与选号；带仅展示）",
+    "spread_take": "services/lottery.py:3145-3160  _take_spread_one ranked：池内取最分散的号（忽略角色带）",
+    "sort_prefix": "services/lottery.py:1761-1776  _trend_sort_prefix 仍供展示带切分；"
+                   "services/lottery.py:1779-1825 order_pool **已忽略**走势前缀（避冷 → 遗漏 → 回落）",
+    "band_rank": "services/lottery.py:1598-1680  _band_rank_prefix / split_pool_into_role_bands "
                  "仅供 trend_distributions 展示切片；选号不再消费",
-    "sampling": "services/lottery.py:1488-1540  sampling_seed_key；"
-                "services/lottery.py:1546-1561 trend_sampling_weight 恒 1.0；"
-                "services/lottery.py:1564-1588 bucket_sampling_weight = 点阵 × 避冷 × 走势(恒1)；"
-                "services/lottery.py:1591-1630 weighted_sample_distinct",
-    "quotas": "services/lottery.py:1455-1482  balanced_wave_quotas 按非空桶均分注数（最大余额法，10 注 → 4/3/3）",
-    "pool": "services/lottery.py:801-830  build_candidate_pools 只按重号 / 重肖剔除，"
+    "sampling": "services/lottery.py:2004-2056  sampling_seed_key；"
+                "services/lottery.py:2062-2077 trend_sampling_weight 恒 1.0；"
+                "services/lottery.py:2080-2104 bucket_sampling_weight = 点阵 × 避冷 × 走势(恒1)；"
+                "services/lottery.py:2107-2146 weighted_sample_distinct",
+    "quotas": "services/lottery.py:1917-1944  balanced_wave_quotas 按非空桶均分注数（最大余额法，10 注 → 4/3/3）",
+    "pool": "services/lottery.py:937-990  build_candidate_pools 按重号 / 重肖 / 近期生肖硬过滤剔除，"
             "normal_max 仅决定 classify_wave 的分桶（不缩小并集）",
-    "classify": "services/lottery.py:543-551  classify_wave(diff, small_max, normal_max)",
-    "soft_flags": "services/lottery.py:926-956  soft_flags 只产出信息标签；"
-                  "services/lottery.py:959-986 soft_penalty_weight 恒返回 1.0（权重参数被忽略）；"
-                  "services/lottery.py:1118-1156 apply_soft_weights 保留为纯工具（线上引擎不再调用）",
-    "ticket_mirror": "services/pick_ticket.py:356-390  出票单镜像同一排序口径"
+    "classify": "services/lottery.py:602-610  classify_wave(diff, small_max, normal_max)",
+    "soft_flags": "services/lottery.py:1096-1126  soft_flags 只产出信息标签；"
+                  "services/lottery.py:1129-1156 soft_penalty_weight 恒返回 1.0（权重参数被忽略）；"
+                  "services/lottery.py:1539-1577 apply_soft_weights 保留为纯工具（线上引擎不再调用）",
+    "ticket_mirror": "services/pick_ticket.py:357-390  出票单镜像同一排序口径"
                      "（点阵不再参与排序；不在回测路径内）",
 }
 
@@ -1159,14 +1159,23 @@ def _pick_wave_mix(
 def _candidate_pool_sizes(
     rows: Sequence[Mapping[str, Any]], cfg: Mapping[str, Any]
 ) -> dict[str, int]:
+    from services.lottery import resolve_allowed_zodiac_groups, zodiac_group
+
     sizes = set()
     for row in rows:
         latest = int(row["latest_used"])
+        # 回测行只带 latest_used；近期生肖过滤需要「截至该期之前」的特码序列，
+        # 此处没有完整 history 时退化为不按生肖收窄（与引擎「无组可解析则不收窄」一致）。
+        history = row.get("history_numbers") or []
         pool = set(range(NUMBER_MIN, NUMBER_MAX + 1))
         if not cfg.get("include_repeat_number", True):
             pool -= {latest}
         if cfg.get("exclude_repeat_zodiac"):
             pool -= set(zodiac_numbers(latest))
+        allowed_groups = resolve_allowed_zodiac_groups(cfg, history)
+        if allowed_groups is not None:
+            allowed_set = set(allowed_groups)
+            pool = {n for n in pool if zodiac_group(n) in allowed_set}
         sizes.add(len(pool))
     return {"min": min(sizes), "max": max(sizes), "distinct": sorted(sizes)}
 
@@ -1329,25 +1338,26 @@ def mechanism_note() -> str:
     """
     return (
         "点阵已从「硬门控」改为「抽样概率分布」：开启时它只决定带内号码的"
-        "**抽样概率更高**（services/lottery.py:1488-1540 的 sampling_seed_key → "
-        "services/lottery.py:1564-1588 的 bucket_sampling_weight → "
-        "services/lottery.py:1591-1630 的 weighted_sample_distinct），不再决定取号顺序；"
+        "**抽样概率更高**（services/lottery.py:2004-2056 的 sampling_seed_key → "
+        "services/lottery.py:2080-2104 的 bucket_sampling_weight → "
+        "services/lottery.py:2107-2146 的 weighted_sample_distinct），不再决定取号顺序；"
         "旧口径里以 ``lattice_primary`` 开头把该桶一次性取满的 wave_pass_order 循环"
-        "已从 recommend 移除（services/lottery.py:2618-2705）。因此「开 / 关」比较的是"
+        "已从 recommend 移除（services/lottery.py:3162-3251）。因此「开 / 关」比较的是"
         "同一形状下的两条不同抽样概率：开启时带内号码被抽到的频率更高，关闭时桶内概率均匀。"
-        "取号形状改由 balanced 配额定型（services/lottery.py:1455-1482 最大余额法均分注数，"
+        "取号形状改由 balanced 配额定型（services/lottery.py:1917-1944 最大余额法均分注数，"
         "10 注 → 4/3/3），ranked 模式下桶内按确定性名次取号"
-        "（services/lottery.py:2671-2689），两种模式都不再让点阵独占某一个波动桶。"
+        "（services/lottery.py:3217-3235），两种模式都不再让点阵独占某一个波动桶。"
         "``lattice_primary`` 现在只作**展示**：告诉前端预测带中心落在哪个桶"
-        "（services/lottery.py:1067-1089）。"
+        "（services/lottery.py:1373-1395）。"
         "``trend_bias`` / ``trend_window`` 已**停用为选择权重**（与三类软降权同模式）："
         "``trend_sampling_weight`` 恒 1.0，``order_pool`` 不吃走势前缀，取号恒走池首 / "
         "配额内点阵抽样；``effective_trend_bias`` 恒回退 neutral。"
         "键仍接受，``trend_distributions`` / ``trend_count`` 仍作展示对照。"
-        "``normal_max`` 也**不**把号码踢出候选池（services/lottery.py:801-830 只按重号 / 重肖剔除），"
-        "它只改分桶归属（services/lottery.py:543-551）与配额分配。"
+        "``normal_max`` 也**不**把号码踢出候选池（services/lottery.py:937-990 按重号 / 重肖 / "
+        "近期生肖硬过滤剔除），"
+        "它只改分桶归属（services/lottery.py:602-610）与配额分配。"
         "三类软降权（重号 / 同肖 / 冷号）已**去除权重**，只留信息标签"
-        "（services/lottery.py:926-956 soft_flags；services/lottery.py:959-986 "
+        "（services/lottery.py:1096-1126 soft_flags；services/lottery.py:1129-1156 "
         "soft_penalty_weight 恒返回 1.0）。"
     )
 

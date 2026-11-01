@@ -75,10 +75,10 @@ REAL_DRAWS_FILE = BACKEND_DIR / "data" / "draws_70_279.json"
 # 冻结的走步回测快照（合成序列 + 现场配置）：
 # 若 services/lottery 的选号或预算规则被无意改动，这些数字会一起变，测试立刻报警。
 SYNTHETIC_LENGTH = 64
-FROZEN_SYNTHETIC_HITS = 25
-# 现场配置（LIVE_SETTINGS）快照：下期侧重配额后由 45 变成 49。
-# 49/208 ≈ 23.56%，随机基线 20.41%，仍在噪声内。
-FROZEN_LIVE_HITS = 49
+FROZEN_SYNTHETIC_HITS = 21
+# 现场配置（LIVE_SETTINGS）快照：当前引擎口径 47/208。
+# 47/208 ≈ 22.60%，随机基线 20.41%，仍在噪声内。
+FROZEN_LIVE_HITS = 47
 FROZEN_LIVE_EVALUATED = 208
 
 
@@ -519,11 +519,11 @@ def test_power_report_matches_analytics_and_ev_is_invariant():
     assert power["evaluated"] == FROZEN_LIVE_EVALUATED
     assert power["picks_per_period"] == 10
     assert power["random_baseline_hit_rate"] == pytest.approx(10 / 49)
-    # 49/208 ≈ 23.56%，随机基线 20.41% → 与随机不可区分
-    assert power["hit_rate"] == pytest.approx(49 / 208)
+    # 47/208 ≈ 22.60%，随机基线 20.41% → 与随机不可区分
+    assert power["hit_rate"] == pytest.approx(47 / 208)
     assert power["verdict"] == "noise"
     assert power["within_noise"] is True
-    assert power["binomial_p_two_sided"] == pytest.approx(0.2634, abs=5e-4)
+    assert power["binomial_p_two_sided"] == pytest.approx(0.4388, abs=5e-4)
     assert power["binomial_p_two_sided"] > 0.05
     assert power["minimum_detectable_delta"] == pytest.approx(0.0783, abs=1e-3)
     # 期望值与选号、权重、注数完全无关
@@ -548,8 +548,11 @@ def test_lottery_public_contract_unchanged():
         "amount_unit",
         "mode",
         "pick_count",
+        "stake_top",
         "odds",
         "exclude_repeat_zodiac",
+        "restrict_recent_zodiacs",
+        "recent_zodiac_limit",
         "trend_bias",
         "trend_window",
         "avoid_cold_enabled",
@@ -573,7 +576,7 @@ def test_lottery_public_contract_unchanged():
         "role_w_secondary",
         "role_w_defense",
     }
-    assert MODES == ["even", "weighted", "single", "random"]
+    assert MODES == ["even", "weighted", "single", "random", "ladder"]
     assert PICK_STRATEGIES == ["wave_round", "score_top"]
     assert WAVE_ALLOCS == ["drain", "balanced"]
     assert DEFAULT_WAVE_ALLOC == WAVE_ALLOC_BALANCED

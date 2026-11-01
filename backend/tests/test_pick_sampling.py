@@ -43,6 +43,8 @@ PRODUCTION_LIKE = {
     "normal_max": 30,
     "trend_bias": "neutral",
     "exclude_repeat_zodiac": False,
+    # 抽样对照用例钉死关闭，避免默认硬过滤改变池大小干扰断言
+    "restrict_recent_zodiacs": False,
     "pick_count": 10,
     "amount_unit": 5,
     "total_amount": 50,
