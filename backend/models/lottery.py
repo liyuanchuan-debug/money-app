@@ -9,6 +9,8 @@ from services.lottery import (
     AVOID_COLD_DAYS_MIN,
     LATTICE_WINDOW_MAX,
     LATTICE_WINDOW_MIN,
+    MAX_OUTSIDE_RECENT_ZODIACS_MAX,
+    MAX_OUTSIDE_RECENT_ZODIACS_MIN,
     MODE_PATTERN,
     NUMBER_MAX,
     NUMBER_MIN,
@@ -52,10 +54,12 @@ class SettingsOut(BaseModel):
     odds: float
     # 避开重肖：True=候选池排除最新同肖；默认 False
     exclude_repeat_zodiac: bool
-    # 近期生肖硬过滤：True=预测号必须属于最近开出的 N 个不重复生肖；默认 True
+    # 近期生肖规则：True=启用核心集 + 肖外配额；默认 True
     restrict_recent_zodiacs: bool
-    # 近期生肖个数上限（1..12）；默认 4（8 码最多落在 4 个生肖）
+    # 近期生肖核心集个数（1..12）；默认 6
     recent_zodiac_limit: int
+    # 核心集外最多允许几个号（0=硬收窄池；默认 2）
+    max_outside_recent_zodiacs: int
     # 上期出过的号（重号）是否保留在候选池：True=不避开、只降权（默认）
     include_repeat_number: bool
     # 三类软降权权重（0..1；1.0 = 不降权）
@@ -124,13 +128,19 @@ class SettingsPatch(BaseModel):
     )
     restrict_recent_zodiacs: bool | None = Field(
         default=None,
-        description="True=预测号必须属于最近开出的 N 个不重复生肖；默认 True",
+        description="True=启用近期生肖核心集 + 肖外配额；默认 True",
     )
     recent_zodiac_limit: int | None = Field(
         default=None,
         ge=RECENT_ZODIAC_LIMIT_MIN,
         le=RECENT_ZODIAC_LIMIT_MAX,
-        description="近期生肖个数上限（1..12）；默认 4（8 码最多落在 4 个生肖）",
+        description="近期生肖核心集个数（1..12）；默认 6",
+    )
+    max_outside_recent_zodiacs: int | None = Field(
+        default=None,
+        ge=MAX_OUTSIDE_RECENT_ZODIACS_MIN,
+        le=MAX_OUTSIDE_RECENT_ZODIACS_MAX,
+        description="核心集外最多允许几个号（0=硬收窄池；默认 2）",
     )
     include_repeat_number: bool | None = Field(
         default=None,

@@ -18,11 +18,13 @@ export interface LotterySettings {
   /** 避开重肖：true=候选池排除最新同肖；默认 false */
   exclude_repeat_zodiac: boolean
   /**
-   * 近期生肖硬过滤：true=预测号必须属于最近开出的 N 个不重复生肖；默认 true。
+   * 近期生肖规则：true=启用核心集（最新 N 肖）+ 肖外配额；默认 true。
    */
   restrict_recent_zodiacs: boolean
-  /** 近期生肖个数上限（1..12）；默认 4（8 码最多落在 4 个生肖） */
+  /** 近期生肖核心集个数（1..12）；默认 6 */
   recent_zodiac_limit: number
+  /** 核心集外最多允许几个号（0=硬收窄池；默认 2） */
+  max_outside_recent_zodiacs: number
   /**
    * 上期出过的号（重号）是否保留在候选池：true=不避开、只降权（默认）。
    * false 才是旧的「排除上期特码本身」。
@@ -101,6 +103,7 @@ export interface LotterySettingsPatch {
   exclude_repeat_zodiac?: boolean
   restrict_recent_zodiacs?: boolean
   recent_zodiac_limit?: number
+  max_outside_recent_zodiacs?: number
   include_repeat_number?: boolean
   repeat_number_weight?: number
   repeat_zodiac_weight?: number
@@ -136,6 +139,8 @@ export interface Pick {
   is_repeat_zodiac: boolean
   /** 上期出过的号（重号）：不避开、只降权，命中时前端标「重号」 */
   is_repeat_number?: boolean
+  /** 是否落在「最新 N 肖」核心集之外（近期生肖规则关闭时恒 false） */
+  is_outside_recent_zodiac?: boolean
   /** 冷号：本池样本内最近 stale_periods 期没出现过（降权，不排除） */
   is_stale?: boolean
   /** 本池样本内距最近一次出现的**期数**（0=最新一期就是它；null=样本内从未出现） */
@@ -843,11 +848,14 @@ export const STALE_PERIODS_MIN = 1
 export const STALE_PERIODS_MAX = 999
 /** 冷号降权系数默认值 */
 export const STALE_WEIGHT_DEFAULT = 0.3
-/** 近期生肖硬过滤：默认开启；预测号必须属于最近开出的 N 个不重复生肖（默认 4） */
+/** 近期生肖规则：默认开启；核心集 = 最新 N 肖（默认 6），肖外最多 M 个（默认 2） */
 export const RESTRICT_RECENT_ZODIACS_DEFAULT = true
-export const RECENT_ZODIAC_LIMIT_DEFAULT = 4
+export const RECENT_ZODIAC_LIMIT_DEFAULT = 6
 export const RECENT_ZODIAC_LIMIT_MIN = 1
 export const RECENT_ZODIAC_LIMIT_MAX = 12
+export const MAX_OUTSIDE_RECENT_ZODIACS_DEFAULT = 2
+export const MAX_OUTSIDE_RECENT_ZODIACS_MIN = 0
+export const MAX_OUTSIDE_RECENT_ZODIACS_MAX = 10
 /** 每注最低金额（元）：所有模式下每一注的实际金额都不得低于它 */
 export const MIN_BET_AMOUNT = 5
 /** 最大投注金额上下限（元） */

@@ -153,14 +153,21 @@ SOFT_WEIGHT_MIN = 0.0
 SOFT_WEIGHT_MAX = 1.0
 
 # --------------------------------------------------------------------------- #
-# 近期生肖硬过滤：预测号码必须落在「特码历史里最新出现过的 N 个不重复生肖」内。
-# 默认开启、N=4（8 码预测最多落在 4 个生肖）；关闭后候选池恢复为全号段
-# （仍受重号/重肖开关约束）。
+# 近期生肖规则（默认开启）
+#
+# - 核心集 = 特码历史上最新开出的 N 个不重复生肖（默认 N=6）；
+# - 肖外配额 = 8 码里最多允许 M 个落在核心集之外的号（默认 M=2）；
+# - M=0 时退化为旧「硬过滤」：候选池只保留核心集生肖；
+# - M>0 时候选池不收窄，取号过程中肖外满额后只允许核心集。
+# 关闭后候选池恢复为全号段（仍受重号/重肖开关约束）。
 # --------------------------------------------------------------------------- #
 DEFAULT_RESTRICT_RECENT_ZODIACS = True
-DEFAULT_RECENT_ZODIAC_LIMIT = 4
+DEFAULT_RECENT_ZODIAC_LIMIT = 6
 RECENT_ZODIAC_LIMIT_MIN = 1
 RECENT_ZODIAC_LIMIT_MAX = ZODIAC_STEP
+DEFAULT_MAX_OUTSIDE_RECENT_ZODIACS = 2
+MAX_OUTSIDE_RECENT_ZODIACS_MIN = 0
+MAX_OUTSIDE_RECENT_ZODIACS_MAX = PICK_COUNT_MAX
 
 # --------------------------------------------------------------------------- #
 # 角色金额配额（主推 / 次选 / 防守）
@@ -491,10 +498,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "odds": DEFAULT_ODDS,
     # 避开重肖：默认关闭（同肖号可以入选）；旧数据缺失该字段时也回退为 False
     "exclude_repeat_zodiac": False,
-    # 近期生肖硬过滤：默认开启；预测号必须属于最近开出的 N 个不重复生肖
-    # （默认 N=4 → 8 码最多落在 4 个生肖）
+    # 近期生肖：默认开启；核心集 = 最新 N 肖（默认 6），肖外最多 M 个（默认 2）
     "restrict_recent_zodiacs": DEFAULT_RESTRICT_RECENT_ZODIACS,
     "recent_zodiac_limit": DEFAULT_RECENT_ZODIAC_LIMIT,
+    "max_outside_recent_zodiacs": DEFAULT_MAX_OUTSIDE_RECENT_ZODIACS,
     # 走势加权：已停用为选择权重；默认 neutral，窗口仅影响展示
     "trend_bias": TREND_BIAS_NEUTRAL,
     "trend_window": DEFAULT_TREND_WINDOW,
@@ -661,7 +668,7 @@ def clamp_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         merged.get("exclude_repeat_zodiac"),
         default=bool(DEFAULT_SETTINGS["exclude_repeat_zodiac"]),
     )
-    # 近期生肖硬过滤：缺失 / 脏值回退默认 True；限额钳到 1..12
+    # 近期生肖：缺失 / 脏值回退默认 True；N 钳到 1..12；肖外配额 M 钳到 0..注数上限
     merged["restrict_recent_zodiacs"] = coerce_bool(
         merged.get("restrict_recent_zodiacs"),
         default=bool(DEFAULT_SETTINGS["restrict_recent_zodiacs"]),
@@ -672,6 +679,14 @@ def clamp_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         recent_zodiac_limit = DEFAULT_RECENT_ZODIAC_LIMIT
     merged["recent_zodiac_limit"] = min(
         RECENT_ZODIAC_LIMIT_MAX, max(RECENT_ZODIAC_LIMIT_MIN, recent_zodiac_limit)
+    )
+    try:
+        max_outside = int(merged["max_outside_recent_zodiacs"])
+    except (TypeError, ValueError):
+        max_outside = DEFAULT_MAX_OUTSIDE_RECENT_ZODIACS
+    merged["max_outside_recent_zodiacs"] = min(
+        MAX_OUTSIDE_RECENT_ZODIACS_MAX,
+        max(MAX_OUTSIDE_RECENT_ZODIACS_MIN, max_outside),
     )
 
     bias = str(merged.get("trend_bias") or "").strip().lower()
@@ -914,13 +929,13 @@ def recent_special_zodiac_groups(
     return seen
 
 
-def resolve_allowed_zodiac_groups(
+def resolve_core_zodiac_groups(
     cfg: Mapping[str, Any] | None,
     history_numbers: Sequence[int],
 ) -> list[int] | None:
-    """按设置解析候选池允许的生肖组；``None`` = 不限制。
+    """解析近期生肖**核心集**（最新 N 个不重复生肖）；``None`` = 规则未启用。
 
-    开启但历史为空 / 无法解析出任何组时返回 ``None``（不把候选池清空）。
+    开启但历史为空 / 无法解析出任何组时返回 ``None``（不把候选池清空、不卡住取号）。
     """
     settings = cfg or DEFAULT_SETTINGS
     if not coerce_bool(
@@ -934,6 +949,41 @@ def resolve_allowed_zodiac_groups(
         limit = DEFAULT_RECENT_ZODIAC_LIMIT
     groups = recent_special_zodiac_groups(history_numbers, limit=limit)
     return groups if groups else None
+
+
+def resolve_max_outside_recent_zodiacs(cfg: Mapping[str, Any] | None) -> int:
+    """肖外配额 M：核心集之外最多允许几个号；脏值回退默认 2，钳到 0..注数上限。"""
+    settings = cfg or DEFAULT_SETTINGS
+    try:
+        value = int(
+            settings.get(
+                "max_outside_recent_zodiacs",
+                DEFAULT_MAX_OUTSIDE_RECENT_ZODIACS,
+            )
+        )
+    except (TypeError, ValueError):
+        value = DEFAULT_MAX_OUTSIDE_RECENT_ZODIACS
+    return min(
+        MAX_OUTSIDE_RECENT_ZODIACS_MAX,
+        max(MAX_OUTSIDE_RECENT_ZODIACS_MIN, value),
+    )
+
+
+def resolve_allowed_zodiac_groups(
+    cfg: Mapping[str, Any] | None,
+    history_numbers: Sequence[int],
+) -> list[int] | None:
+    """候选池硬收窄用的生肖组；``None`` = 不收窄池。
+
+    仅当近期生肖规则开启 **且** 肖外配额 M=0 时返回核心集（旧硬过滤）。
+    M>0 时池保持全号段，改在取号阶段执行「最多 M 个肖外」。
+    """
+    core = resolve_core_zodiac_groups(cfg, history_numbers)
+    if core is None:
+        return None
+    if resolve_max_outside_recent_zodiacs(cfg) > 0:
+        return None
+    return core
 
 
 def build_candidate_pools(
@@ -3005,6 +3055,12 @@ def recommend(
         else 0.0
     )
 
+    # 近期生肖：核心集（最新 N 肖）用于取号配额；硬收窄池仅在 M=0 时发生
+    core_zodiac_groups = resolve_core_zodiac_groups(cfg, history)
+    core_zodiac_set = set(core_zodiac_groups) if core_zodiac_groups is not None else None
+    max_outside_recent = (
+        resolve_max_outside_recent_zodiacs(cfg) if core_zodiac_set is not None else 0
+    )
     allowed_zodiac_groups = resolve_allowed_zodiac_groups(cfg, history)
     pools = build_candidate_pools(
         latest,
@@ -3076,6 +3132,8 @@ def recommend(
 
     picks: list[dict[str, Any]] = []
     used_numbers: set[int] = set()
+    # 肖外已取个数（相对核心集）；满 max_outside_recent 后只允许核心集号
+    outside_recent_picked = 0
     pick_strategy = str(cfg.get("pick_strategy") or DEFAULT_PICK_STRATEGY)
     if pick_strategy not in PICK_STRATEGIES:
         pick_strategy = DEFAULT_PICK_STRATEGY
@@ -3088,8 +3146,20 @@ def recommend(
         pick_sampling = DEFAULT_PICK_SAMPLING
     score_weights = clamp_score_weights(cfg)
 
-    def _annex_pick(wave: str, item: dict[str, Any], *, score: float | None = None) -> None:
+    def _is_outside_recent(number: int) -> bool:
+        return core_zodiac_set is not None and zodiac_group(number) not in core_zodiac_set
+
+    def _eligible_recent(number: int) -> bool:
+        if not _is_outside_recent(number):
+            return True
+        return outside_recent_picked < max_outside_recent
+
+    def _annex_pick(wave: str, item: dict[str, Any], *, score: float | None = None) -> bool:
+        nonlocal outside_recent_picked
         number = int(item["number"])
+        if number in used_numbers or not _eligible_recent(number):
+            return False
+        outside = _is_outside_recent(number)
         used_numbers.add(number)
         # 从有序池里摘掉，避免后续再取到同一号
         ordered_pools[wave] = [
@@ -3108,22 +3178,31 @@ def recommend(
             # 号码 → 生肖的固定映射（随农历年轮转）；没有农历年时为 null
             "zodiac": pick_zodiac,
             "zodiac_label": zodiac_label(pick_zodiac),
+            # 是否落在「最新 N 肖」核心集之外（规则关闭时恒 False）
+            "is_outside_recent_zodiac": outside,
         }
         if score is not None:
             row["score"] = float(score)
         picks.append(row)
+        if outside:
+            outside_recent_picked += 1
+        return True
 
     if pick_strategy == PICK_STRATEGY_SCORE_TOP:
         # 打分 Top-N：跨波动桶统一取分最高的 N 个（只改集合，不改金额规则）
+        # 逐号 annex，尊重肖外配额（满额后跳过肖外候选继续往下取）
         for selected in select_score_top_candidates(
             pools,
-            pick_count=pick_count,
+            # 多取候选再按肖外配额过滤，避免 Top-N 全是肖外时凑不满注数
+            pick_count=NUMBER_MAX,
             focus=focus,
             trend_counts=trend_counts,
             mid_target=mid_target,
             days_since_last=days_since_last,
             weights=score_weights,
         ):
+            if len(picks) >= pick_count:
+                break
             wave = str(selected["wave_type"])
             _annex_pick(
                 wave,
@@ -3135,14 +3214,14 @@ def recommend(
         def _take_one(wave: str, preferred_role: str | None = None) -> bool:
             """从该波动桶取一个号（返回是否取到）。
 
-            「近期走势加权去掉」后恒取池内第一个（池已按「避冷 → 遗漏」排好）；
+            「近期走势加权去掉」后按池内顺序取第一个**仍符合肖外配额**的号；
             ``preferred_role`` / 角色带不再参与选号（参数保留仅兼容旧调用形）。
             """
             _ = preferred_role  # 走势加权已停用：角色带偏好不再取号
-            if not ordered_pools[wave]:
-                return False
-            _annex_pick(wave, ordered_pools[wave][0])
-            return True
+            for item in ordered_pools[wave]:
+                if _annex_pick(wave, item):
+                    return True
+            return False
 
         def _take_spread_one(wave: str, preferred_role: str | None = None) -> bool:
             """均衡分配 + ranked 专用：从该波动桶取**离已选号码最远**的一个号。
@@ -3150,16 +3229,20 @@ def recommend(
             「近期走势加权去掉」后候选恒为池内既有排序；只把「取池首」换成
             「取最分散的一个」；并列时取池内靠前者，因此仍然确定、可复现。
             ``used_numbers`` 为空时等价于取池首。``preferred_role`` 被忽略。
+            候选会先按肖外配额过滤。
             """
             _ = preferred_role  # 走势加权已停用：角色带偏好不再取号
-            if not ordered_pools[wave]:
+            candidates = [
+                item
+                for item in ordered_pools[wave]
+                if _eligible_recent(int(item["number"]))
+            ]
+            if not candidates:
                 return False
-            candidates = list(ordered_pools[wave])
             index = pick_most_spread(
                 [int(item["number"]) for item in candidates], used_numbers
             )
-            _annex_pick(wave, candidates[index])
-            return True
+            return _annex_pick(wave, candidates[index])
 
         # 取号分派（「随机分布选号」）：
         #   balanced + seeded_random（默认）= 配额内按点阵概率的**期号种子随机**抽样；
@@ -3187,31 +3270,35 @@ def recommend(
                     quota = int(quotas[wave])
                     if quota <= 0:
                         continue
-                    weighted: list[tuple[int, float]] = []
+                    weight_by_number: dict[int, float] = {}
                     for item in ordered_pools[wave]:
                         number = int(item["number"])
-                        weighted.append(
-                            (
+                        weight_by_number[number] = bucket_sampling_weight(
+                            number,
+                            lattice_scores=lattice_scores,
+                            # 避冷仍然生效：冷号概率被压低（不排除）
+                            cold_weight=avoid_cold_weight(
+                                days_since_last.get(number),
+                                enabled=cold_enabled,
+                                threshold=cold_days,
+                            ),
+                            trend_weight=trend_sampling_weight(
                                 number,
-                                bucket_sampling_weight(
-                                    number,
-                                    lattice_scores=lattice_scores,
-                                    # 避冷仍然生效：冷号概率被压低（不排除）
-                                    cold_weight=avoid_cold_weight(
-                                        days_since_last.get(number),
-                                        enabled=cold_enabled,
-                                        threshold=cold_days,
-                                    ),
-                                    trend_weight=trend_sampling_weight(
-                                        number,
-                                        bias=trend_bias,
-                                        trend_counts=trend_counts,
-                                        mid_target=mid_target,
-                                    ),
-                                ),
-                            )
+                                bias=trend_bias,
+                                trend_counts=trend_counts,
+                                mid_target=mid_target,
+                            ),
                         )
-                    for number in weighted_sample_distinct(rng, weighted, quota):
+                    # 逐号抽：每抽一号后按肖外配额重滤候选，避免一次抽满再超配额
+                    for _ in range(quota):
+                        weighted = [
+                            (number, weight)
+                            for number, weight in weight_by_number.items()
+                            if number not in used_numbers and _eligible_recent(number)
+                        ]
+                        if not weighted:
+                            break
+                        number = weighted_sample_distinct(rng, weighted, 1)[0]
                         _annex_pick(
                             wave,
                             {"number": number, "diff": abs(number - int(latest))},
@@ -3250,7 +3337,8 @@ def recommend(
                     break
                 while len(picks) < pick_count and ordered_pools[wave]:
                     # 补齐时按「即将落到的角色顺位」偏好对应频次带
-                    _take_one(wave, assign_roles(pick_count)[len(picks)])
+                    if not _take_one(wave, assign_roles(pick_count)[len(picks)]):
+                        break
 
     # 角色按侧重顺序分配 —— 在侧重顺序中出现越靠前的波动类型越优先，
     # 依次获得 主推 / 次选 / 防守…（focus 恒含全部三类波动）。
@@ -3439,30 +3527,40 @@ def recommend(
         "（历史权重值 0.5 / 0.8 / 0.3 已停用；写入这些设置也不会改变选号或金额。）"
     )
 
-    # 近期生肖硬过滤：候选池只保留最近开出的 N 个不重复生肖
-    if allowed_zodiac_groups is not None:
+    # 近期生肖：核心集 + 肖外配额（M=0 硬收窄池；M>0 取号阶段限额）
+    if core_zodiac_groups is not None:
         limit_n = int(cfg["recent_zodiac_limit"])
         zodiac_bits: list[str] = []
-        for group in allowed_zodiac_groups:
+        for group in core_zodiac_groups:
             reference = int(group) + 1
             code = (
                 zodiac_of(reference, zodiac_date) if zodiac_date is not None else None
             )
             label = zodiac_label(code)
             zodiac_bits.append(label or f"组{group}")
-        notes.append(
-            f"近期生肖硬过滤已开启：预测号码必须属于最近开出的 "
-            f"{len(allowed_zodiac_groups)}/{limit_n} 个不重复生肖"
-            f"（{'、'.join(zodiac_bits)}）；其它生肖整组不入候选池。"
-            "这是样本内硬约束，不是概率，也不承诺提高命中率。"
-        )
+        core_text = "、".join(zodiac_bits)
+        if allowed_zodiac_groups is not None:
+            notes.append(
+                f"近期生肖硬过滤已开启（肖外配额 0）：预测号码必须属于最近开出的 "
+                f"{len(core_zodiac_groups)}/{limit_n} 个不重复生肖"
+                f"（{core_text}）；其它生肖整组不入候选池。"
+                "这是样本内硬约束，不是概率，也不承诺提高命中率。"
+            )
+        else:
+            notes.append(
+                f"近期生肖规则已开启：核心集为最近开出的 "
+                f"{len(core_zodiac_groups)}/{limit_n} 个不重复生肖（{core_text}）；"
+                f"本期 {pick_count} 码里最多允许 {max_outside_recent} 个落在核心集外"
+                f"（实际肖外 {outside_recent_picked} 个）。"
+                "这是样本内硬约束，不是概率，也不承诺提高命中率。"
+            )
     elif bool(cfg["restrict_recent_zodiacs"]):
         notes.append(
-            "近期生肖硬过滤已开启，但本池样本尚无法解析出生肖组，本期未收窄候选池。"
+            "近期生肖规则已开启，但本池样本尚无法解析出生肖组，本期未施加核心集约束。"
         )
     else:
         notes.append(
-            "近期生肖硬过滤已关闭：候选池不按「最近开出的生肖」收窄。"
+            "近期生肖规则已关闭：候选池与取号不按「最近开出的生肖」收窄。"
         )
 
     # 角色金额配额（均注模式）：说明主推/次选/防守的分配口径
@@ -3608,19 +3706,22 @@ def recommend(
             "excluded_count": 0,
             "excluded_numbers": sorted(heat_absent),
         },
-        # 近期生肖硬过滤摘要（只增不改）：enabled + 实际生效的分组键 / 汉字
+        # 近期生肖摘要（只增不改）：核心集 + 肖外配额 + 实际生效的分组键 / 汉字
         "recent_zodiacs": {
             "enabled": bool(cfg["restrict_recent_zodiacs"]),
             "limit": int(cfg["recent_zodiac_limit"]),
-            "applied": allowed_zodiac_groups is not None,
-            "groups": list(allowed_zodiac_groups or []),
+            "max_outside": int(cfg["max_outside_recent_zodiacs"]),
+            "outside_count": int(outside_recent_picked),
+            "hard_pool": allowed_zodiac_groups is not None,
+            "applied": core_zodiac_groups is not None,
+            "groups": list(core_zodiac_groups or []),
             "codes": [
                 (
                     zodiac_of(int(group) + 1, zodiac_date)
                     if zodiac_date is not None
                     else None
                 )
-                for group in (allowed_zodiac_groups or [])
+                for group in (core_zodiac_groups or [])
             ],
             "labels": [
                 zodiac_label(
@@ -3628,7 +3729,7 @@ def recommend(
                     if zodiac_date is not None
                     else None
                 )
-                for group in (allowed_zodiac_groups or [])
+                for group in (core_zodiac_groups or [])
             ],
         },
         "avoid_cold": {
