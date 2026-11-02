@@ -615,7 +615,7 @@ const latticeBand = computed(() => lattice.value?.band ?? null)
 
 /**
  * 预测点阵旁展示：特码历史上最新开出的 6 个不重复生肖（新→旧）。
- * 纯展示，与「只选近期生肖」硬过滤的 N（默认 4）无关；样本不足则有几个列几个。
+ * 纯展示，与「只选近期生肖」核心集 N / 肖外配额无关；样本不足则有几个列几个。
  */
 const LATEST_ZODIAC_DISPLAY_COUNT = 6
 const latestSixZodiacs = computed(() => {
@@ -635,6 +635,39 @@ const latestSixZodiacs = computed(() => {
     if (out.length >= LATEST_ZODIAC_DISPLAY_COUNT) break
   }
   return out
+})
+
+/**
+ * 最新特码历史上「出现过后的下一期」号码列表（纯展示，不参与选号）。
+ * 开奖序列约定最新在前：锚点 = draws[0]；更早的同号出现在 i≥1，
+ * 其下一期实开 = draws[i-1]（更新的那一期）。当前这一期尚无下一期，不计入。
+ * 顺序 = 最近一次转移在前；同号可重复出现（每次历史都列）。
+ */
+const latestNumberNextDraws = computed(() => {
+  const draws = normalizeDraws(rawDraws.value)
+  const anchor = draws[0]?.special_number
+  if (anchor == null) {
+    return { anchor: null as number | null, successors: [] as Array<{
+      number: number
+      fromPeriod: number | null
+      toPeriod: number | null
+    }> }
+  }
+  const successors: Array<{
+    number: number
+    fromPeriod: number | null
+    toPeriod: number | null
+  }> = []
+  for (let index = 1; index < draws.length; index += 1) {
+    if (draws[index].special_number !== anchor) continue
+    const next = draws[index - 1]
+    successors.push({
+      number: next.special_number,
+      fromPeriod: draws[index].period,
+      toPeriod: next.period,
+    })
+  }
+  return { anchor, successors }
 })
 
 /** 三中三：后端从预测带派生；点阵关闭 / 无带时仍回块，前端按 status 展示或隐藏 */
@@ -1801,22 +1834,55 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   </button>
                 </div>
                 <div
-                  v-if="latestSixZodiacs.length"
-                  class="flex flex-wrap items-center justify-end gap-1.5"
-                  role="list"
-                  aria-label="最新 6 个生肖"
+                  v-if="latestSixZodiacs.length || latestNumberNextDraws.anchor != null"
+                  class="flex flex-wrap items-center justify-end gap-x-1.5 gap-y-1"
                 >
-                  <span class="text-[11px] text-slate-500">最新 6 肖</span>
-                  <StatChip
-                    v-for="(item, index) in latestSixZodiacs"
-                    :key="item.code || item.label"
-                    :tone="index === 0 ? 'nebula' : 'neutral'"
-                    size="xs"
-                    role="listitem"
-                    :title="index === 0 ? '最新开出' : `往前第 ${index + 1} 个不重复生肖`"
-                  >
-                    {{ item.label }}
-                  </StatChip>
+                  <template v-if="latestSixZodiacs.length">
+                    <span class="text-[11px] text-slate-500">最新 6 肖</span>
+                    <StatChip
+                      v-for="(item, index) in latestSixZodiacs"
+                      :key="item.code || item.label"
+                      :tone="index === 0 ? 'nebula' : 'neutral'"
+                      size="xs"
+                      :title="index === 0 ? '最新开出' : `往前第 ${index + 1} 个不重复生肖`"
+                    >
+                      {{ item.label }}
+                    </StatChip>
+                  </template>
+                  <template v-if="latestNumberNextDraws.anchor != null">
+                    <span
+                      v-if="latestSixZodiacs.length"
+                      class="mx-0.5 text-[11px] text-slate-600"
+                      aria-hidden="true"
+                    >·</span>
+                    <span class="text-[11px] text-slate-500">
+                      <span class="num text-slate-300">{{ pad(latestNumberNextDraws.anchor) }}</span>
+                      后曾开
+                      <template v-if="latestNumberNextDraws.successors.length">
+                        · {{ latestNumberNextDraws.successors.length }} 次
+                      </template>
+                    </span>
+                    <template v-if="latestNumberNextDraws.successors.length">
+                      <StatChip
+                        v-for="(item, index) in latestNumberNextDraws.successors"
+                        :key="`${item.fromPeriod}-${item.toPeriod}-${item.number}-${index}`"
+                        tone="aqua"
+                        size="xs"
+                        :title="item.fromPeriod != null && item.toPeriod != null
+                          ? `第 ${item.fromPeriod} 期开 ${pad(latestNumberNextDraws.anchor!)} 后，第 ${item.toPeriod} 期开 ${pad(item.number)}`
+                          : `下一期曾开 ${pad(item.number)}`"
+                      >
+                        {{ pad(item.number) }}
+                      </StatChip>
+                    </template>
+                    <span
+                      v-else
+                      class="text-[11px] text-amber-200/90"
+                      role="status"
+                    >
+                      本池此前未开过该号，无下一期样本
+                    </span>
+                  </template>
                 </div>
               </div>
             </div>
