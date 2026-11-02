@@ -1112,7 +1112,7 @@ def test_settings_api_exclude_repeat_zodiac_roundtrip():
 
 
 # --------------------------------------------------------------------------- #
-# 11b. 近期生肖硬过滤（默认开启，N=6）
+# 11b. 近期生肖硬过滤（默认开启，N=4；8 码最多落在 4 个生肖）
 # --------------------------------------------------------------------------- #
 def test_recent_special_zodiac_groups_newest_first_unique():
     from services.lottery import recent_special_zodiac_groups, zodiac_group
@@ -1148,7 +1148,7 @@ def test_recommend_restricts_to_recent_zodiacs_by_default():
 
     # 历史只覆盖 3 个生肖组；默认开启硬过滤 → 预测号只能落在这 3 组
     history = [1, 2, 3, 1, 2, 3, 1, 2, 3]
-    allowed = set(recent_special_zodiac_groups(history, limit=6))
+    allowed = set(recent_special_zodiac_groups(history, limit=4))
     assert allowed == {zodiac_group(1), zodiac_group(2), zodiac_group(3)}
 
     result = recommend(
@@ -1157,7 +1157,7 @@ def test_recommend_restricts_to_recent_zodiacs_by_default():
         history_numbers=history,
         settings={
             "restrict_recent_zodiacs": True,
-            "recent_zodiac_limit": 6,
+            "recent_zodiac_limit": 4,
             "pick_count": 6,
             "include_repeat_number": True,
             "exclude_repeat_zodiac": False,
@@ -1167,12 +1167,42 @@ def test_recommend_restricts_to_recent_zodiacs_by_default():
         },
     )
     assert result["settings"]["restrict_recent_zodiacs"] is True
-    assert result["settings"]["recent_zodiac_limit"] == 6
+    assert result["settings"]["recent_zodiac_limit"] == 4
     assert result["recent_zodiacs"]["applied"] is True
     assert set(result["recent_zodiacs"]["groups"]) == allowed
     picked = [pick["number"] for pick in result["picks"]]
     assert picked
     assert all(zodiac_group(n) in allowed for n in picked)
+
+
+def test_recommend_eight_picks_span_at_most_four_zodiacs():
+    """产品口径：8 码预测在默认近期生肖硬过滤下，最多属于 4 个生肖。"""
+    from services.lottery import zodiac_group
+
+    # 12 个不同组的特码历史，确保候选池能收到满额 4 肖
+    history = list(range(1, 13)) * 3
+    result = recommend(
+        latest=1,
+        previous=2,
+        history_numbers=history,
+        settings={
+            "restrict_recent_zodiacs": True,
+            "recent_zodiac_limit": 4,
+            "pick_count": 8,
+            "include_repeat_number": True,
+            "exclude_repeat_zodiac": False,
+            "lattice_enabled": False,
+            "avoid_cold_enabled": False,
+            "pick_sampling": "ranked",
+        },
+    )
+    picked = [pick["number"] for pick in result["picks"]]
+    assert len(picked) == 8
+    distinct = {zodiac_group(n) for n in picked}
+    assert len(distinct) <= 4
+    assert set(result["recent_zodiacs"]["groups"]) == distinct or distinct.issubset(
+        set(result["recent_zodiacs"]["groups"])
+    )
 
 
 def test_recommend_can_disable_recent_zodiac_restriction():
@@ -1219,7 +1249,7 @@ def test_clamp_settings_recent_zodiac_defaults_and_bounds():
 
     # 产品默认（模块常量）仍是开启；本文件 autouse 会把 DEFAULT_SETTINGS 临时关掉
     assert DEFAULT_RESTRICT_RECENT_ZODIACS is True
-    assert DEFAULT_RECENT_ZODIAC_LIMIT == 6
+    assert DEFAULT_RECENT_ZODIAC_LIMIT == 4
     assert clamp_settings({"restrict_recent_zodiacs": True})[
         "restrict_recent_zodiacs"
     ] is True
@@ -1228,7 +1258,7 @@ def test_clamp_settings_recent_zodiac_defaults_and_bounds():
     ] is False
     assert clamp_settings({"recent_zodiac_limit": 0})["recent_zodiac_limit"] == 1
     assert clamp_settings({"recent_zodiac_limit": 99})["recent_zodiac_limit"] == 12
-    assert clamp_settings({"recent_zodiac_limit": "abc"})["recent_zodiac_limit"] == 6
+    assert clamp_settings({"recent_zodiac_limit": "abc"})["recent_zodiac_limit"] == 4
 
 
 def test_settings_api_recent_zodiac_roundtrip(monkeypatch):
@@ -1243,21 +1273,21 @@ def test_settings_api_recent_zodiac_roundtrip(monkeypatch):
     with TestClient(app) as client:
         body = client.get("/api/settings").json()
         assert body["restrict_recent_zodiacs"] is True
-        assert body["recent_zodiac_limit"] == 6
+        assert body["recent_zodiac_limit"] == 4
 
         updated = client.put(
             "/api/settings",
-            json={"restrict_recent_zodiacs": False, "recent_zodiac_limit": 4},
+            json={"restrict_recent_zodiacs": False, "recent_zodiac_limit": 6},
         ).json()
         assert updated["restrict_recent_zodiacs"] is False
-        assert updated["recent_zodiac_limit"] == 4
+        assert updated["recent_zodiac_limit"] == 6
 
         restored = client.put(
             "/api/settings",
-            json={"restrict_recent_zodiacs": True, "recent_zodiac_limit": 6},
+            json={"restrict_recent_zodiacs": True, "recent_zodiac_limit": 4},
         ).json()
         assert restored["restrict_recent_zodiacs"] is True
-        assert restored["recent_zodiac_limit"] == 6
+        assert restored["recent_zodiac_limit"] == 4
         assert restored["total_amount"] == body["total_amount"]
 
 

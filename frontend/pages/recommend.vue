@@ -613,6 +613,30 @@ const softSummary = computed(() => result.value?.soft_weights ?? null)
 const lattice = computed(() => result.value?.lattice ?? null)
 const latticeBand = computed(() => lattice.value?.band ?? null)
 
+/**
+ * 预测点阵旁展示：特码历史上最新开出的 6 个不重复生肖（新→旧）。
+ * 纯展示，与「只选近期生肖」硬过滤的 N（默认 4）无关；样本不足则有几个列几个。
+ */
+const LATEST_ZODIAC_DISPLAY_COUNT = 6
+const latestSixZodiacs = computed(() => {
+  const draws = normalizeDraws(rawDraws.value)
+  const seen = new Set<string>()
+  const out: { code: string; label: string }[] = []
+  for (const draw of draws) {
+    const code = typeof draw.zodiac === 'string' ? draw.zodiac.trim() : ''
+    const fromDraw = zodiacText(draw)
+    const fromTable = heatZodiacLabelByNumber.value.get(draw.special_number) ?? ''
+    const label = fromDraw || fromTable || code
+    if (!label) continue
+    const key = code || label
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ code, label })
+    if (out.length >= LATEST_ZODIAC_DISPLAY_COUNT) break
+  }
+  return out
+})
+
 /** 三中三：后端从预测带派生；点阵关闭 / 无带时仍回块，前端按 status 展示或隐藏 */
 const tripleSets = computed(() => result.value?.triple_sets ?? null)
 const tripleSetsReady = computed(() => tripleSets.value?.status === 'ok')
@@ -1743,37 +1767,57 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   本池至少要 3 期开奖记录，才能统计预测带命中率。
                 </p>
               </div>
-              <div class="flex flex-wrap items-center gap-1" role="group" aria-label="预测带日期">
-                <button
-                  type="button"
-                  class="inline-flex min-h-[32px] items-center justify-center rounded-lg border px-2.5 text-xs font-medium transition-colors"
-                  :class="latticeHistoryOffset === 0
-                    ? 'border-aqua-400/60 bg-aqua-400/15 text-aqua-100'
-                    : 'border-white/10 bg-white/5 text-slate-300 active:bg-white/15'"
-                  :aria-pressed="latticeHistoryOffset === 0"
-                  @click="goLivePrediction"
+              <div class="flex flex-col items-stretch gap-2 sm:items-end">
+                <div class="flex flex-wrap items-center gap-1" role="group" aria-label="预测带日期">
+                  <button
+                    type="button"
+                    class="inline-flex min-h-[32px] items-center justify-center rounded-lg border px-2.5 text-xs font-medium transition-colors"
+                    :class="latticeHistoryOffset === 0
+                      ? 'border-aqua-400/60 bg-aqua-400/15 text-aqua-100'
+                      : 'border-white/10 bg-white/5 text-slate-300 active:bg-white/15'"
+                    :aria-pressed="latticeHistoryOffset === 0"
+                    @click="goLivePrediction"
+                  >
+                    本期
+                  </button>
+                  <button
+                    type="button"
+                    class="inline-flex min-h-[32px] items-center justify-center rounded-lg border border-white/10 bg-white/5 px-2.5 text-xs font-medium text-slate-300 transition-colors active:bg-white/15 disabled:cursor-not-allowed disabled:opacity-40"
+                    :disabled="latticeHistoryOffset <= 0"
+                    @click="stepHistoryLater"
+                  >
+                    更新
+                  </button>
+                  <button
+                    type="button"
+                    class="inline-flex min-h-[32px] items-center justify-center rounded-lg border px-2.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+                    :class="latticeHistoryOffset > 0
+                      ? 'border-amber-400/60 bg-amber-400/15 text-amber-100'
+                      : 'border-white/10 bg-white/5 text-slate-300 active:bg-white/15'"
+                    :disabled="latticeHistoryOffset >= latticeReplayWindow.maxOffset"
+                    @click="stepHistoryEarlier"
+                  >
+                    更早
+                  </button>
+                </div>
+                <div
+                  v-if="latestSixZodiacs.length"
+                  class="flex flex-wrap items-center justify-end gap-1.5"
+                  role="list"
+                  aria-label="最新 6 个生肖"
                 >
-                  本期
-                </button>
-                <button
-                  type="button"
-                  class="inline-flex min-h-[32px] items-center justify-center rounded-lg border border-white/10 bg-white/5 px-2.5 text-xs font-medium text-slate-300 transition-colors active:bg-white/15 disabled:cursor-not-allowed disabled:opacity-40"
-                  :disabled="latticeHistoryOffset <= 0"
-                  @click="stepHistoryLater"
-                >
-                  更新
-                </button>
-                <button
-                  type="button"
-                  class="inline-flex min-h-[32px] items-center justify-center rounded-lg border px-2.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40"
-                  :class="latticeHistoryOffset > 0
-                    ? 'border-amber-400/60 bg-amber-400/15 text-amber-100'
-                    : 'border-white/10 bg-white/5 text-slate-300 active:bg-white/15'"
-                  :disabled="latticeHistoryOffset >= latticeReplayWindow.maxOffset"
-                  @click="stepHistoryEarlier"
-                >
-                  更早
-                </button>
+                  <span class="text-[11px] text-slate-500">最新 6 肖</span>
+                  <StatChip
+                    v-for="(item, index) in latestSixZodiacs"
+                    :key="item.code || item.label"
+                    :tone="index === 0 ? 'nebula' : 'neutral'"
+                    size="xs"
+                    role="listitem"
+                    :title="index === 0 ? '最新开出' : `往前第 ${index + 1} 个不重复生肖`"
+                  >
+                    {{ item.label }}
+                  </StatChip>
+                </div>
               </div>
             </div>
             <p

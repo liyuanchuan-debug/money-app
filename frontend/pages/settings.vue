@@ -833,7 +833,7 @@ const readonlyInputClass
                   <p class="text-xs leading-relaxed text-slate-500">
                     从最新一期特码往回数，取前
                     <span class="num text-slate-300">{{ form.recent_zodiac_limit }}</span>
-                    个不重复生肖（默认 6，范围 1～12）。样本不足该个数时用已开出的全部生肖。
+                    个不重复生肖（默认 4，范围 1～12；8 码最多落在 4 个生肖）。样本不足该个数时用已开出的全部生肖。
                   </p>
                 </div>
               </div>

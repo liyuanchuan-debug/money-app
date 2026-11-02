@@ -154,10 +154,11 @@ SOFT_WEIGHT_MAX = 1.0
 
 # --------------------------------------------------------------------------- #
 # 近期生肖硬过滤：预测号码必须落在「特码历史里最新出现过的 N 个不重复生肖」内。
-# 默认开启、N=6；关闭后候选池恢复为全号段（仍受重号/重肖开关约束）。
+# 默认开启、N=4（8 码预测最多落在 4 个生肖）；关闭后候选池恢复为全号段
+# （仍受重号/重肖开关约束）。
 # --------------------------------------------------------------------------- #
 DEFAULT_RESTRICT_RECENT_ZODIACS = True
-DEFAULT_RECENT_ZODIAC_LIMIT = 6
+DEFAULT_RECENT_ZODIAC_LIMIT = 4
 RECENT_ZODIAC_LIMIT_MIN = 1
 RECENT_ZODIAC_LIMIT_MAX = ZODIAC_STEP
 
@@ -491,6 +492,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 避开重肖：默认关闭（同肖号可以入选）；旧数据缺失该字段时也回退为 False
     "exclude_repeat_zodiac": False,
     # 近期生肖硬过滤：默认开启；预测号必须属于最近开出的 N 个不重复生肖
+    # （默认 N=4 → 8 码最多落在 4 个生肖）
     "restrict_recent_zodiacs": DEFAULT_RESTRICT_RECENT_ZODIACS,
     "recent_zodiac_limit": DEFAULT_RECENT_ZODIAC_LIMIT,
     # 走势加权：已停用为选择权重；默认 neutral，窗口仅影响展示

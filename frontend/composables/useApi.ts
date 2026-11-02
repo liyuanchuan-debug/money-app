@@ -21,7 +21,7 @@ export interface LotterySettings {
    * 近期生肖硬过滤：true=预测号必须属于最近开出的 N 个不重复生肖；默认 true。
    */
   restrict_recent_zodiacs: boolean
-  /** 近期生肖个数上限（1..12）；默认 6 */
+  /** 近期生肖个数上限（1..12）；默认 4（8 码最多落在 4 个生肖） */
   recent_zodiac_limit: number
   /**
    * 上期出过的号（重号）是否保留在候选池：true=不避开、只降权（默认）。
@@ -843,9 +843,9 @@ export const STALE_PERIODS_MIN = 1
 export const STALE_PERIODS_MAX = 999
 /** 冷号降权系数默认值 */
 export const STALE_WEIGHT_DEFAULT = 0.3
-/** 近期生肖硬过滤：默认开启；预测号必须属于最近开出的 N 个不重复生肖 */
+/** 近期生肖硬过滤：默认开启；预测号必须属于最近开出的 N 个不重复生肖（默认 4） */
 export const RESTRICT_RECENT_ZODIACS_DEFAULT = true
-export const RECENT_ZODIAC_LIMIT_DEFAULT = 6
+export const RECENT_ZODIAC_LIMIT_DEFAULT = 4
 export const RECENT_ZODIAC_LIMIT_MIN = 1
 export const RECENT_ZODIAC_LIMIT_MAX = 12
 /** 每注最低金额（元）：所有模式下每一注的实际金额都不得低于它 */

@@ -54,7 +54,7 @@ class SettingsOut(BaseModel):
     exclude_repeat_zodiac: bool
     # 近期生肖硬过滤：True=预测号必须属于最近开出的 N 个不重复生肖；默认 True
     restrict_recent_zodiacs: bool
-    # 近期生肖个数上限（1..12）；默认 6
+    # 近期生肖个数上限（1..12）；默认 4（8 码最多落在 4 个生肖）
     recent_zodiac_limit: int
     # 上期出过的号（重号）是否保留在候选池：True=不避开、只降权（默认）
     include_repeat_number: bool
@@ -130,7 +130,7 @@ class SettingsPatch(BaseModel):
         default=None,
         ge=RECENT_ZODIAC_LIMIT_MIN,
         le=RECENT_ZODIAC_LIMIT_MAX,
-        description="近期生肖个数上限（1..12）；默认 6",
+        description="近期生肖个数上限（1..12）；默认 4（8 码最多落在 4 个生肖）",
     )
     include_repeat_number: bool | None = Field(
         default=None,

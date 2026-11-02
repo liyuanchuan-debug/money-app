@@ -307,7 +307,7 @@ SETTING_GATES: dict[str, str] = {
     "odds": "只进 pnl / 兑付展示；recommend 不读赔率 → 不改变号码与金额",
     "exclude_repeat_zodiac": "候选池整组剔除最新同肖（build_candidate_pools）",
     "restrict_recent_zodiacs": "候选池只保留近期最新开出的 N 个不重复生肖（默认开）",
-    "recent_zodiac_limit": "近期生肖硬过滤的 N（默认 6，范围 1..12）",
+    "recent_zodiac_limit": "近期生肖硬过滤的 N（默认 4，范围 1..12；8 码最多落在 4 个生肖）",
     "include_repeat_number": "候选池是否保留上期特码；exclude_repeat_zodiac=True 时该号已被剔除",
     "repeat_number_weight": "**已停用（2026-10-09 降权去除）**：值仍被 clamp 接受并回显，但不参与选号 / 金额",
     "repeat_zodiac_weight": "**已停用（2026-10-09 降权去除）**：同上；同肖仍照常打标签",
