@@ -305,6 +305,7 @@ async def post_recommend(
         amount_seed=payload.amount_seed,
         period=period,
         history_dates=history_dates,
+        pick_seed=payload.pick_seed,
     )
 
     # 带内命中率只统计本池真实开奖（假设号码预览不得污染）；与 GET /api/lattice/hit-rate 同口径

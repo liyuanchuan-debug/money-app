@@ -45,6 +45,7 @@ PRODUCTION_LIKE = {
     "exclude_repeat_zodiac": False,
     # 抽样对照用例钉死关闭，避免默认硬过滤改变池大小干扰断言
     "restrict_recent_zodiacs": False,
+    "restrict_pick_zodiacs": False,
     "pick_count": 10,
     "amount_unit": 5,
     "total_amount": 50,
@@ -168,7 +169,7 @@ def test_sampling_seed_key_is_a_pinned_sha256_of_the_declared_material():
     )
     assert isinstance(seed, str) and len(seed) == 64
     int(seed, 16)  # 必须是合法十六进制
-    assert seed == "1da21cbebee390605dd213e285128880bbf0e2fb15d241cfa0dc626d32659874"
+    assert seed == "0df63a282820b43bacc684da0f9c2dd702d3dc9a9d8a026eaf9bdcb4750b8732"
 
     # 逐字节可复现：同参数两次相同
     again = L.sampling_seed_key(
@@ -178,6 +179,27 @@ def test_sampling_seed_key_is_a_pinned_sha256_of_the_declared_material():
         settings=_cfg(lattice_enabled=True),
     )
     assert again == seed
+    # batch=0 不进材料，与缺省相同；batch≥1 换一批
+    assert (
+        L.sampling_seed_key(
+            period=279,
+            latest=18,
+            previous=7,
+            settings=_cfg(lattice_enabled=True),
+            batch=0,
+        )
+        == seed
+    )
+    assert (
+        L.sampling_seed_key(
+            period=279,
+            latest=18,
+            previous=7,
+            settings=_cfg(lattice_enabled=True),
+            batch=1,
+        )
+        != seed
+    )
 
 
 def test_sampling_seed_key_ignores_dict_order_and_amount_keys():
@@ -367,9 +389,9 @@ def test_lattice_band_is_sampled_more_often_than_the_quota_aware_uniform_expecta
 
     measured_mean = statistics.fmean(measured)
     expected_mean = statistics.fmean(expected)
-    # 点阵加权把带内入选推高到「同桶均匀」期望之上（下期侧重配额下实测约 +0.57 注/期）
+    # 点阵加权把带内入选推高到「同桶均匀」期望之上（4:2:2 配额口径）
     assert measured_mean > expected_mean
-    assert measured_mean - expected_mean == pytest.approx(0.571, abs=0.05)
+    assert measured_mean - expected_mean == pytest.approx(0.634, abs=0.05)
     # 同桶内条件概率：带内 > 带外
     assert cond_in / avail_in > cond_out / avail_out
     # 预测带绝大多数期同时覆盖 normal 与 small 两个桶
@@ -391,11 +413,7 @@ def test_lattice_band_is_sampled_more_often_than_the_quota_aware_uniform_expecta
 # 4. 形状（clumping 没有回来）
 # --------------------------------------------------------------------------- #
 def test_seeded_sampling_keeps_exact_count_distinctness_and_balanced_shape():
-    """208 期真实池：毎期恒 10 注互不相同。
-
-    上期大跳→只侧重小 时，配额可整期落在一桶（产品口径，不是旧 drain 的「一坨」）；
-    两池及以上侧重时仍不应把 10 注抽干进单一桶。
-    """
+    """208 期真实池：毎期恒 10 注互不相同；主侧重+防守下不应抽干进单一桶。"""
     rows = _walk_forward()
 
     max_bucket_counts = []
@@ -408,10 +426,9 @@ def test_seeded_sampling_keeps_exact_count_distinctness_and_balanced_shape():
         counts = row["waves"]
         top = max(counts.values())
         max_bucket_counts.append(top)
-        active_quotas = sum(1 for quota in row["quotas"].values() if quota > 0)
-        assert top < 10 or active_quotas <= 1
+        assert top < 10
 
-    assert statistics.fmean(max_bucket_counts) == pytest.approx(7.9, abs=1.0)
+    assert statistics.fmean(max_bucket_counts) == pytest.approx(5.6, abs=0.8)
 
 
 def test_legacy_drain_is_still_available_and_still_clumps():

@@ -26,9 +26,13 @@ import {
   MAX_OUTSIDE_RECENT_ZODIACS_DEFAULT,
   MAX_OUTSIDE_RECENT_ZODIACS_MAX,
   MAX_OUTSIDE_RECENT_ZODIACS_MIN,
+  MAX_PICK_ZODIACS_DEFAULT,
+  MAX_PICK_ZODIACS_MAX,
+  MAX_PICK_ZODIACS_MIN,
   RECENT_ZODIAC_LIMIT_DEFAULT,
   RECENT_ZODIAC_LIMIT_MAX,
   RECENT_ZODIAC_LIMIT_MIN,
+  RESTRICT_PICK_ZODIACS_DEFAULT,
   RESTRICT_RECENT_ZODIACS_DEFAULT,
   STALE_PERIODS_DEFAULT,
   STALE_PERIODS_MAX,
@@ -103,6 +107,9 @@ const form = reactive({
   restrict_recent_zodiacs: RESTRICT_RECENT_ZODIACS_DEFAULT,
   recent_zodiac_limit: RECENT_ZODIAC_LIMIT_DEFAULT,
   max_outside_recent_zodiacs: MAX_OUTSIDE_RECENT_ZODIACS_DEFAULT,
+  // 单票生肖跨度：默认开 / 最多 4 肖
+  restrict_pick_zodiacs: RESTRICT_PICK_ZODIACS_DEFAULT,
+  max_pick_zodiacs: MAX_PICK_ZODIACS_DEFAULT,
   // 走势取样窗：仅影响「走势分布参考」展示，不改选号
   trend_window: TREND_WINDOW_DEFAULT,
   // 避冷加权（自然日口径）：仍生效；默认关闭
@@ -226,13 +233,17 @@ async function load() {
     // 缺字号 / 旧后端：默认不避开重肖、保留重号（与 DEFAULT_SETTINGS 一致）
     form.exclude_repeat_zodiac = settings.exclude_repeat_zodiac === true
     // 缺字段时按默认开启（与 DEFAULT_SETTINGS 一致）
-    form.restrict_recent_zodiacs = settings.restrict_recent_zodiacs !== false
+    form.restrict_recent_zodiacs = settings.restrict_recent_zodiacs === true
     form.recent_zodiac_limit = typeof settings.recent_zodiac_limit === 'number'
       ? settings.recent_zodiac_limit
       : RECENT_ZODIAC_LIMIT_DEFAULT
     form.max_outside_recent_zodiacs = typeof settings.max_outside_recent_zodiacs === 'number'
       ? settings.max_outside_recent_zodiacs
       : MAX_OUTSIDE_RECENT_ZODIACS_DEFAULT
+    form.restrict_pick_zodiacs = settings.restrict_pick_zodiacs !== false
+    form.max_pick_zodiacs = typeof settings.max_pick_zodiacs === 'number'
+      ? settings.max_pick_zodiacs
+      : MAX_PICK_ZODIACS_DEFAULT
     form.include_repeat_number = settings.include_repeat_number !== false
     form.stale_periods = typeof settings.stale_periods === 'number'
       ? settings.stale_periods
@@ -383,6 +394,8 @@ async function save() {
       restrict_recent_zodiacs: form.restrict_recent_zodiacs,
       recent_zodiac_limit: form.recent_zodiac_limit,
       max_outside_recent_zodiacs: form.max_outside_recent_zodiacs,
+      restrict_pick_zodiacs: form.restrict_pick_zodiacs,
+      max_pick_zodiacs: form.max_pick_zodiacs,
       include_repeat_number: form.include_repeat_number,
       // 假旋钮固定回写默认：引擎已停用为权重，不再提供可调 UI
       repeat_number_weight: REPEAT_NUMBER_WEIGHT_DEFAULT,
@@ -408,13 +421,17 @@ async function save() {
     form.amount_unit = settings.amount_unit
     form.odds = typeof settings.odds === 'number' ? settings.odds : 47
     form.exclude_repeat_zodiac = settings.exclude_repeat_zodiac === true
-    form.restrict_recent_zodiacs = settings.restrict_recent_zodiacs !== false
+    form.restrict_recent_zodiacs = settings.restrict_recent_zodiacs === true
     form.recent_zodiac_limit = typeof settings.recent_zodiac_limit === 'number'
       ? settings.recent_zodiac_limit
       : RECENT_ZODIAC_LIMIT_DEFAULT
     form.max_outside_recent_zodiacs = typeof settings.max_outside_recent_zodiacs === 'number'
       ? settings.max_outside_recent_zodiacs
       : MAX_OUTSIDE_RECENT_ZODIACS_DEFAULT
+    form.restrict_pick_zodiacs = settings.restrict_pick_zodiacs !== false
+    form.max_pick_zodiacs = typeof settings.max_pick_zodiacs === 'number'
+      ? settings.max_pick_zodiacs
+      : MAX_PICK_ZODIACS_DEFAULT
     form.include_repeat_number = settings.include_repeat_number !== false
     form.stale_periods = typeof settings.stale_periods === 'number'
       ? settings.stale_periods
@@ -810,19 +827,62 @@ const readonlyInputClass
                 </div>
               </div>
 
-              <!-- 近期生肖：核心集最新 N 肖 + 肖外最多 M 个（默认开 / 6 / 2） -->
+              <!-- 单票生肖跨度：默认开 / 最多 4 肖 -->
+              <div class="space-y-3">
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                  <div class="space-y-1">
+                    <p id="restrict-pick-zodiacs-label" class="text-sm font-medium text-slate-200">
+                      单票生肖跨度
+                    </p>
+                    <p class="text-xs leading-relaxed text-slate-500">
+                      开启（默认）后，本期预测码最多覆盖
+                      <span class="num text-slate-300">{{ form.max_pick_zodiacs }}</span>
+                      个不重复生肖；满额后只允许已出现生肖组内的号。这是硬约束，不是概率。
+                    </p>
+                  </div>
+                  <GlassButton
+                    role="switch"
+                    :aria-checked="form.restrict_pick_zodiacs"
+                    aria-labelledby="restrict-pick-zodiacs-label"
+                    :variant="form.restrict_pick_zodiacs ? 'primary' : 'glass'"
+                    class="min-h-[44px] shrink-0 px-4 text-base"
+                    @click="form.restrict_pick_zodiacs = !form.restrict_pick_zodiacs"
+                  >
+                    {{ form.restrict_pick_zodiacs ? '已开启' : '已关闭' }}
+                  </GlassButton>
+                </div>
+                <div v-if="form.restrict_pick_zodiacs" class="space-y-2">
+                  <label for="max-pick-zodiacs" class="block text-sm font-medium text-slate-200">
+                    最多几个生肖
+                  </label>
+                  <input
+                    id="max-pick-zodiacs"
+                    v-model.number="form.max_pick_zodiacs"
+                    type="number"
+                    :min="MAX_PICK_ZODIACS_MIN"
+                    :max="MAX_PICK_ZODIACS_MAX"
+                    inputmode="numeric"
+                    :class="inputClass"
+                  >
+                  <p class="text-xs leading-relaxed text-slate-500">
+                    默认 4（8 码场景常用），范围
+                    {{ MAX_PICK_ZODIACS_MIN }}～{{ MAX_PICK_ZODIACS_MAX }}。
+                  </p>
+                </div>
+              </div>
+
+              <!-- 近期生肖：选号拦截已停用；预测页点阵旁仍展示最新 6 肖 -->
               <div class="space-y-3">
                 <div class="flex flex-wrap items-center justify-between gap-3">
                   <div class="space-y-1">
                     <p id="restrict-recent-zodiacs-label" class="text-sm font-medium text-slate-200">
-                      近期生肖规则
+                      近期生肖规则（选号已不拦截）
                     </p>
                     <p class="text-xs leading-relaxed text-slate-500">
-                      开启（默认）后，以「特码历史上最新开出的
+                      财富密码生成已按波动侧重伪代码出号，**不再**按「最新 N 肖 / 肖外配额」拦截号码。
+                      预测页点阵旁仍会展示最新
                       <span class="num text-slate-300">{{ form.recent_zodiac_limit }}</span>
-                      个不重复生肖」为核心集；本期预测码里最多允许
-                      <span class="num text-slate-300">{{ form.max_outside_recent_zodiacs }}</span>
-                      个落在核心集外。肖外配额为 0 时其它生肖整组不入候选池。这是硬约束，不是概率。
+                      个不重复生肖（纯对照）。下方开关仅保留兼容，打开也不会再改号单。
                     </p>
                   </div>
                   <GlassButton

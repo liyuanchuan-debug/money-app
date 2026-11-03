@@ -11,6 +11,8 @@ from services.lottery import (
     LATTICE_WINDOW_MIN,
     MAX_OUTSIDE_RECENT_ZODIACS_MAX,
     MAX_OUTSIDE_RECENT_ZODIACS_MIN,
+    MAX_PICK_ZODIACS_MAX,
+    MAX_PICK_ZODIACS_MIN,
     MODE_PATTERN,
     NUMBER_MAX,
     NUMBER_MIN,
@@ -60,6 +62,10 @@ class SettingsOut(BaseModel):
     recent_zodiac_limit: int
     # 核心集外最多允许几个号（0=硬收窄池；默认 2）
     max_outside_recent_zodiacs: int
+    # 单票生肖跨度：True=本期预测码最多覆盖 max_pick_zodiacs 个生肖；默认 True
+    restrict_pick_zodiacs: bool
+    # 单票最多几个不重复生肖（1..12）；默认 4
+    max_pick_zodiacs: int
     # 上期出过的号（重号）是否保留在候选池：True=不避开、只降权（默认）
     include_repeat_number: bool
     # 三类软降权权重（0..1；1.0 = 不降权）
@@ -141,6 +147,16 @@ class SettingsPatch(BaseModel):
         ge=MAX_OUTSIDE_RECENT_ZODIACS_MIN,
         le=MAX_OUTSIDE_RECENT_ZODIACS_MAX,
         description="核心集外最多允许几个号（0=硬收窄池；默认 2）",
+    )
+    restrict_pick_zodiacs: bool | None = Field(
+        default=None,
+        description="True=单票最多覆盖 max_pick_zodiacs 个生肖；默认 True",
+    )
+    max_pick_zodiacs: int | None = Field(
+        default=None,
+        ge=MAX_PICK_ZODIACS_MIN,
+        le=MAX_PICK_ZODIACS_MAX,
+        description="单票最多几个不重复生肖（1..12）；默认 4",
     )
     include_repeat_number: bool | None = Field(
         default=None,
@@ -280,6 +296,13 @@ class RecommendRequest(BaseModel):
     # 随机分配的重掷种子：不传时由「期」+ 参数确定性派生（同期重算结果一致）
     amount_seed: int | str | None = Field(
         default=None, description="random 模式的重掷种子（小整数 / 字符串）"
+    )
+    # 桶内抽样换批：0/缺省 = 同期默认样本；≥1 = 显式换一批号码（不落库）
+    pick_seed: int | None = Field(
+        default=None,
+        ge=0,
+        le=10_000,
+        description="seeded_random 换批序号；0/缺省保持同期默认同号",
     )
     # 走势加权临场预览（不落库）
     trend_bias: str | None = Field(default=None, pattern=TREND_BIAS_PATTERN)

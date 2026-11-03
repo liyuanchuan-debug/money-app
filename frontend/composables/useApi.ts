@@ -25,6 +25,10 @@ export interface LotterySettings {
   recent_zodiac_limit: number
   /** 核心集外最多允许几个号（0=硬收窄池；默认 2） */
   max_outside_recent_zodiacs: number
+  /** 单票生肖跨度：true=本期预测码最多覆盖 max_pick_zodiacs 个生肖；默认 true */
+  restrict_pick_zodiacs: boolean
+  /** 单票最多几个不重复生肖（1..12）；默认 4 */
+  max_pick_zodiacs: number
   /**
    * 上期出过的号（重号）是否保留在候选池：true=不避开、只降权（默认）。
    * false 才是旧的「排除上期特码本身」。
@@ -104,6 +108,8 @@ export interface LotterySettingsPatch {
   restrict_recent_zodiacs?: boolean
   recent_zodiac_limit?: number
   max_outside_recent_zodiacs?: number
+  restrict_pick_zodiacs?: boolean
+  max_pick_zodiacs?: number
   include_repeat_number?: boolean
   repeat_number_weight?: number
   repeat_zodiac_weight?: number
@@ -849,13 +855,18 @@ export const STALE_PERIODS_MAX = 999
 /** 冷号降权系数默认值 */
 export const STALE_WEIGHT_DEFAULT = 0.3
 /** 近期生肖规则：默认开启；核心集 = 最新 N 肖（默认 6），肖外最多 M 个（默认 2） */
-export const RESTRICT_RECENT_ZODIACS_DEFAULT = true
+export const RESTRICT_RECENT_ZODIACS_DEFAULT = false
 export const RECENT_ZODIAC_LIMIT_DEFAULT = 6
 export const RECENT_ZODIAC_LIMIT_MIN = 1
 export const RECENT_ZODIAC_LIMIT_MAX = 12
 export const MAX_OUTSIDE_RECENT_ZODIACS_DEFAULT = 2
 export const MAX_OUTSIDE_RECENT_ZODIACS_MIN = 0
 export const MAX_OUTSIDE_RECENT_ZODIACS_MAX = 10
+/** 单票生肖跨度：默认开启，最多 4 个不重复生肖 */
+export const RESTRICT_PICK_ZODIACS_DEFAULT = true
+export const MAX_PICK_ZODIACS_DEFAULT = 4
+export const MAX_PICK_ZODIACS_MIN = 1
+export const MAX_PICK_ZODIACS_MAX = 12
 /** 每注最低金额（元）：所有模式下每一注的实际金额都不得低于它 */
 export const MIN_BET_AMOUNT = 5
 /** 最大投注金额上下限（元） */
@@ -1253,6 +1264,7 @@ export function useApi() {
      * - ``bet_count``：临场注数（1–10，不落库；覆盖 settings.pick_count）；
      * - ``amount_seed``：随机分配的**重掷种子**（不传时后端按「期」+ 参数确定性派生，
      *   所以同一期重复请求结果一致；传了才得到另一份分配）；
+     * - ``pick_seed``：号码抽样换批序号（0/不传 = 同期默认样本；≥1 = 换一批号）；
      * - ``total_amount`` / ``amount_unit``：临场试算覆盖项（可选，不落库）；
      * - ``trend_bias`` / ``trend_window``：走势加权临场预览（可选，不落库）。
      */
@@ -1262,6 +1274,7 @@ export function useApi() {
         number?: number
         bet_count?: number
         amount_seed?: number | string
+        pick_seed?: number
         total_amount?: number
         amount_unit?: number
         trend_bias?: TrendBias

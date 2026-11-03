@@ -164,9 +164,10 @@ def memory_store_env(monkeypatch):
     # 本模块的接口用例按「开发旁路」书写：显式关闭鉴权开关，避免本地 .env 里的
     # AUTH_ENFORCED=true 让匿名 GET/PUT 变成 401（auth_enforced() 在请求时读环境变量）。
     monkeypatch.setenv("AUTH_ENFORCED", "false")
-    # 默认关闭近期生肖硬过滤：多数旧用例用短历史，池会被收窄到个位数。
-    # 专门覆盖该开关的用例在 settings 里显式传 True。
+    # 默认关闭近期生肖硬过滤 / 单票生肖跨度：多数旧用例用短历史或钉死波段配额，
+    # 专门覆盖这些开关的用例在 settings 里显式传 True。
     monkeypatch.setitem(DEFAULT_SETTINGS, "restrict_recent_zodiacs", False)
+    monkeypatch.setitem(DEFAULT_SETTINGS, "restrict_pick_zodiacs", False)
     yield
 
 
@@ -303,8 +304,7 @@ def test_missing_wave_reported_and_filled():
 # 5. 侧重（回补）角色分配（决策 1）
 # --------------------------------------------------------------------------- #
 def test_prev_small_focus_puts_normal_first():
-    # |10 - 5| = 5 → 上期小波动，侧重顺序 [常规, 大跳]（不回补小）
-    # 关闭点阵：本用例只校验侧重角色分配（点阵另有专门用例覆盖）
+    # |10 - 5| = 5 → 上期小波动，顺序 [常规, 大跳, 小防守]
     result = recommend(
         latest=10,
         previous=5,
@@ -313,13 +313,17 @@ def test_prev_small_focus_puts_normal_first():
     )
 
     assert result["prev_wave"]["type"] == WAVE_SMALL
-    assert [item["type"] for item in result["focus_order"]] == [WAVE_NORMAL, WAVE_BIG]
+    assert [item["type"] for item in result["focus_order"]] == [
+        WAVE_NORMAL,
+        WAVE_BIG,
+        WAVE_SMALL,
+    ]
     primary = next(pick for pick in result["picks"] if pick["role"] == "primary")
     assert primary["wave_type"] == WAVE_NORMAL
 
 
 def test_prev_big_focus_puts_small_first():
-    # |1 - 40| = 39 → 上期大跳，侧重顺序 [小波动]（只小回补）
+    # |1 - 40| = 39 → 上期大跳，顺序 [小, 常, 大]
     result = recommend(
         latest=1,
         previous=40,
@@ -328,7 +332,11 @@ def test_prev_big_focus_puts_small_first():
     )
 
     assert result["prev_wave"]["type"] == WAVE_BIG
-    assert [item["type"] for item in result["focus_order"]] == [WAVE_SMALL]
+    assert [item["type"] for item in result["focus_order"]] == [
+        WAVE_SMALL,
+        WAVE_NORMAL,
+        WAVE_BIG,
+    ]
     primary = next(pick for pick in result["picks"] if pick["role"] == "primary")
     assert primary["wave_type"] == WAVE_SMALL
 
@@ -448,7 +456,7 @@ def test_default_wave_alloc_is_balanced():
 
 
 def test_focus_alloc_follows_previous_wave():
-    """默认选号按上期波动侧重分配额：上期小波动、10 码 → 常规 6、大跳 4（不回补小）。"""
+    """上期小波动、10 码 → 常 5、大 3、小 2（主推/次/防守 4:2:2）。"""
     from collections import Counter
 
     result = recommend(
@@ -470,31 +478,37 @@ def test_focus_alloc_follows_previous_wave():
     assert len(numbers) == 10
     assert len(set(numbers)) == 10
     counts = Counter(pick["wave_type"] for pick in result["picks"])
-    assert counts[WAVE_NORMAL] == 6
-    assert counts[WAVE_BIG] == 4
-    assert counts.get(WAVE_SMALL, 0) == 0
+    assert counts[WAVE_NORMAL] == 5
+    assert counts[WAVE_BIG] == 3
+    assert counts[WAVE_SMALL] == 2
     assert any("下期侧重" in note for note in result["notes"])
     assert any("期望值" in note for note in result["notes"])
 
 
-def test_focus_alloc_prev_big_all_to_small_when_available():
-    """上期大跳 → 只侧重小回补：小池有号时 8 码全进小波动。"""
+def test_focus_alloc_prev_big_keeps_defense_slots():
+    """上期大跳 → 主推小，常/大留防守（4:2:2；6 码最大余数下为 3:2:1）。"""
     from collections import Counter
 
     from services.lottery import FOCUS_BY_PREV_WAVE, focus_wave_quotas
 
-    assert FOCUS_BY_PREV_WAVE[WAVE_BIG] == [WAVE_SMALL]
+    assert FOCUS_BY_PREV_WAVE[WAVE_BIG] == [WAVE_SMALL, WAVE_NORMAL, WAVE_BIG]
     assert focus_wave_quotas(
-        8, [WAVE_SMALL], {WAVE_SMALL: 20, WAVE_NORMAL: 20, WAVE_BIG: 9}
-    ) == {WAVE_SMALL: 8, WAVE_NORMAL: 0, WAVE_BIG: 0}
+        8,
+        [WAVE_SMALL, WAVE_NORMAL, WAVE_BIG],
+        {WAVE_SMALL: 20, WAVE_NORMAL: 20, WAVE_BIG: 9},
+    ) == {WAVE_SMALL: 4, WAVE_NORMAL: 2, WAVE_BIG: 2}
+    assert focus_wave_quotas(
+        6,
+        [WAVE_SMALL, WAVE_NORMAL, WAVE_BIG],
+        {WAVE_SMALL: 20, WAVE_NORMAL: 20, WAVE_BIG: 9},
+    ) == {WAVE_SMALL: 3, WAVE_NORMAL: 2, WAVE_BIG: 1}
 
-    # |5 - 40| = 35 → 上期大跳；latest=5 时小波动桶 = 1..15（含自身）
     result = recommend(
         latest=5,
         previous=40,
         history_numbers=[5, 40, 12, 28, 8, 33, 15, 45] * 3,
         settings={
-            "pick_count": 8,
+            "pick_count": 6,
             "mode": "ladder",
             "small_max": 10,
             "normal_max": 30,
@@ -507,22 +521,57 @@ def test_focus_alloc_prev_big_all_to_small_when_available():
     )
     assert result["prev_wave"]["type"] == WAVE_BIG
     counts = Counter(pick["wave_type"] for pick in result["picks"])
-    assert len(result["picks"]) == 8
-    assert counts.get(WAVE_SMALL, 0) == 8
-    assert counts.get(WAVE_NORMAL, 0) == 0
-    assert counts.get(WAVE_BIG, 0) == 0
+    assert len(result["picks"]) == 6
+    assert counts.get(WAVE_SMALL, 0) == 3
+    assert counts.get(WAVE_NORMAL, 0) == 2
+    assert counts.get(WAVE_BIG, 0) == 1
 
 
 def test_focus_wave_quotas_falls_back_when_primary_pool_empty():
-    """大跳只侧重小，但小池为空时按 WAVE_ORDER 兜底到常/大，仍凑满注数。"""
+    """主侧重池为空时按 WAVE_ORDER 兜底，仍凑满注数。"""
     from services.lottery import focus_wave_quotas
 
     quota = focus_wave_quotas(
-        8, [WAVE_SMALL], {WAVE_SMALL: 0, WAVE_NORMAL: 20, WAVE_BIG: 9}
+        8,
+        [WAVE_SMALL, WAVE_NORMAL, WAVE_BIG],
+        {WAVE_SMALL: 0, WAVE_NORMAL: 20, WAVE_BIG: 9},
     )
     assert quota[WAVE_SMALL] == 0
     assert quota[WAVE_NORMAL] + quota[WAVE_BIG] == 8
     assert sum(quota.values()) == 8
+
+
+def test_user_rule_latest_26_prev_21_big_empty_uses_small_defense():
+    """用户四步例：最新26、上期21（小），大跳无号 → 3码配额常规2 + 小1；42/19/04 分属常/小/常。"""
+    from services.lottery import FOCUS_BY_PREV_WAVE, focus_wave_quotas, classify_wave
+
+    latest, previous = 26, 21
+    assert abs(latest - previous) == 5
+    assert classify_wave(5, 10, 30) == WAVE_SMALL
+    focus = FOCUS_BY_PREV_WAVE[WAVE_SMALL]
+    assert focus == [WAVE_NORMAL, WAVE_BIG, WAVE_SMALL]
+
+    pools = {w: [] for w in (WAVE_SMALL, WAVE_NORMAL, WAVE_BIG)}
+    for n in range(1, 50):
+        pools[classify_wave(abs(n - latest), 10, 30)].append(n)
+    assert pools[WAVE_BIG] == []
+    assert 42 in pools[WAVE_NORMAL] and 4 in pools[WAVE_NORMAL]
+    assert 19 in pools[WAVE_SMALL]
+
+    # 大跳空 → 权重顺延：4:2 → 3注时常规2 + 小1
+    quota = focus_wave_quotas(
+        3, focus, {w: len(pools[w]) for w in (WAVE_SMALL, WAVE_NORMAL, WAVE_BIG)}
+    )
+    assert quota == {WAVE_SMALL: 1, WAVE_NORMAL: 2, WAVE_BIG: 0}
+
+    # 本期（latest=15 上期常）8 码 4:2:2 → 小4 / 大2 / 常2
+    q307 = focus_wave_quotas(
+        8,
+        FOCUS_BY_PREV_WAVE[WAVE_NORMAL],
+        {"small": 21, "normal": 24, "big": 4},
+    )
+    assert q307 == {WAVE_SMALL: 4, WAVE_NORMAL: 2, WAVE_BIG: 2}
+    assert classify_wave(abs(42 - 15), 10, 30) == WAVE_NORMAL
 
 
 def test_balanced_alloc_is_deterministic():
@@ -1219,13 +1268,13 @@ def test_resolve_allowed_zodiac_groups_hard_only_when_max_outside_zero():
     assert set(core) == {zodiac_group(n) for n in range(1, 7)}
 
 
-def test_recommend_restricts_to_recent_zodiacs_when_max_outside_zero():
+def test_recommend_ignores_recent_zodiac_pick_filter_even_when_setting_on():
+    """生成路径不再按近期生肖拦截；开启设置也只展示，不收窄号单。"""
     from services.lottery import recent_special_zodiac_groups, zodiac_group
 
-    # 历史只覆盖 3 个生肖组；M=0 硬收窄 → 预测号只能落在这 3 组
     history = [1, 2, 3, 1, 2, 3, 1, 2, 3]
-    allowed = set(recent_special_zodiac_groups(history, limit=6))
-    assert allowed == {zodiac_group(1), zodiac_group(2), zodiac_group(3)}
+    core = set(recent_special_zodiac_groups(history, limit=6))
+    assert core == {zodiac_group(1), zodiac_group(2), zodiac_group(3)}
 
     result = recommend(
         latest=1,
@@ -1243,19 +1292,19 @@ def test_recommend_restricts_to_recent_zodiacs_when_max_outside_zero():
             "pick_sampling": "ranked",
         },
     )
-    assert result["settings"]["restrict_recent_zodiacs"] is True
-    assert result["settings"]["recent_zodiac_limit"] == 6
-    assert result["settings"]["max_outside_recent_zodiacs"] == 0
-    assert result["recent_zodiacs"]["applied"] is True
-    assert result["recent_zodiacs"]["hard_pool"] is True
-    assert set(result["recent_zodiacs"]["groups"]) == allowed
+    assert result["recent_zodiacs"]["applied"] is False
+    assert result["recent_zodiacs"]["hard_pool"] is False
+    assert result["recent_zodiacs"]["pick_filter"] is False
+    assert result["recent_zodiacs"]["display_only"] is True
+    assert set(result["recent_zodiacs"]["groups"]) == core
     picked = [pick["number"] for pick in result["picks"]]
     assert picked
-    assert all(zodiac_group(n) in allowed for n in picked)
+    # 允许出核心集外的号（不再硬拦）
+    assert any(zodiac_group(n) not in core for n in range(1, 50))
 
 
-def test_recommend_eight_picks_at_most_two_outside_latest_six_zodiacs():
-    """产品口径：8 码里最多 2 个可落在最新 6 肖之外。"""
+def test_recommend_does_not_cap_outside_latest_six_zodiacs():
+    """8 码不再限制「肖外最多 2」；核心集仍写入摘要供展示。"""
     from services.lottery import recent_special_zodiac_groups, zodiac_group
 
     history = list(range(1, 13)) * 3
@@ -1280,13 +1329,63 @@ def test_recommend_eight_picks_at_most_two_outside_latest_six_zodiacs():
     picked = [pick["number"] for pick in result["picks"]]
     assert len(picked) == 8
     outside = [n for n in picked if zodiac_group(n) not in core]
-    assert len(outside) <= 2
     assert result["recent_zodiacs"]["outside_count"] == len(outside)
-    assert result["recent_zodiacs"]["max_outside"] == 2
-    assert result["recent_zodiacs"]["hard_pool"] is False
+    assert result["recent_zodiacs"]["applied"] is False
+    assert result["recent_zodiacs"]["pick_filter"] is False
     assert sum(1 for p in result["picks"] if p.get("is_outside_recent_zodiac")) == len(
         outside
     )
+
+
+def test_recommend_at_most_four_pick_zodiacs():
+    """单票生肖跨度：8 码最多 4 个不重复生肖。"""
+    from services.lottery import zodiac_group
+
+    history = list(range(1, 50)) * 2
+    result = recommend(
+        latest=15,
+        previous=26,
+        history_numbers=history,
+        settings={
+            "restrict_pick_zodiacs": True,
+            "max_pick_zodiacs": 4,
+            "pick_count": 8,
+            "mode": "ladder",
+            "include_repeat_number": True,
+            "exclude_repeat_zodiac": False,
+            "lattice_enabled": False,
+            "avoid_cold_enabled": False,
+            "pick_sampling": "seeded_random",
+        },
+        mode="ladder",
+        period=307,
+    )
+    picked = [int(p["number"]) for p in result["picks"]]
+    assert len(picked) == 8
+    groups = {zodiac_group(n) for n in picked}
+    assert len(groups) <= 4
+    assert result["pick_zodiacs"]["enabled"] is True
+    assert result["pick_zodiacs"]["max"] == 4
+    assert result["pick_zodiacs"]["count"] == len(groups)
+
+
+def test_recommend_can_disable_pick_zodiac_span():
+    """关闭单票生肖跨度后，不再限制覆盖几个生肖。"""
+    result = recommend(
+        latest=15,
+        previous=26,
+        history_numbers=list(range(1, 50)) * 2,
+        settings={
+            "restrict_pick_zodiacs": False,
+            "max_pick_zodiacs": 4,
+            "pick_count": 8,
+            "lattice_enabled": False,
+            "avoid_cold_enabled": False,
+            "pick_sampling": "ranked",
+        },
+    )
+    assert result["pick_zodiacs"]["enabled"] is False
+    assert len(result["picks"]) == 8
 
 
 def test_recommend_can_disable_recent_zodiac_restriction():
@@ -1314,14 +1413,16 @@ def test_recommend_can_disable_recent_zodiac_restriction():
     )
     assert result["settings"]["restrict_recent_zodiacs"] is False
     assert result["recent_zodiacs"]["applied"] is False
-    assert result["recent_zodiacs"]["groups"] == []
+    assert result["recent_zodiacs"]["pick_filter"] is False
+    # 展示用核心集仍回填；不表示选号拦截
+    assert result["recent_zodiacs"]["groups"] == [0, 1, 2]
     cfg = clamp_settings(settings)
     assert resolve_allowed_zodiac_groups(cfg, history) is None
     pools = build_candidate_pools(
         1, cfg["small_max"], cfg["normal_max"], include_repeat_number=True
     )
     nums = {item["number"] for pool in pools.values() for item in pool}
-    # 关闭硬过滤后，候选池应包含历史未开出的生肖组
+    # 候选池应包含历史未开出的生肖组
     assert any(zodiac_group(n) not in {0, 1, 2} for n in nums)
 
 
@@ -1332,8 +1433,8 @@ def test_clamp_settings_recent_zodiac_defaults_and_bounds():
         DEFAULT_RESTRICT_RECENT_ZODIACS,
     )
 
-    # 产品默认（模块常量）仍是开启；本文件 autouse 会把 DEFAULT_SETTINGS 临时关掉
-    assert DEFAULT_RESTRICT_RECENT_ZODIACS is True
+    # 产品默认：选号不按近期生肖拦截
+    assert DEFAULT_RESTRICT_RECENT_ZODIACS is False
     assert DEFAULT_RECENT_ZODIAC_LIMIT == 6
     assert DEFAULT_MAX_OUTSIDE_RECENT_ZODIACS == 2
     assert clamp_settings({"restrict_recent_zodiacs": True})[
@@ -1362,36 +1463,33 @@ def test_settings_api_recent_zodiac_roundtrip(monkeypatch):
     from main import app
     from services import lottery as lottery_mod
 
-    # API 用例要验证产品默认（开启），临时恢复 DEFAULT_SETTINGS
-    monkeypatch.setitem(lottery_mod.DEFAULT_SETTINGS, "restrict_recent_zodiacs", True)
-
     with TestClient(app) as client:
         body = client.get("/api/settings").json()
-        assert body["restrict_recent_zodiacs"] is True
+        assert body["restrict_recent_zodiacs"] is False
         assert body["recent_zodiac_limit"] == 6
         assert body["max_outside_recent_zodiacs"] == 2
 
         updated = client.put(
             "/api/settings",
             json={
-                "restrict_recent_zodiacs": False,
+                "restrict_recent_zodiacs": True,
                 "recent_zodiac_limit": 4,
                 "max_outside_recent_zodiacs": 0,
             },
         ).json()
-        assert updated["restrict_recent_zodiacs"] is False
+        assert updated["restrict_recent_zodiacs"] is True
         assert updated["recent_zodiac_limit"] == 4
         assert updated["max_outside_recent_zodiacs"] == 0
 
         restored = client.put(
             "/api/settings",
             json={
-                "restrict_recent_zodiacs": True,
+                "restrict_recent_zodiacs": False,
                 "recent_zodiac_limit": 6,
                 "max_outside_recent_zodiacs": 2,
             },
         ).json()
-        assert restored["restrict_recent_zodiacs"] is True
+        assert restored["restrict_recent_zodiacs"] is False
         assert restored["recent_zodiac_limit"] == 6
         assert restored["max_outside_recent_zodiacs"] == 2
         assert restored["total_amount"] == body["total_amount"]

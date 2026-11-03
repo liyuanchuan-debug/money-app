@@ -222,16 +222,16 @@ if stale:                                  weight *= stale_weight           # 0.
 `score_top` = 「全候选池打分取前 N」。取完之后，**按侧重顺序**把 10 注分成
 主推 1 注、次选/防守交替（3:2:1 是**金额**权重，不是注数配额）。
 
-### 5.1 侧重顺序 `FOCUS_BY_PREV_WAVE`
+### 5.1 侧重顺序 `FOCUS_BY_PREV_WAVE`（主侧重 + 同型防守）
 
 ```python
-small  → [normal, big]   # 不回补小
-normal → [small,  big]   # 不回补常规
-big    → [small]         # 只小回补
+small  → [normal, big,    small]   # 主推常/大，小做防守
+normal → [small,  big,    normal]  # 主推小/大，常做防守
+big    → [small,  normal, big]     # 主推小，常/大做防守
 ```
 
-上期波动类型决定本期侧重次序，第一个即主推方向。侧重池容量不够装下全部注数时，
-`focus_wave_quotas` 再按 `WAVE_ORDER`（小→常→大）把未列入的池接上兜底。
+权重 4:2:2（8 码整除为 4:2:2）。空池跳过（例：上期小且大跳无号 →
+常规:小 ≈ 2:1，对应「主选常规、小波动防守」）。近期 6 肖只展示，不拦截选号。
 
 ### 5.2 路径 A：`wave_round`（默认，`lottery.py:2197-2212`）
 

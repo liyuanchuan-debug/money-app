@@ -91,6 +91,14 @@ const amountSeed = computed(() =>
   mode.value === 'random' && rerollCount.value > 0 ? rerollCount.value : undefined)
 
 /**
+ * 号码换批计数：0 = 同期默认样本（首屏自动生成）；点「生成财富密码」后 +1 换一批号。
+ * 改注数 / 模式时归零，回到该结构下的默认样本。
+ */
+const pickRerollCount = ref(0)
+const pickSeed = computed(() =>
+  pickRerollCount.value > 0 ? pickRerollCount.value : undefined)
+
+/**
  * 设置与样本口径互不依赖，并行拉取；推荐结果依赖 mode（来自设置），必须等设置回来。
  * 远端 DB 下串行会把本页 SSR 拉到 settings+draws+recommend 三趟 RTT 之和。
  */
@@ -260,6 +268,7 @@ const {
     mode: mode.value,
     bet_count: betCount.value,
     amount_seed: amountSeed.value,
+    pick_seed: pickSeed.value,
     // 走势偏好已停用：固定 neutral；trend_window 只影响走势分布参考展示
     trend_bias: 'neutral',
     trend_window: trendWindow.value,
@@ -1033,13 +1042,15 @@ function clearCopyFeedback() {
 watch([mode, betCount, trendWindow, stakeTop], async () => {
   clearCopyFeedback()
   rerollCount.value = 0
+  pickRerollCount.value = 0
   await refresh()
 })
 
-/** 显式重新生成（首屏仍会自动生成一次，这颗按钮只是「再算一遍」） */
+/** 显式重新生成：换一批号码（pick_seed +1）；首屏仍是 batch=0 默认样本 */
 async function generate() {
   if (pending.value) return
   clearCopyFeedback()
+  pickRerollCount.value += 1
   await refresh()
   generateHit.fire()
 }
@@ -1266,7 +1277,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
           <!-- 主行动：显式重新生成（首屏自动生成一次的行为保留；按钮常驻，任何状态下都能点） -->
           <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <p class="text-xs leading-relaxed text-slate-500">
-              打开本页会自动生成一次；点右侧按钮即按当前筹码模式重新生成。
+              打开本页会自动生成一期默认样本；再点右侧按钮会换一批号码（同期可复现的换批种子）。
               这里不会改动设置页保存的默认值。
             </p>
             <div class="relative inline-flex shrink-0 rounded-[14px]">
