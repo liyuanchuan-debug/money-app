@@ -476,11 +476,17 @@ DEFAULT_SCORE_W_DIFF = 0.5
 SCORE_WEIGHT_MIN = -5.0
 SCORE_WEIGHT_MAX = 5.0
 
-# 波动回补逻辑：上期波动类型 → 本期侧重顺序（第一个即主推方向）
+# 波动回补逻辑：上期波动类型 → 本期侧重顺序（第一个即主推方向）。
+# 口径（与产品伪代码对齐，2026-11）：
+#   上期小 → 侧重常规、大跳（不回补小）；
+#   上期常规 → 侧重小、大跳（不回补常规）；
+#   上期大跳 → 只侧重小回补。
+# 侧重池容量不够装下全部注数时，``focus_wave_quotas`` 再按 WAVE_ORDER
+# 把未列入的池接上做兜底，避免空侧重池导致 0 注。
 FOCUS_BY_PREV_WAVE: dict[str, list[str]] = {
-    WAVE_SMALL: [WAVE_NORMAL, WAVE_BIG, WAVE_SMALL],
-    WAVE_NORMAL: [WAVE_SMALL, WAVE_BIG, WAVE_NORMAL],
-    WAVE_BIG: [WAVE_SMALL, WAVE_NORMAL, WAVE_BIG],
+    WAVE_SMALL: [WAVE_NORMAL, WAVE_BIG],
+    WAVE_NORMAL: [WAVE_SMALL, WAVE_BIG],
+    WAVE_BIG: [WAVE_SMALL],
 }
 DEFAULT_FOCUS = [WAVE_SMALL, WAVE_NORMAL, WAVE_BIG]
 
@@ -1999,8 +2005,9 @@ def balanced_wave_quotas(
     return quota
 
 
-# 下期侧重配额：侧重 : 次侧重 : 垫后 = 3 : 2 : 1。
-# 8 注且三池都有号 → 4 / 3 / 1；10 注 → 5 / 3 / 2。空池跳过，权重顺延。
+# 下期侧重配额：侧重顺序里第 1 / 2 / 3 池权重 = 3 : 2 : 1。
+# 两池侧重（如小→常+大）→ 约 3:2；单池侧重（大→只小）→ 全给该池。
+# 空池跳过，权重顺延；侧重池装不满时再按 WAVE_ORDER 接未列入的池兜底。
 FOCUS_QUOTA_WEIGHTS = (3, 2, 1)
 
 
@@ -2013,11 +2020,22 @@ def focus_wave_quotas(
 
     ``focus`` 第一个是本期主侧重。空池不参与，权重按剩余池顺延。
     某池装不下配额时，余数按侧重顺序补给仍有空位的池。
+    侧重池总容量仍不够 ``pick_count`` 时，按 ``WAVE_ORDER`` 把未列入
+    focus 的非空池接在后面做兜底（避免「大跳只侧重小、小池又空 → 0 注」）。
     """
     total = max(0, int(pick_count))
     quota = {wave: 0 for wave in WAVE_ORDER}
     caps = {wave: max(0, int(available.get(wave, 0))) for wave in WAVE_ORDER}
     ordered = [wave for wave in focus if caps.get(wave, 0) > 0]
+    capacity = sum(caps[wave] for wave in ordered)
+    if capacity < total:
+        for wave in WAVE_ORDER:
+            if wave in ordered or caps.get(wave, 0) <= 0:
+                continue
+            ordered.append(wave)
+            capacity += caps[wave]
+            if capacity >= total:
+                break
     if total <= 0 or not ordered:
         return quota
     weights = [
@@ -3250,8 +3268,8 @@ def recommend(
         #   drain                           = 旧行为（逐桶取满，仅历史审计复用）。
         # 点阵不再「先在预测波动桶取满」：它只改抽样概率，不改取号顺序 / 桶配额。
         if wave_alloc == WAVE_ALLOC_BALANCED:
-            # 下期侧重：配额按上一期波动的侧重顺序 3:2:1（8 注 → 4/3/1），
-            # 不再按非空桶均分。空池跳过。
+            # 下期侧重：配额按上一期波动的侧重顺序加权（两池约 3:2，三池 3:2:1；
+            # 单池侧重则全给该池）。空池跳过；侧重池不够再 WAVE_ORDER 兜底。
             quotas = focus_wave_quotas(
                 pick_count,
                 focus,
@@ -3341,8 +3359,11 @@ def recommend(
                         break
 
     # 角色按侧重顺序分配 —— 在侧重顺序中出现越靠前的波动类型越优先，
-    # 依次获得 主推 / 次选 / 防守…（focus 恒含全部三类波动）。
-    picks.sort(key=lambda pick: focus.index(pick["wave_type"]))
+    # 依次获得 主推 / 次选 / 防守…。focus 可能不含全部三类（兜底池排后）。
+    focus_rank = {wave: index for index, wave in enumerate(focus)}
+    for index, wave in enumerate(WAVE_ORDER):
+        focus_rank.setdefault(wave, len(focus) + index)
+    picks.sort(key=lambda pick: focus_rank[pick["wave_type"]])
     role_weights = role_amount_weights(cfg)
     if ladder_rows is not None:
         # 候选不足时从防守那一端截掉，主攻 / 常规优先保留
@@ -3615,7 +3636,8 @@ def recommend(
     elif wave_alloc == WAVE_ALLOC_BALANCED and pick_sampling == PICK_SAMPLING_SEEDED_RANDOM:
         notes.append(
             "选号策略为波动轮取（下期侧重 + 种子随机）：按上一期波动把注数分给侧重池"
-            f"（权重 3:2:1，{pick_count} 注在三池都有号时主侧重最多），"
+            f"（侧重顺序权重 3:2:1，{pick_count} 注；上期小→常+大，上期常规→小+大，"
+            "上期大→只小；侧重池不够再按小→常→大兜底），"
             "空池跳过。再在每个桶的配额内按「点阵概率分布」用**期号种子随机**不放回抽样。"
             "命中概率与期望值完全不变（任意"
             f" {pick_count} 个不同号命中概率恒为 {pick_count}/49），"
@@ -3624,7 +3646,8 @@ def recommend(
     elif wave_alloc == WAVE_ALLOC_BALANCED:
         notes.append(
             "选号策略为波动轮取（下期侧重 + 按名次）：按上一期波动把注数分给侧重池"
-            f"（权重 3:2:1，{pick_count} 注在三池都有号时主侧重最多），"
+            f"（侧重顺序权重 3:2:1，{pick_count} 注；上期小→常+大，上期常规→小+大，"
+            "上期大→只小；侧重池不够再按小→常→大兜底），"
             "桶内优先挑「离已选号码最远」的号。"
             "该口径为**确定性**（不随机），供历史审计快照复现。"
             "命中概率与期望值完全不变（任意"

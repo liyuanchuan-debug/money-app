@@ -303,7 +303,7 @@ def test_missing_wave_reported_and_filled():
 # 5. 侧重（回补）角色分配（决策 1）
 # --------------------------------------------------------------------------- #
 def test_prev_small_focus_puts_normal_first():
-    # |10 - 5| = 5 → 上期小波动，侧重顺序 [常规, 大跳, 小波动]
+    # |10 - 5| = 5 → 上期小波动，侧重顺序 [常规, 大跳]（不回补小）
     # 关闭点阵：本用例只校验侧重角色分配（点阵另有专门用例覆盖）
     result = recommend(
         latest=10,
@@ -313,12 +313,13 @@ def test_prev_small_focus_puts_normal_first():
     )
 
     assert result["prev_wave"]["type"] == WAVE_SMALL
+    assert [item["type"] for item in result["focus_order"]] == [WAVE_NORMAL, WAVE_BIG]
     primary = next(pick for pick in result["picks"] if pick["role"] == "primary")
     assert primary["wave_type"] == WAVE_NORMAL
 
 
 def test_prev_big_focus_puts_small_first():
-    # |1 - 40| = 39 → 上期大跳，侧重顺序 [小波动, 常规, 大跳]
+    # |1 - 40| = 39 → 上期大跳，侧重顺序 [小波动]（只小回补）
     result = recommend(
         latest=1,
         previous=40,
@@ -327,6 +328,7 @@ def test_prev_big_focus_puts_small_first():
     )
 
     assert result["prev_wave"]["type"] == WAVE_BIG
+    assert [item["type"] for item in result["focus_order"]] == [WAVE_SMALL]
     primary = next(pick for pick in result["picks"] if pick["role"] == "primary")
     assert primary["wave_type"] == WAVE_SMALL
 
@@ -446,7 +448,7 @@ def test_default_wave_alloc_is_balanced():
 
 
 def test_focus_alloc_follows_previous_wave():
-    """默认选号按上期波动侧重分配额：上期小波动、10 码 → 常规 5、大跳 3、小波动 2。"""
+    """默认选号按上期波动侧重分配额：上期小波动、10 码 → 常规 6、大跳 4（不回补小）。"""
     from collections import Counter
 
     result = recommend(
@@ -468,11 +470,59 @@ def test_focus_alloc_follows_previous_wave():
     assert len(numbers) == 10
     assert len(set(numbers)) == 10
     counts = Counter(pick["wave_type"] for pick in result["picks"])
-    assert counts[WAVE_NORMAL] == 5
-    assert counts[WAVE_BIG] == 3
-    assert counts[WAVE_SMALL] == 2
+    assert counts[WAVE_NORMAL] == 6
+    assert counts[WAVE_BIG] == 4
+    assert counts.get(WAVE_SMALL, 0) == 0
     assert any("下期侧重" in note for note in result["notes"])
     assert any("期望值" in note for note in result["notes"])
+
+
+def test_focus_alloc_prev_big_all_to_small_when_available():
+    """上期大跳 → 只侧重小回补：小池有号时 8 码全进小波动。"""
+    from collections import Counter
+
+    from services.lottery import FOCUS_BY_PREV_WAVE, focus_wave_quotas
+
+    assert FOCUS_BY_PREV_WAVE[WAVE_BIG] == [WAVE_SMALL]
+    assert focus_wave_quotas(
+        8, [WAVE_SMALL], {WAVE_SMALL: 20, WAVE_NORMAL: 20, WAVE_BIG: 9}
+    ) == {WAVE_SMALL: 8, WAVE_NORMAL: 0, WAVE_BIG: 0}
+
+    # |5 - 40| = 35 → 上期大跳；latest=5 时小波动桶 = 1..15（含自身）
+    result = recommend(
+        latest=5,
+        previous=40,
+        history_numbers=[5, 40, 12, 28, 8, 33, 15, 45] * 3,
+        settings={
+            "pick_count": 8,
+            "mode": "ladder",
+            "small_max": 10,
+            "normal_max": 30,
+            "lattice_enabled": False,
+            "avoid_cold_enabled": False,
+            "wave_alloc": WAVE_ALLOC_BALANCED,
+            "pick_sampling": "ranked",
+            "restrict_recent_zodiacs": False,
+        },
+    )
+    assert result["prev_wave"]["type"] == WAVE_BIG
+    counts = Counter(pick["wave_type"] for pick in result["picks"])
+    assert len(result["picks"]) == 8
+    assert counts.get(WAVE_SMALL, 0) == 8
+    assert counts.get(WAVE_NORMAL, 0) == 0
+    assert counts.get(WAVE_BIG, 0) == 0
+
+
+def test_focus_wave_quotas_falls_back_when_primary_pool_empty():
+    """大跳只侧重小，但小池为空时按 WAVE_ORDER 兜底到常/大，仍凑满注数。"""
+    from services.lottery import focus_wave_quotas
+
+    quota = focus_wave_quotas(
+        8, [WAVE_SMALL], {WAVE_SMALL: 0, WAVE_NORMAL: 20, WAVE_BIG: 9}
+    )
+    assert quota[WAVE_SMALL] == 0
+    assert quota[WAVE_NORMAL] + quota[WAVE_BIG] == 8
+    assert sum(quota.values()) == 8
 
 
 def test_balanced_alloc_is_deterministic():

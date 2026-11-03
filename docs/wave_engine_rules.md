@@ -222,15 +222,16 @@ if stale:                                  weight *= stale_weight           # 0.
 `score_top` = 「全候选池打分取前 N」。取完之后，**按侧重顺序**把 10 注分成
 主推 1 注、次选/防守交替（3:2:1 是**金额**权重，不是注数配额）。
 
-### 5.1 侧重顺序 `FOCUS_BY_PREV_WAVE`（`lottery.py:217-223`）
+### 5.1 侧重顺序 `FOCUS_BY_PREV_WAVE`
 
 ```python
-small  → [normal, big,    small]
-normal → [small,  big,    normal]
-big    → [small,  normal, big]
+small  → [normal, big]   # 不回补小
+normal → [small,  big]   # 不回补常规
+big    → [small]         # 只小回补
 ```
 
-上期波动类型决定本期三类波动的侧重次序，第一个即主推方向（`lottery.py:2030-2043`）。
+上期波动类型决定本期侧重次序，第一个即主推方向。侧重池容量不够装下全部注数时，
+`focus_wave_quotas` 再按 `WAVE_ORDER`（小→常→大）把未列入的池接上兜底。
 
 ### 5.2 路径 A：`wave_round`（默认，`lottery.py:2197-2212`）
 
