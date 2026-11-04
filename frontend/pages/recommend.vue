@@ -50,8 +50,8 @@ const BET_COUNT_MAX = 10
 
 /** 临时预览用的筹码模式：初值仍来自设置页保存的默认值 */
 const mode = ref<ChipMode>('ladder')
-/** 临时预览：注数（档位默认 8，可改；其它模式同样跟本页控件） */
-const betCount = ref(8)
+/** 临时预览：注数（档位默认 6，可改；其它模式同样跟本页控件） */
+const betCount = ref(6)
 /** 档位尖刀：15 或 20，只影响第一注主攻 */
 const stakeTop = ref<15 | 20>(15)
 const stakeTopOptions = [15, 20] as const
