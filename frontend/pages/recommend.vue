@@ -714,6 +714,8 @@ const latestNumberNextDraws = computed(() => {
       number: number
       fromPeriod: number | null
       toPeriod: number | null
+      /** 该次「下一期实开」距本池最新一期隔了几期（0 = 就是最新一期） */
+      periodsAgo: number
     }>,
   }
   if (!draws.length) return empty
@@ -727,6 +729,7 @@ const latestNumberNextDraws = computed(() => {
     number: number
     fromPeriod: number | null
     toPeriod: number | null
+    periodsAgo: number
   }> = []
   for (let index = 1; index < draws.length; index += 1) {
     if (draws[index].special_number !== anchor) continue
@@ -735,6 +738,8 @@ const latestNumberNextDraws = computed(() => {
       number: next.special_number,
       fromPeriod: draws[index].period,
       toPeriod: next.period,
+      // 下一期实开在 newest-first 下标 index-1 → 距最新隔了 index-1 期
+      periodsAgo: index - 1,
     })
   }
   return { anchor, successors }
@@ -1896,19 +1901,28 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                         · {{ latestNumberNextDraws.successors.length }} 次
                       </template>
                     </span>
-                    <template v-if="latestNumberNextDraws.successors.length">
-                      <StatChip
+                    <span
+                      v-if="latestNumberNextDraws.successors.length"
+                      class="inline-flex flex-wrap items-center justify-end gap-x-3 gap-y-1.5"
+                    >
+                      <span
                         v-for="(item, index) in latestNumberNextDraws.successors"
                         :key="`${item.fromPeriod}-${item.toPeriod}-${item.number}-${index}`"
-                        tone="aqua"
-                        size="xs"
+                        class="inline-flex items-center gap-1.5"
                         :title="item.fromPeriod != null && item.toPeriod != null
-                          ? `第 ${item.fromPeriod} 期开 ${pad(latestNumberNextDraws.anchor!)} 后，第 ${item.toPeriod} 期开 ${pad(item.number)}`
-                          : `下一期曾开 ${pad(item.number)}`"
+                          ? `第 ${item.fromPeriod} 期开 ${pad(latestNumberNextDraws.anchor!)} 后，第 ${item.toPeriod} 期开 ${pad(item.number)}（${item.periodsAgo === 0 ? '即最新一期' : `${item.periodsAgo} 期前`}）`
+                          : `下一期曾开 ${pad(item.number)}（${item.periodsAgo === 0 ? '即最新一期' : `${item.periodsAgo} 期前`}）`"
                       >
-                        {{ pad(item.number) }}
-                      </StatChip>
-                    </template>
+                        <StatChip tone="aqua" size="xs">
+                          {{ pad(item.number) }}
+                        </StatChip>
+                        <span
+                          class="num rounded-md border border-slate-500/35 bg-slate-500/10 px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-slate-400"
+                        >
+                          {{ item.periodsAgo === 0 ? '最新' : `${item.periodsAgo}期前` }}
+                        </span>
+                      </span>
+                    </span>
                     <span
                       v-else
                       class="text-[11px] text-amber-200/90"
