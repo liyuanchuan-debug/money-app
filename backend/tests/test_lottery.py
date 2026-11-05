@@ -245,7 +245,7 @@ def test_recommend_sweep(
     if mode == MODE_LADDER:
         from services.lottery import stake_ladder
 
-        expected = stake_ladder(15, pick_count)
+        expected = stake_ladder(10, pick_count)
         assert len(picks) == len(expected)
         assert [pick["amount"] for pick in picks] == [amount for _, amount in expected]
         assert result["total_amount"] == sum(amount for _, amount in expected)
@@ -456,7 +456,7 @@ def test_default_wave_alloc_is_balanced():
 
 
 def test_focus_alloc_follows_previous_wave():
-    """上期小波动、10 码 → 常 5、大 3、小 2（主推/次/防守 4:2:2）。"""
+    """上期小波动、10 码 → 常 4、大 3、小 3（主推/次/防守 2:2:2，余数给主侧重）。"""
     from collections import Counter
 
     result = recommend(
@@ -478,30 +478,25 @@ def test_focus_alloc_follows_previous_wave():
     assert len(numbers) == 10
     assert len(set(numbers)) == 10
     counts = Counter(pick["wave_type"] for pick in result["picks"])
-    assert counts[WAVE_NORMAL] == 5
+    assert counts[WAVE_NORMAL] == 4
     assert counts[WAVE_BIG] == 3
-    assert counts[WAVE_SMALL] == 2
+    assert counts[WAVE_SMALL] == 3
     assert any("下期侧重" in note for note in result["notes"])
     assert any("期望值" in note for note in result["notes"])
 
 
 def test_focus_alloc_prev_big_keeps_defense_slots():
-    """上期大跳 → 主推小，常/大留防守（4:2:2；6 码最大余数下为 3:2:1）。"""
+    """上期大跳 → 三池均分（2:2:2；6 码为 2:2:2）。"""
     from collections import Counter
 
     from services.lottery import FOCUS_BY_PREV_WAVE, focus_wave_quotas
 
     assert FOCUS_BY_PREV_WAVE[WAVE_BIG] == [WAVE_SMALL, WAVE_NORMAL, WAVE_BIG]
     assert focus_wave_quotas(
-        8,
-        [WAVE_SMALL, WAVE_NORMAL, WAVE_BIG],
-        {WAVE_SMALL: 20, WAVE_NORMAL: 20, WAVE_BIG: 9},
-    ) == {WAVE_SMALL: 4, WAVE_NORMAL: 2, WAVE_BIG: 2}
-    assert focus_wave_quotas(
         6,
         [WAVE_SMALL, WAVE_NORMAL, WAVE_BIG],
         {WAVE_SMALL: 20, WAVE_NORMAL: 20, WAVE_BIG: 9},
-    ) == {WAVE_SMALL: 3, WAVE_NORMAL: 2, WAVE_BIG: 1}
+    ) == {WAVE_SMALL: 2, WAVE_NORMAL: 2, WAVE_BIG: 2}
 
     result = recommend(
         latest=5,
@@ -522,9 +517,9 @@ def test_focus_alloc_prev_big_keeps_defense_slots():
     assert result["prev_wave"]["type"] == WAVE_BIG
     counts = Counter(pick["wave_type"] for pick in result["picks"])
     assert len(result["picks"]) == 6
-    assert counts.get(WAVE_SMALL, 0) == 3
+    assert counts.get(WAVE_SMALL, 0) == 2
     assert counts.get(WAVE_NORMAL, 0) == 2
-    assert counts.get(WAVE_BIG, 0) == 1
+    assert counts.get(WAVE_BIG, 0) == 2
 
 
 def test_focus_wave_quotas_falls_back_when_primary_pool_empty():
@@ -558,19 +553,19 @@ def test_user_rule_latest_26_prev_21_big_empty_uses_small_defense():
     assert 42 in pools[WAVE_NORMAL] and 4 in pools[WAVE_NORMAL]
     assert 19 in pools[WAVE_SMALL]
 
-    # 大跳空 → 权重顺延：4:2 → 3注时常规2 + 小1
+    # 大跳空 → 权重顺延：2:2 → 3注时常规2 + 小1
     quota = focus_wave_quotas(
         3, focus, {w: len(pools[w]) for w in (WAVE_SMALL, WAVE_NORMAL, WAVE_BIG)}
     )
     assert quota == {WAVE_SMALL: 1, WAVE_NORMAL: 2, WAVE_BIG: 0}
 
-    # 本期（latest=15 上期常）8 码 4:2:2 → 小4 / 大2 / 常2
-    q307 = focus_wave_quotas(
-        8,
+    # 6 码上期常规 → 2:2:2 → 小2 / 大2 / 常2
+    q6 = focus_wave_quotas(
+        6,
         FOCUS_BY_PREV_WAVE[WAVE_NORMAL],
         {"small": 21, "normal": 24, "big": 4},
     )
-    assert q307 == {WAVE_SMALL: 4, WAVE_NORMAL: 2, WAVE_BIG: 2}
+    assert q6 == {WAVE_SMALL: 2, WAVE_NORMAL: 2, WAVE_BIG: 2}
     assert classify_wave(abs(42 - 15), 10, 30) == WAVE_NORMAL
 
 
@@ -3825,7 +3820,7 @@ def test_recommend_api_unfundable_override_returns_no_ticket():
 
 
 def test_stake_ladder_tier_counts_caps():
-    """一档1～2、二档≤3、五元档≤5；注数≥20 时一档升到 2。"""
+    """尖刀15/20：一档1～2、二档≤3、五元档≤5；尖刀10：10元最多2、其余3。"""
     from services.lottery import stake_ladder_tier_counts
 
     assert stake_ladder_tier_counts(1) == (1, 0, 0, 0)
@@ -3833,30 +3828,47 @@ def test_stake_ladder_tier_counts_caps():
     assert stake_ladder_tier_counts(10) == (1, 3, 5, 1)
     assert stake_ladder_tier_counts(16) == (1, 3, 5, 7)
     assert stake_ladder_tier_counts(20) == (2, 3, 5, 10)
+    # 尖刀 10：最多 2 注 10 元，其余全 3
+    assert stake_ladder_tier_counts(1, 10) == (1, 0, 0, 0)
+    assert stake_ladder_tier_counts(2, 10) == (2, 0, 0, 0)
+    assert stake_ladder_tier_counts(8, 10) == (2, 0, 0, 6)
+    assert stake_ladder_tier_counts(10, 10) == (2, 0, 0, 8)
 
 
 def test_stake_ladder_default_eight_and_count_switch():
-    """档位：一档1～2、二档≤3、五元档≤5、其余3元；尖刀15/20合计跟着变。"""
+    """档位：尖刀10=10×2+其余3；尖刀15/20 仍走四档。"""
+    from services.lottery import STAKE_TOP_DEFAULT
+
     history = [18, 7, 33, 12, 41, 5, 26, 9]
     base = dict(pick_count=8, total_amount=50, amount_unit=5, avoid_cold_enabled=False)
+    assert STAKE_TOP_DEFAULT == 10
+    default_ten = recommend(
+        latest=18, previous=7, history_numbers=history, settings=base, mode=MODE_LADDER,
+    )
     fifteen = recommend(
         latest=18, previous=7, history_numbers=history, settings={**base, "stake_top": 15}, mode=MODE_LADDER,
     )
     twenty = recommend(
         latest=18, previous=7, history_numbers=history, settings={**base, "stake_top": 20}, mode=MODE_LADDER,
     )
-    ten = recommend(
+    ten_picks = recommend(
         latest=18, previous=7, history_numbers=history,
-        settings={**base, "pick_count": 10, "stake_top": 15}, mode=MODE_LADDER,
+        settings={**base, "pick_count": 10, "stake_top": 10}, mode=MODE_LADDER,
     )
-    # 8 注：尖刀1 + 10元×3 + 5元×4
+    # 8 注默认尖刀10：10×2 + 3×6
+    assert [p["amount"] for p in default_ten["picks"]] == [10, 10, 3, 3, 3, 3, 3, 3]
+    assert default_ten["total_amount"] == 38
+    assert any("尖刀 2 注各 10 元" in note for note in default_ten["notes"])
+    assert any("3 元档 6 注" in note for note in default_ten["notes"])
+    assert any("10 元最多 2 注" in note for note in default_ten["notes"])
+    # 8 注尖刀15/20：尖刀1 + 10元×3 + 5元×4
     assert [p["amount"] for p in fifteen["picks"]] == [15, 10, 10, 10, 5, 5, 5, 5]
     assert fifteen["total_amount"] == 65
     assert [p["amount"] for p in twenty["picks"]] == [20, 10, 10, 10, 5, 5, 5, 5]
     assert twenty["total_amount"] == 70
-    # 10 注（引擎上限）：尖刀1 + 10元×3 + 5元×5 + 3元×1
-    assert [p["amount"] for p in ten["picks"]] == [15, 10, 10, 10, 5, 5, 5, 5, 5, 3]
-    assert ten["total_amount"] == 73
+    # 10 注尖刀10：10×2 + 3×8
+    assert [p["amount"] for p in ten_picks["picks"]] == [10, 10, 3, 3, 3, 3, 3, 3, 3, 3]
+    assert ten_picks["total_amount"] == 44
     assert {p["number"] for p in fifteen["picks"]} == {p["number"] for p in twenty["picks"]}
     assert any("不按固定总预算" in note for note in fifteen["notes"])
 

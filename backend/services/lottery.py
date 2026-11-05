@@ -78,9 +78,10 @@ TOTAL_AMOUNT_MAX = 100
 DEFAULT_TOTAL_AMOUNT = 50
 DEFAULT_PICK_COUNT = 6
 # 档位（mode=ladder）：金额先按角色定，合计 = 各注之和，不锁死总预算。
-# 容量：尖刀 1～2（≥11 注时 2）→ 10 元 ≤3 → 5 元 ≤5 → 其余 3 元；默认 8 码。
-STAKE_TOP_DEFAULT = 15
-STAKE_TOP_CHOICES = (15, 20)
+# 尖刀 15/20：尖刀 1～2 → 10 元 ≤3 → 5 元 ≤5 → 其余 3 元；默认 8 码。
+# 尖刀 10：10 元最多 2 注，其余全部 3 元（无二档 / 五元档）。
+STAKE_TOP_DEFAULT = 10
+STAKE_TOP_CHOICES = (10, 15, 20)
 STAKE_ATTACK_SECOND = 10
 STAKE_REGULAR = 5
 STAKE_DEFENSE = 3
@@ -89,7 +90,7 @@ STAKE_TIP_MAX = 2
 STAKE_ATTACK_SECOND_MAX = 3
 STAKE_REGULAR_MAX = 5
 STAKE_LADDER_DEFAULT_COUNT = 8
-# 注数达到该值时一档可升到 2 注，否则默认 1 注（16 注样例为 1+3+5+其余）
+# 尖刀 15/20：注数达到该值时一档可升到 2 注，否则默认 1 注
 STAKE_TIP_TWO_MIN_COUNT = 20
 LADDER_ROLE_LABELS = {
     ROLE_PRIMARY: "主攻",
@@ -503,7 +504,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "amount_unit": DEFAULT_AMOUNT_UNIT,
     "mode": MODE_EVEN,
     "pick_count": DEFAULT_PICK_COUNT,
-    # 档位尖刀金额：只允许 15 或 20；档位模式以外不参与分配
+    # 档位尖刀金额：只允许 10 / 15 / 20；档位模式以外不参与分配
     "stake_top": STAKE_TOP_DEFAULT,
     # 特码兑付倍数（用户设定；默认 47）
     "odds": DEFAULT_ODDS,
@@ -1933,17 +1934,26 @@ def take_from_role_band(
     return None
 
 
-def stake_ladder_tier_counts(count: int) -> tuple[int, int, int, int]:
+def stake_ladder_tier_counts(
+    count: int,
+    top: int | None = None,
+) -> tuple[int, int, int, int]:
     """按注数切分四档容量：``(尖刀, 10元, 5元, 3元)``。
 
-    - 一档（尖刀）：1～2（注数 ≥ ``STAKE_TIP_TWO_MIN_COUNT`` 时取 2，否则 1）
-    - 二档（10 元）：不超过 ``STAKE_ATTACK_SECOND_MAX``
-    - 五元档：不超过 ``STAKE_REGULAR_MAX``
-    - 其余全部进 3 元档
+    - 尖刀 10：10 元最多 ``STAKE_TIP_MAX``（2）注，其余全进 3 元（无二档 / 五元档）
+    - 尖刀 15/20：
+      - 一档（尖刀）：1～2（注数 ≥ ``STAKE_TIP_TWO_MIN_COUNT`` 时取 2，否则 1）
+      - 二档（10 元）：不超过 ``STAKE_ATTACK_SECOND_MAX``
+      - 五元档：不超过 ``STAKE_REGULAR_MAX``
+      - 其余全部进 3 元档
     """
     target = max(0, int(count))
     if target <= 0:
         return 0, 0, 0, 0
+    tip = int(top) if top is not None and int(top) in STAKE_TOP_CHOICES else None
+    if tip == STAKE_ATTACK_SECOND:
+        tip_n = min(STAKE_TIP_MAX, target)
+        return tip_n, 0, 0, target - tip_n
     tip_n = min(STAKE_TIP_MAX, 2 if target >= STAKE_TIP_TWO_MIN_COUNT else 1, target)
     rem = target - tip_n
     second_n = min(STAKE_ATTACK_SECOND_MAX, rem)
@@ -1959,13 +1969,14 @@ def stake_ladder(
 ) -> list[tuple[str, int]]:
     """档位金额表：``(角色, 金额)``，默认 8 码，注数可改。
 
-    顺序：尖刀（1～2）→ 10 元（≤3）→ 5 元（≤5）→ 其余 3 元。
-    ``top`` 只接受 15 或 20。``count`` 夹在 1–PICK_COUNT_MAX；候选不足时由调用方再截。
+    尖刀 10：最多 2 注 10 元，其余 3 元。
+    尖刀 15/20：尖刀 → 10 元（≤3）→ 5 元（≤5）→ 其余 3 元。
+    ``top`` 只接受 10 / 15 / 20。``count`` 夹在 1–PICK_COUNT_MAX；候选不足时由调用方再截。
     """
     tip = int(top) if int(top) in STAKE_TOP_CHOICES else STAKE_TOP_DEFAULT
     target = STAKE_LADDER_DEFAULT_COUNT if count is None else int(count)
     target = min(PICK_COUNT_MAX, max(PICK_COUNT_MIN, target))
-    tip_n, second_n, regular_n, defense_n = stake_ladder_tier_counts(target)
+    tip_n, second_n, regular_n, defense_n = stake_ladder_tier_counts(target, tip)
     rows: list[tuple[str, int]] = []
     rows.extend((ROLE_PRIMARY, tip) for _ in range(tip_n))
     rows.extend((ROLE_PRIMARY, STAKE_ATTACK_SECOND) for _ in range(second_n))
@@ -2024,10 +2035,9 @@ def balanced_wave_quotas(
     return quota
 
 
-# 下期侧重配额：主推 / 次侧重 / 防守 = 4 : 2 : 2。
-# 8 码整除为 4:2:2（防守不再只剩 1 注）；某池空则跳过、权重顺延
-# （上期小且大跳空时，常规:小 ≈ 2:1）。
-FOCUS_QUOTA_WEIGHTS = (4, 2, 2)
+# 下期侧重配额：主推 / 次侧重 / 防守 = 2 : 2 : 2（三池均分）。
+# 6 码整除为 2:2:2；某池空则跳过、权重顺延。
+FOCUS_QUOTA_WEIGHTS = (2, 2, 2)
 
 
 def focus_wave_quotas(
@@ -2988,18 +2998,22 @@ def recommend(
         ladder_rows = stake_ladder(int(cfg["stake_top"]), pick_count)
         pick_count = len(ladder_rows)
         total = sum(amount for _, amount in ladder_rows)
-        tip_n = sum(1 for _, amount in ladder_rows if amount in STAKE_TOP_CHOICES)
-        second_n = sum(1 for _, amount in ladder_rows if amount == STAKE_ATTACK_SECOND)
-        regular_n = sum(1 for _, amount in ladder_rows if amount == STAKE_REGULAR)
-        defense_n = sum(1 for _, amount in ladder_rows if amount == STAKE_DEFENSE)
         tip_amount = ladder_rows[0][1] if ladder_rows else STAKE_TOP_DEFAULT
+        tip_n, second_n, regular_n, defense_n = stake_ladder_tier_counts(
+            pick_count, tip_amount
+        )
+        if tip_amount == STAKE_ATTACK_SECOND:
+            rule_note = "尖刀 10：10 元最多 2 注，其余 3 元。"
+        else:
+            rule_note = "尖刀 15/20：一档≤2、二档≤3、五元档≤5，其余进 3 元。"
         allocation_notes.append(
             "档位金额不按固定总预算拆分："
             f"{pick_count} 码按档相加（尖刀 {tip_n} 注各 {tip_amount} 元"
             + (f"、10 元档 {second_n} 注" if second_n else "")
             + (f"、5 元档 {regular_n} 注" if regular_n else "")
             + (f"、3 元档 {defense_n} 注" if defense_n else "")
-            + f"）；合计 {total} 元。尖刀只取 15 或 20；一档≤2、二档≤3、五元档≤5，其余进 3 元。"
+            + f"）；合计 {total} 元。"
+            + rule_note
         )
         no_ticket_reason = None
         no_ticket_message = None
@@ -3319,7 +3333,7 @@ def recommend(
         #   drain                           = 旧行为（逐桶取满，仅历史审计复用）。
         # 点阵不再「先在预测波动桶取满」：它只改抽样概率，不改取号顺序 / 桶配额。
         if wave_alloc == WAVE_ALLOC_BALANCED:
-            # 下期侧重：配额按上一期波动的侧重顺序加权（三池 4:2:2；
+            # 下期侧重：配额按上一期波动的侧重顺序加权（三池 2:2:2 均分；
             # 空池跳过、权重顺延）。侧重池不够再 WAVE_ORDER 兜底。
             quotas = focus_wave_quotas(
                 pick_count,
@@ -3695,7 +3709,7 @@ def recommend(
     elif wave_alloc == WAVE_ALLOC_BALANCED and pick_sampling == PICK_SAMPLING_SEEDED_RANDOM:
         notes.append(
             "选号策略为波动轮取（下期侧重 + 种子随机）：按上一期波动把注数分给"
-            f"主侧重/次侧重/同型防守（权重 4:2:2，{pick_count} 注；"
+            f"主侧重/次侧重/同型防守（权重 2:2:2，三池均分，{pick_count} 注；"
             "上期小→常>大>小，上期常规→小>大>常，上期大→小>常>大；"
             "空池跳过，不够再按小→常→大兜底）。"
             "再在每个桶的配额内按「点阵概率分布」用**期号种子随机**不放回抽样。"
@@ -3706,7 +3720,7 @@ def recommend(
     elif wave_alloc == WAVE_ALLOC_BALANCED:
         notes.append(
             "选号策略为波动轮取（下期侧重 + 按名次）：按上一期波动把注数分给"
-            f"主侧重/次侧重/同型防守（权重 4:2:2，{pick_count} 注；"
+            f"主侧重/次侧重/同型防守（权重 2:2:2，三池均分，{pick_count} 注；"
             "上期小→常>大>小，上期常规→小>大>常，上期大→小>常>大；"
             "空池跳过，不够再按小→常→大兜底）。"
             "桶内优先挑「离已选号码最远」的号。"

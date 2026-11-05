@@ -389,9 +389,9 @@ def test_lattice_band_is_sampled_more_often_than_the_quota_aware_uniform_expecta
 
     measured_mean = statistics.fmean(measured)
     expected_mean = statistics.fmean(expected)
-    # 点阵加权把带内入选推高到「同桶均匀」期望之上（4:2:2 配额口径）
+    # 点阵加权把带内入选推高到「同桶均匀」期望之上（2:2:2 配额口径）
     assert measured_mean > expected_mean
-    assert measured_mean - expected_mean == pytest.approx(0.634, abs=0.05)
+    assert measured_mean - expected_mean == pytest.approx(0.662, abs=0.05)
     # 同桶内条件概率：带内 > 带外
     assert cond_in / avail_in > cond_out / avail_out
     # 预测带绝大多数期同时覆盖 normal 与 small 两个桶
@@ -428,7 +428,7 @@ def test_seeded_sampling_keeps_exact_count_distinctness_and_balanced_shape():
         max_bucket_counts.append(top)
         assert top < 10
 
-    assert statistics.fmean(max_bucket_counts) == pytest.approx(5.6, abs=0.8)
+    assert statistics.fmean(max_bucket_counts) == pytest.approx(4.37, abs=0.8)
 
 
 def test_legacy_drain_is_still_available_and_still_clumps():

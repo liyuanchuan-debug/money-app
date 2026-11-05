@@ -50,8 +50,8 @@ class SettingsOut(BaseModel):
     bet_unit: int
     mode: str
     pick_count: int
-    # 档位尖刀：15 或 20；只在 mode=ladder 时决定第一注主攻金额
-    stake_top: int = 15
+    # 档位尖刀：10 / 15 / 20；只在 mode=ladder 时决定第一注主攻金额
+    stake_top: int = 10
     # 特码兑付倍数（用户设定；默认 47）
     odds: float
     # 避开重肖：True=候选池排除最新同肖；默认 False
@@ -127,7 +127,7 @@ class SettingsPatch(BaseModel):
     )
     mode: str | None = Field(default=None, pattern=MODE_PATTERN)
     stake_top: int | None = Field(
-        default=None, description="档位尖刀金额，只允许 15 或 20"
+        default=None, description="档位尖刀金额，只允许 10 / 15 / 20"
     )
     exclude_repeat_zodiac: bool | None = Field(
         default=None, description="True=避开最新一期同肖；默认 False"
@@ -310,5 +310,5 @@ class RecommendRequest(BaseModel):
         default=None, ge=TREND_WINDOW_MIN, le=TREND_WINDOW_MAX
     )
     stake_top: int | None = Field(
-        default=None, description="临场尖刀金额，只允许 15 或 20；不落库"
+        default=None, description="临场尖刀金额，只允许 10 / 15 / 20；不落库"
     )

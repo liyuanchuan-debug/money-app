@@ -101,7 +101,7 @@ const form = reactive({
   amount_unit: 5,
   odds: 47,
   mode: 'even' as ChipMode,
-  stake_top: 15 as 15 | 20,
+  stake_top: 10 as 10 | 15 | 20,
   exclude_repeat_zodiac: false,
   // 近期生肖：核心集最新 N 肖 + 肖外最多 M 个（默认开 / N=6 / M=2）
   restrict_recent_zodiacs: RESTRICT_RECENT_ZODIACS_DEFAULT,
@@ -131,7 +131,12 @@ const form = reactive({
   role_w_defense: ROLE_WEIGHT_DEFENSE_DEFAULT,
 })
 
-const stakeTopOptions = [15, 20] as const
+const stakeTopOptions = [10, 15, 20] as const
+
+function normalizeStakeTop(value: unknown): 10 | 15 | 20 {
+  if (value === 15 || value === 20) return value
+  return 10
+}
 
 const derivedBigMin = computed(() => form.normal_max + 1)
 
@@ -266,7 +271,7 @@ async function load() {
       : ROLE_WEIGHT_DEFENSE_DEFAULT
     // 只在后端返回合法枚举时覆盖，避免把状态搞成取值之外的脏值
     if (isChipMode(settings.mode)) form.mode = settings.mode
-    form.stake_top = settings.stake_top === 20 ? 20 : 15
+    form.stake_top = normalizeStakeTop(settings.stake_top)
     if (typeof settings.trend_window === 'number') form.trend_window = settings.trend_window
     // 缺字段 / 旧后端 → 默认关闭避冷（与 DEFAULT_SETTINGS 一致），阈值回退 60
     form.avoid_cold_enabled = settings.avoid_cold_enabled === true
@@ -453,7 +458,7 @@ async function save() {
       ? settings.role_w_defense
       : ROLE_WEIGHT_DEFENSE_DEFAULT
     if (isChipMode(settings.mode)) form.mode = settings.mode
-    form.stake_top = settings.stake_top === 20 ? 20 : 15
+    form.stake_top = normalizeStakeTop(settings.stake_top)
     if (typeof settings.trend_window === 'number') form.trend_window = settings.trend_window
     form.avoid_cold_enabled = settings.avoid_cold_enabled === true
     form.avoid_cold_days = typeof settings.avoid_cold_days === 'number'
@@ -575,7 +580,7 @@ const readonlyInputClass
                   均注：各注先保底 1 个单位，余量按下方「角色配额」分给主推 / 次选 / 防守（1:1:1 即严格均分）。
                   侧重：主推约占 4/6 单位，其余均分；单挑：只出 1 注（整份最大投注
                   押在一个号上）；随机分配：按最小单位随机拆给各注。四种模式的每一注金额都是最小单位的正整数倍。
-                  档位默认 8 码（注数可改）：尖刀主攻 15 或 20 元、另一注主攻 10 元、常规 3 注各 5 元、防守 3 注各 3 元；多于 8 再补防守 3 元，合计随各注相加。
+                  档位默认 8 码（注数可改）：尖刀 10（默认）= 10 元最多 2 注、其余 3 元；尖刀 15/20 = 尖刀 + 二档 10 元（≤3）+ 五元档（≤5）+ 其余 3 元。合计随各注相加。
                   保存后作为默认值：生成财富密码时按此模式分配筹码；在「波浪买入法」页面里临时切换只影响当次，
                   不改这里的默认值。
                 </p>

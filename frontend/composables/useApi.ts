@@ -11,7 +11,7 @@ export interface LotterySettings {
   bet_unit: number
   mode: string
   pick_count: number
-  /** 档位尖刀金额：15 或 20 */
+  /** 档位尖刀金额：10 / 15 / 20 */
   stake_top?: number
   /** 特码兑付倍数（用户设定；默认 47，不是收益承诺） */
   odds: number
@@ -101,7 +101,7 @@ export interface LotterySettingsPatch {
   amount_unit?: number
   mode?: ChipMode
   pick_count?: number
-  /** 档位尖刀金额：15 或 20 */
+  /** 档位尖刀金额：10 / 15 / 20 */
   stake_top?: number
   odds?: number
   exclude_repeat_zodiac?: boolean

@@ -52,9 +52,9 @@ const BET_COUNT_MAX = 10
 const mode = ref<ChipMode>('ladder')
 /** 临时预览：注数（档位默认 6，可改；其它模式同样跟本页控件） */
 const betCount = ref(6)
-/** 档位尖刀：15 或 20，只影响第一注主攻 */
-const stakeTop = ref<15 | 20>(15)
-const stakeTopOptions = [15, 20] as const
+/** 档位尖刀：10 / 15 / 20，只影响第一注主攻（默认 10） */
+const stakeTop = ref<10 | 15 | 20>(10)
+const stakeTopOptions = [10, 15, 20] as const
 /** 走势分布参考取样窗（仅展示；不改选号；本页切换不写库） */
 const trendWindow = ref(TREND_WINDOW_DEFAULT)
 const activeWaveTab = ref<'small' | 'normal' | 'big'>('small')
@@ -106,8 +106,11 @@ const [{ data: settings }, { data: rawDraws }] = await Promise.all([
   useAsyncData('settings', () => api.getSettings()),
   useAsyncData<DrawItem[]>('draws-sample', () => api.listDraws(SAMPLE_LIMIT, 0)),
 ])
-if (settings.value?.stake_top === 20) {
-  stakeTop.value = 20
+// 临场尖刀初值跟设置页已保存的 stake_top；缺省 / 非法回退产品默认 10
+if (settings.value?.stake_top === 10 || settings.value?.stake_top === 15 || settings.value?.stake_top === 20) {
+  stakeTop.value = settings.value.stake_top
+} else {
+  stakeTop.value = 10
 }
 if (typeof settings.value?.trend_window === 'number') {
   trendWindow.value = settings.value.trend_window
@@ -378,9 +381,17 @@ const STAKE_REGULAR_MAX = 5
 /** 注数达到该值才把一档升到 2；未满时保持 1 注尖刀（如 16 注 → 1+3+5+其余） */
 const STAKE_TIP_TWO_MIN_COUNT = 20
 
-function stakeLadderTierCounts(count: number): [number, number, number, number] {
+function stakeLadderTierCounts(
+  count: number,
+  tip: number,
+): [number, number, number, number] {
   const target = Math.max(0, Math.trunc(count))
   if (target <= 0) return [0, 0, 0, 0]
+  // 尖刀 10：10 元最多 2 注，其余全 3 元
+  if (tip === 10) {
+    const tipN = Math.min(STAKE_TIP_MAX, target)
+    return [tipN, 0, 0, target - tipN]
+  }
   const tipN = Math.min(
     STAKE_TIP_MAX,
     target >= STAKE_TIP_TWO_MIN_COUNT ? 2 : 1,
@@ -395,9 +406,9 @@ function stakeLadderTierCounts(count: number): [number, number, number, number] 
 }
 
 function stakeLadderAmounts(top: number, count: number): number[] {
-  const tip = top === 20 ? 20 : 15
+  const tip = top === 15 || top === 20 ? top : 10
   const n = Math.max(0, Math.min(49, Math.trunc(count)))
-  const [tipN, secondN, regularN, defenseN] = stakeLadderTierCounts(n)
+  const [tipN, secondN, regularN, defenseN] = stakeLadderTierCounts(n, tip)
   const rows: number[] = []
   for (let i = 0; i < tipN; i += 1) rows.push(tip)
   for (let i = 0; i < secondN; i += 1) rows.push(STAKE_ATTACK_SECOND)
@@ -646,39 +657,6 @@ const latestSixZodiacs = computed(() => {
   return out
 })
 
-/**
- * 最新特码历史上「出现过后的下一期」号码列表（纯展示，不参与选号）。
- * 开奖序列约定最新在前：锚点 = draws[0]；更早的同号出现在 i≥1，
- * 其下一期实开 = draws[i-1]（更新的那一期）。当前这一期尚无下一期，不计入。
- * 顺序 = 最近一次转移在前；同号可重复出现（每次历史都列）。
- */
-const latestNumberNextDraws = computed(() => {
-  const draws = normalizeDraws(rawDraws.value)
-  const anchor = draws[0]?.special_number
-  if (anchor == null) {
-    return { anchor: null as number | null, successors: [] as Array<{
-      number: number
-      fromPeriod: number | null
-      toPeriod: number | null
-    }> }
-  }
-  const successors: Array<{
-    number: number
-    fromPeriod: number | null
-    toPeriod: number | null
-  }> = []
-  for (let index = 1; index < draws.length; index += 1) {
-    if (draws[index].special_number !== anchor) continue
-    const next = draws[index - 1]
-    successors.push({
-      number: next.special_number,
-      fromPeriod: draws[index].period,
-      toPeriod: next.period,
-    })
-  }
-  return { anchor, successors }
-})
-
 /** 三中三：后端从预测带派生；点阵关闭 / 无带时仍回块，前端按 status 展示或隐藏 */
 const tripleSets = computed(() => result.value?.triple_sets ?? null)
 const tripleSetsReady = computed(() => tripleSets.value?.status === 'ok')
@@ -718,6 +696,49 @@ const waveTrendWindow = ref(WAVE_TREND_WINDOW_DEFAULT)
  * 1 = 最近已开奖那一期当时的预测；越大越早，可一直往前翻。
  */
 const latticeHistoryOffset = ref(0)
+
+/**
+ * 当前预测锚点特码历史上「出现过后的下一期」号码列表（纯展示，不参与选号）。
+ * 开奖序列约定最新在前；跟 latticeHistoryOffset 同步：
+ *   offset=0（本期）→ 锚点 draws[0]；offset>0（更早）→ 锚点 draws[offset]
+ *   （与点阵回放的历史锚点同号）。
+ * 更早的同号出现在更大下标，其下一期实开 = draws[i-1]。
+ * 本期尚无下一期，不把 draws[0] 自己算进去；回放期已有实开，会计入。
+ * 顺序 = 最近一次转移在前；同号可重复出现（每次历史都列）。
+ */
+const latestNumberNextDraws = computed(() => {
+  const draws = normalizeDraws(rawDraws.value)
+  const empty = {
+    anchor: null as number | null,
+    successors: [] as Array<{
+      number: number
+      fromPeriod: number | null
+      toPeriod: number | null
+    }>,
+  }
+  if (!draws.length) return empty
+  const offset = Math.max(
+    0,
+    Math.min(latticeHistoryOffset.value, draws.length - 1),
+  )
+  const anchor = draws[offset]?.special_number
+  if (anchor == null) return empty
+  const successors: Array<{
+    number: number
+    fromPeriod: number | null
+    toPeriod: number | null
+  }> = []
+  for (let index = 1; index < draws.length; index += 1) {
+    if (draws[index].special_number !== anchor) continue
+    const next = draws[index - 1]
+    successors.push({
+      number: next.special_number,
+      fromPeriod: draws[index].period,
+      toPeriod: next.period,
+    })
+  }
+  return { anchor, successors }
+})
 
 const latticeReplayWindow = computed(() => {
   const newestFirst = normalizeDraws(rawDraws.value)
@@ -1339,7 +1360,8 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
 
             <p class="text-xs leading-relaxed text-slate-500">
               本页默认走「档位」：默认 8 个码，注数可改；金额按档相加，不先锁一笔总预算。
-              一档尖刀 {{ stakeTop }} 元（1～2 注）、二档 10 元（≤3）、五元档（≤5），其余 3 元。
+              <template v-if="stakeTop === 10">尖刀 10 元最多 2 注，其余 3 元。</template>
+              <template v-else>一档尖刀 {{ stakeTop }} 元（1～2 注）、二档 10 元（≤3）、五元档（≤5），其余 3 元。</template>
               切到均注 / 侧重 / 单挑 / 随机分配后，才按最大投注金额拆分。
               要改默认请到
               <NuxtLink
@@ -1413,7 +1435,8 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               </div>
               <p class="text-xs leading-relaxed text-slate-500">
                 <template v-if="mode === 'ladder'">
-                  一档 {{ stakeTop }} 元（1～2）、二档 10 元（≤3）、五元档（≤5），其余 3 元。
+                  <template v-if="stakeTop === 10">尖刀 10 最多 2 注，其余 3 元。</template>
+                  <template v-else>一档 {{ stakeTop }} 元（1～2）、二档 10 元（≤3）、五元档（≤5），其余 3 元。</template>
                   改注数按档位容量重摊，不从固定总预算里拆。
                 </template>
                 <template v-else>
@@ -1442,7 +1465,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 各注 {{ result.picks[0]?.amount ?? result.bet_unit }} 元（最小单位 {{ result.amount_unit }} 元的倍数）
               </StatChip>
               <StatChip v-else-if="result.mode === 'ladder'" tone="amber" size="sm">
-                尖刀≤2 · 10元≤3 · 5元≤5 · 其余3元
+                {{ stakeTop === 10 ? '尖刀10最多2 · 其余3元' : '尖刀≤2 · 10元≤3 · 5元≤5 · 其余3元' }}
               </StatChip>
               <StatChip v-else tone="amber" size="sm">各注金额不等（均为最小单位倍数）</StatChip>
             </div>
@@ -2113,7 +2136,10 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               <div class="space-y-1">
                 <h2 class="text-lg font-medium text-white">投注串</h2>
                 <p class="text-xs leading-relaxed text-slate-500">
-                  按上方热力格勾选重排；档位：尖刀 {{ stakeTop }}（1～2）→10 元（≤3）→5 元（≤5）→其余 3 元；红色（带外预测）一律 3 元。已选 {{ latticeSelectedCount }} 注
+                  按上方热力格勾选重排；档位：
+                  <template v-if="stakeTop === 10">尖刀 10 最多 2 注，其余 3 元</template>
+                  <template v-else>尖刀 {{ stakeTop }}（1～2）→10 元（≤3）→5 元（≤5）→其余 3 元</template>
+                  ；红色（带外预测）一律 3 元。已选 {{ latticeSelectedCount }} 注
                   <template v-if="selectionTicketTotal"> · 合计 {{ selectionTicketTotal }} 元</template>。
                 </p>
               </div>
