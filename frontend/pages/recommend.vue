@@ -665,8 +665,26 @@ function drawZodiacKey(draw: {
 }
 
 /**
+ * 特码生肖组：与后端 ``zodiac_group`` 同口径 ``(n-1) % 12``。
+ * 重肖统计必须用组号，不能只靠 API 生肖字符串（缺字段 / 中英不一致会漏计）。
+ * 例：34 与 46 同组 → 相邻开出即重肖。
+ */
+function zodiacGroupOf(number: number): number {
+  return (Math.trunc(number) - 1) % 12
+}
+
+function drawZodiacLabel(draw: {
+  special_number: number
+  zodiac?: string
+  zodiac_label?: string
+}): string {
+  return zodiacText(draw) || drawZodiacKey(draw) || heatZodiacLabelByNumber.value.get(draw.special_number) || ''
+}
+
+/**
  * 本池最近一次「相邻两期」重号 / 重肖距最新隔了几期（纯展示）。
  * newest-first：draws[i] 与 draws[i+1]（更早一期）比较；periodsAgo=i（0=最新一期即重号/重肖）。
+ * 重肖 = 相邻两期特码不同号、但 ``(n-1)%12`` 同组（与选号 ``is_repeat_zodiac`` 同口径；纯重号不算重肖）。
  */
 const latestRepeatGaps = computed(() => {
   const draws = normalizeDraws(rawDraws.value)
@@ -687,25 +705,25 @@ const latestRepeatGaps = computed(() => {
     const newer = draws[index]
     const older = draws[index + 1]
     if (numberAgo == null && newer.special_number === older.special_number) {
-      const key = drawZodiacKey(newer)
       numberAgo = index
       numberPair = {
         number: newer.special_number,
-        label: zodiacText(newer) || key,
+        label: drawZodiacLabel(newer),
         period: newer.period,
       }
     }
-    if (zodiacAgo == null) {
-      const newerKey = drawZodiacKey(newer)
-      const olderKey = drawZodiacKey(older)
-      if (newerKey && olderKey && newerKey === olderKey) {
-        zodiacAgo = index
-        zodiacPair = {
-          newer: newer.special_number,
-          older: older.special_number,
-          label: zodiacText(newer) || newerKey,
-          period: newer.period,
-        }
+    // 重肖：不同号 + 同生肖组（34 后接 46 算；46 后再 46 只算重号）
+    if (
+      zodiacAgo == null
+      && newer.special_number !== older.special_number
+      && zodiacGroupOf(newer.special_number) === zodiacGroupOf(older.special_number)
+    ) {
+      zodiacAgo = index
+      zodiacPair = {
+        newer: newer.special_number,
+        older: older.special_number,
+        label: drawZodiacLabel(newer) || drawZodiacLabel(older),
+        period: newer.period,
       }
     }
     if (numberAgo != null && zodiacAgo != null) break
@@ -2033,16 +2051,31 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                       <span
                         class="inline-flex items-center gap-1.5"
                         :title="latestRepeatGaps.zodiacPair
-                          ? `最近相邻重肖：第 ${latestRepeatGaps.zodiacPair.period ?? '—'} 期 ${pad(latestRepeatGaps.zodiacPair.newer)} 与上一期 ${pad(latestRepeatGaps.zodiacPair.older)} 同肖「${latestRepeatGaps.zodiacPair.label}」（${periodsAgoLabel(latestRepeatGaps.zodiacAgo!)}）`
-                          : '本池已加载样本内没有相邻两期同肖'"
+                          ? `最近相邻重肖：第 ${latestRepeatGaps.zodiacPair.period ?? '—'} 期 ${pad(latestRepeatGaps.zodiacPair.newer)} 与上一期 ${pad(latestRepeatGaps.zodiacPair.older)} 同肖「${latestRepeatGaps.zodiacPair.label || '同组'}」（${periodsAgoLabel(latestRepeatGaps.zodiacAgo!)}）；按 (号-1)%12 同组判定`
+                          : '本池已加载样本内没有相邻两期不同号但同肖'"
                       >
                         <span>最近重肖</span>
-                        <span
-                          v-if="latestRepeatGaps.zodiacAgo != null"
-                          class="num rounded-md border border-amber-400/35 bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-amber-200/90"
-                        >
-                          {{ periodsAgoLabel(latestRepeatGaps.zodiacAgo) }}
-                        </span>
+                        <template v-if="latestRepeatGaps.zodiacPair && latestRepeatGaps.zodiacAgo != null">
+                          <StatChip tone="amber" size="xs">
+                            {{ pad(latestRepeatGaps.zodiacPair.newer) }}
+                          </StatChip>
+                          <span class="text-[10px] text-slate-500">/</span>
+                          <StatChip tone="amber" size="xs">
+                            {{ pad(latestRepeatGaps.zodiacPair.older) }}
+                          </StatChip>
+                          <StatChip
+                            v-if="latestRepeatGaps.zodiacPair.label"
+                            tone="nebula"
+                            size="xs"
+                          >
+                            {{ latestRepeatGaps.zodiacPair.label }}
+                          </StatChip>
+                          <span
+                            class="num rounded-md border border-amber-400/35 bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-amber-200/90"
+                          >
+                            {{ periodsAgoLabel(latestRepeatGaps.zodiacAgo) }}
+                          </span>
+                        </template>
                         <span v-else class="text-slate-600">本池无</span>
                       </span>
                     </span>
