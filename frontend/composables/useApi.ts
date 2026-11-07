@@ -46,6 +46,15 @@ export interface LotterySettings {
   lattice_enabled: boolean
   /** 预测波动线取样期数（0=本池全部）；默认 30 */
   lattice_window: number
+  /**
+   * 特码拐点支撑/压力偏好：true=把特码当走势找局部高低点，抽样抬权（默认 true）。
+   * 只改相对权重，不硬塞、不承诺命中率。
+   */
+  pivot_prefer_enabled: boolean
+  /** 拐点左右各看几期（1..5）；默认 1=三期 K 线转向 */
+  pivot_span: number
+  /** 只在最近多少期内找拐点并抬权（10..100）；默认 60 */
+  pivot_lookback: number
   /** 均注模式角色配额：主推组权重；默认 3 */
   role_w_primary: number
   /** 均注模式角色配额：次选组权重；默认 2 */
@@ -117,6 +126,9 @@ export interface LotterySettingsPatch {
   stale_weight?: number
   lattice_enabled?: boolean
   lattice_window?: number
+  pivot_prefer_enabled?: boolean
+  pivot_span?: number
+  pivot_lookback?: number
   /** 均注模式角色配额：主推 : 次选 : 防守（默认 3:2:1，防守最低） */
   role_w_primary?: number
   role_w_secondary?: number
@@ -161,6 +173,14 @@ export interface Pick {
   lattice_weight?: number
   /** 该注是否落在预测波动带内 */
   in_lattice_band?: boolean
+  /** 是否特码序列上的局部高低点（支撑或压力） */
+  is_price_pivot?: boolean
+  /** 局部低点（支撑） */
+  is_pivot_support?: boolean
+  /** 局部高点（压力） */
+  is_pivot_resistance?: boolean
+  /** 拐点抽样抬权倍数（关闭偏好时恒 1） */
+  pivot_weight?: number
   /**
    * 号码 → 生肖的固定映射（英文码 + 汉字标签），随农历年（春节）轮转。
    * 与 `latest_zodiac` 指向同一组号码（农历年只决定这一组叫什么名字）。
@@ -344,6 +364,23 @@ export interface RecommendResult {
     }>
     /** 本池 walk-forward：实开落在当时预测带的命中统计 */
     hit_stats?: LatticeBandHitStatsPayload | null
+  }
+  /**
+   * 特码拐点支撑/压力摘要（抽样偏好；scores 不回传）。
+   * 支撑 = 局部低点，压力 = 局部高点；只抬权重，不硬塞。
+   */
+  price_pivots?: {
+    enabled: boolean
+    span: number
+    /** 近窗回看期数（默认 60）；更早拐点不优先 */
+    lookback: number
+    sample_size: number
+    support: Array<{ number: number; count: number; periods_ago?: number }>
+    resistance: Array<{ number: number; count: number; periods_ago?: number }>
+    preferred_numbers: number[]
+    boost: number
+    recency_boost?: number
+    rule: string
   }
   /**
    * 三中三：从本期预测带内选 3 组、每组 3 个号（纯展示）。
@@ -909,6 +946,15 @@ export const ROLE_WEIGHT_PRESETS = [
 export const LATTICE_WINDOW_DEFAULT = 100
 export const LATTICE_WINDOW_MIN = 0
 export const LATTICE_WINDOW_MAX = 500
+
+/** 特码拐点左右跨度 / 近窗回看默认与范围（与后端对齐） */
+export const PIVOT_PREFER_DEFAULT = true
+export const PIVOT_SPAN_DEFAULT = 1
+export const PIVOT_SPAN_MIN = 1
+export const PIVOT_SPAN_MAX = 5
+export const PIVOT_LOOKBACK_DEFAULT = 60
+export const PIVOT_LOOKBACK_MIN = 10
+export const PIVOT_LOOKBACK_MAX = 100
 
 /** 权重档位（设置页点选；1.0 = 不降权） */
 export const SOFT_WEIGHT_OPTIONS = [

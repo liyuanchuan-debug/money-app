@@ -3820,7 +3820,7 @@ def test_recommend_api_unfundable_override_returns_no_ticket():
 
 
 def test_stake_ladder_tier_counts_caps():
-    """尖刀15/20：一档1～2、二档≤3、五元档≤5；尖刀10：10元最多2、其余3。"""
+    """尖刀15/20：一档1～2、二档≤3、五元档≤5；尖刀10：10×2、5×3、其余3。"""
     from services.lottery import stake_ladder_tier_counts
 
     assert stake_ladder_tier_counts(1) == (1, 0, 0, 0)
@@ -3828,15 +3828,16 @@ def test_stake_ladder_tier_counts_caps():
     assert stake_ladder_tier_counts(10) == (1, 3, 5, 1)
     assert stake_ladder_tier_counts(16) == (1, 3, 5, 7)
     assert stake_ladder_tier_counts(20) == (2, 3, 5, 10)
-    # 尖刀 10：最多 2 注 10 元，其余全 3
+    # 尖刀 10：2 个 10 → 最多 3 个 5 → 其余 3
     assert stake_ladder_tier_counts(1, 10) == (1, 0, 0, 0)
     assert stake_ladder_tier_counts(2, 10) == (2, 0, 0, 0)
-    assert stake_ladder_tier_counts(8, 10) == (2, 0, 0, 6)
-    assert stake_ladder_tier_counts(10, 10) == (2, 0, 0, 8)
+    assert stake_ladder_tier_counts(5, 10) == (2, 0, 3, 0)
+    assert stake_ladder_tier_counts(8, 10) == (2, 0, 3, 3)
+    assert stake_ladder_tier_counts(10, 10) == (2, 0, 3, 5)
 
 
 def test_stake_ladder_default_eight_and_count_switch():
-    """档位：尖刀10=10×2+其余3；尖刀15/20 仍走四档。"""
+    """档位：尖刀10=10×2+5×3+其余3；尖刀15/20 仍走四档。"""
     from services.lottery import STAKE_TOP_DEFAULT
 
     history = [18, 7, 33, 12, 41, 5, 26, 9]
@@ -3855,20 +3856,21 @@ def test_stake_ladder_default_eight_and_count_switch():
         latest=18, previous=7, history_numbers=history,
         settings={**base, "pick_count": 10, "stake_top": 10}, mode=MODE_LADDER,
     )
-    # 8 注默认尖刀10：10×2 + 3×6
-    assert [p["amount"] for p in default_ten["picks"]] == [10, 10, 3, 3, 3, 3, 3, 3]
-    assert default_ten["total_amount"] == 38
+    # 8 注默认尖刀10：10×2 + 5×3 + 3×3
+    assert [p["amount"] for p in default_ten["picks"]] == [10, 10, 5, 5, 5, 3, 3, 3]
+    assert default_ten["total_amount"] == 44
     assert any("尖刀 2 注各 10 元" in note for note in default_ten["notes"])
-    assert any("3 元档 6 注" in note for note in default_ten["notes"])
-    assert any("10 元最多 2 注" in note for note in default_ten["notes"])
+    assert any("5 元档 3 注" in note for note in default_ten["notes"])
+    assert any("3 元档 3 注" in note for note in default_ten["notes"])
+    assert any("5 元最多 3 注" in note for note in default_ten["notes"])
     # 8 注尖刀15/20：尖刀1 + 10元×3 + 5元×4
     assert [p["amount"] for p in fifteen["picks"]] == [15, 10, 10, 10, 5, 5, 5, 5]
     assert fifteen["total_amount"] == 65
     assert [p["amount"] for p in twenty["picks"]] == [20, 10, 10, 10, 5, 5, 5, 5]
     assert twenty["total_amount"] == 70
-    # 10 注尖刀10：10×2 + 3×8
-    assert [p["amount"] for p in ten_picks["picks"]] == [10, 10, 3, 3, 3, 3, 3, 3, 3, 3]
-    assert ten_picks["total_amount"] == 44
+    # 10 注尖刀10：10×2 + 5×3 + 3×5
+    assert [p["amount"] for p in ten_picks["picks"]] == [10, 10, 5, 5, 5, 3, 3, 3, 3, 3]
+    assert ten_picks["total_amount"] == 50
     assert {p["number"] for p in fifteen["picks"]} == {p["number"] for p in twenty["picks"]}
     assert any("不按固定总预算" in note for note in fifteen["notes"])
 
@@ -3916,3 +3918,134 @@ def test_heat_absent_hard_exclude_disabled():
     assert short_result["heat_absent"]["applied"] is False
     assert short_result["heat_absent"]["excluded_numbers"] == []
     assert any("出现热度硬排除已停用" in note for note in short_result["notes"])
+
+def test_find_price_pivots_marks_kline_turn_support_and_resistance():
+    """K 线三期转向：46→13→46 中间 13=支撑；15→46→13 中间 46=压力。"""
+    from services.lottery import DEFAULT_PIVOT_SPAN, find_price_pivots
+
+    assert DEFAULT_PIVOT_SPAN == 1
+    # newest-first：最新在前。chrono 旧→新 46,13,46 → newest_first=[46,13,46]
+    support = find_price_pivots([46, 13, 46], span=1, lookback=60)
+    assert support["preferred_numbers"] == [13]
+    assert {row["number"] for row in support["support"]} == {13}
+    assert support["resistance"] == []
+
+    # chrono 旧→新 15,46,13 → newest_first=[13,46,15]
+    resist = find_price_pivots([13, 46, 15], span=1, lookback=60)
+    assert resist["preferred_numbers"] == [46]
+    assert {row["number"] for row in resist["resistance"]} == {46}
+    assert resist["support"] == []
+
+    # span=2 对三期形态标不出拐点（需要左右各 2 邻居）
+    assert find_price_pivots([46, 13, 46], span=2)["preferred_numbers"] == []
+
+
+def test_find_price_pivots_marks_local_highs_and_lows():
+    from services.lottery import (
+        DEFAULT_PIVOT_BOOST,
+        DEFAULT_PIVOT_RECENCY_BOOST,
+        find_price_pivots,
+    )
+
+    # 旧→新：14→20→18→16→8→10，局部高 20、局部低 8（span=2 更严）
+    chrono = [10, 12, 14, 20, 18, 16, 14, 8, 10, 12, 25, 22, 20]
+    newest_first = list(reversed(chrono))
+    pivots = find_price_pivots(newest_first, span=2, lookback=60)
+    numbers_support = {row["number"] for row in pivots["support"]}
+    numbers_resistance = {row["number"] for row in pivots["resistance"]}
+    assert 8 in numbers_support
+    assert 20 in numbers_resistance
+    assert 25 in numbers_resistance
+    assert pivots["lookback"] == 60
+    # 8 在近窗内出现；抬权 = (1+boost) × (1+recency*(1-gap/lookback))
+    gap_8 = next(row["periods_ago"] for row in pivots["support"] if row["number"] == 8)
+    expected_8 = (1.0 + DEFAULT_PIVOT_BOOST) * (
+        1.0 + DEFAULT_PIVOT_RECENCY_BOOST * (1.0 - gap_8 / 60.0)
+    )
+    assert pivots["scores"][8] == pytest.approx(expected_8)
+    assert pivots["scores"][11] == 1.0
+    # 样本太短 → 无拐点
+    assert find_price_pivots([1, 2, 3], span=2)["preferred_numbers"] == []
+
+
+def test_find_price_pivots_lookback_ignores_old_levels():
+    """更早于 lookback 的拐点号不进偏好（例如远窗 48，近窗只要 46）。"""
+    from services.lottery import find_price_pivots
+
+    # 近 10 期：46 为压力；远窗另造 48 压力（span=2 需左右各 2 邻居）
+    recent = [40, 42, 44, 46, 44, 42, 40, 41, 42, 43]  # 旧→新
+    ancient = [20, 22, 24, 48, 30, 28, 26] + [20] * 20
+    chrono = ancient + recent
+    newest_first = list(reversed(chrono))
+    near = find_price_pivots(newest_first, span=2, lookback=10)
+    assert 46 in near["preferred_numbers"]
+    assert 48 not in near["preferred_numbers"]
+    wide = find_price_pivots(newest_first, span=2, lookback=100)
+    assert 46 in wide["preferred_numbers"]
+    assert 48 in wide["preferred_numbers"]
+    assert near["scores"][46] > 1.0
+    assert near["scores"][48] == 1.0
+
+
+def test_recommend_pivot_prefer_boosts_sampling_and_annotates_picks():
+    from services.lottery import find_price_pivots, bucket_sampling_weight
+
+    chrono = [10, 12, 14, 20, 18, 16, 14, 8, 10, 12, 25, 22, 20] * 4
+    newest_first = list(reversed(chrono))
+    pivots = find_price_pivots(newest_first, span=2, lookback=60)
+    preferred = set(pivots["preferred_numbers"])
+    assert preferred
+    # 抽样权重：拐点号 > 非拐点号（抬权通道本身成立）
+    pivot_n = next(iter(preferred))
+    plain_n = next(n for n in range(1, 50) if n not in preferred)
+    assert bucket_sampling_weight(
+        pivot_n, pivot_weight=float(pivots["scores"][pivot_n])
+    ) > bucket_sampling_weight(plain_n, pivot_weight=1.0)
+
+    on = recommend(
+        latest=newest_first[0],
+        previous=newest_first[1],
+        history_numbers=newest_first,
+        settings={
+            "pick_count": 6,
+            "mode": "ladder",
+            "lattice_enabled": False,
+            "restrict_pick_zodiacs": False,
+            "pivot_prefer_enabled": True,
+            "pivot_span": 2,
+            "pivot_lookback": 60,
+        },
+        period=9001,
+    )
+    assert on["price_pivots"]["enabled"] is True
+    assert on["price_pivots"]["lookback"] == 60
+    assert set(on["price_pivots"]["preferred_numbers"]) == preferred
+    assert any("只看最近 60 期" in note for note in on["notes"])
+    for pick in on["picks"]:
+        number = int(pick["number"])
+        expected_w = float(pivots["scores"][number])
+        assert pick.get("pivot_weight") == pytest.approx(expected_w)
+        assert bool(pick.get("is_price_pivot")) is (number in preferred)
+        assert bool(pick.get("is_pivot_support")) is (
+            number in {row["number"] for row in pivots["support"]}
+        )
+        assert bool(pick.get("is_pivot_resistance")) is (
+            number in {row["number"] for row in pivots["resistance"]}
+        )
+
+    off = recommend(
+        latest=newest_first[0],
+        previous=newest_first[1],
+        history_numbers=newest_first,
+        settings={
+            "pick_count": 6,
+            "mode": "ladder",
+            "lattice_enabled": False,
+            "restrict_pick_zodiacs": False,
+            "pivot_prefer_enabled": False,
+        },
+        period=9001,
+    )
+    assert off["price_pivots"]["enabled"] is False
+    assert all(pick.get("pivot_weight") == 1.0 for pick in off["picks"])
+    assert any("拐点支撑/压力偏好已关闭" in note for note in off["notes"])

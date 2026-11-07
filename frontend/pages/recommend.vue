@@ -297,6 +297,7 @@ function normalizeRecommendResult(raw: unknown): RecommendResult | undefined {
     Array.isArray(value) ? value : []
   const soft = source.soft_weights
   const triple = source.triple_sets
+  const pivots = source.price_pivots
   return {
     ...(source as RecommendResult),
     picks: asArray(source.picks),
@@ -304,6 +305,16 @@ function normalizeRecommendResult(raw: unknown): RecommendResult | undefined {
     missing_waves: asArray(source.missing_waves),
     focus_order: asArray(source.focus_order),
     latest_zodiac: asArray(source.latest_zodiac),
+    ...(pivots
+      ? {
+          price_pivots: {
+            ...pivots,
+            support: asArray(pivots.support),
+            resistance: asArray(pivots.resistance),
+            preferred_numbers: asArray(pivots.preferred_numbers),
+          },
+        }
+      : {}),
     ...(triple
       ? {
           triple_sets: {
@@ -378,6 +389,8 @@ const STAKE_DEFENSE = 3
 const STAKE_TIP_MAX = 2
 const STAKE_ATTACK_SECOND_MAX = 3
 const STAKE_REGULAR_MAX = 5
+/** 尖刀 10：5 元档最多 3 注（2 个 10 → 3 个 5 → 其余 3） */
+const STAKE_TIP10_FIVE_MAX = 3
 /** 注数达到该值才把一档升到 2；未满时保持 1 注尖刀（如 16 注 → 1+3+5+其余） */
 const STAKE_TIP_TWO_MIN_COUNT = 20
 
@@ -387,10 +400,12 @@ function stakeLadderTierCounts(
 ): [number, number, number, number] {
   const target = Math.max(0, Math.trunc(count))
   if (target <= 0) return [0, 0, 0, 0]
-  // 尖刀 10：10 元最多 2 注，其余全 3 元
+  // 尖刀 10：2 个 10 元 → 最多 3 个 5 元 → 其余 3 元
   if (tip === 10) {
     const tipN = Math.min(STAKE_TIP_MAX, target)
-    return [tipN, 0, 0, target - tipN]
+    let rem = target - tipN
+    const fiveN = Math.min(STAKE_TIP10_FIVE_MAX, rem)
+    return [tipN, 0, fiveN, rem - fiveN]
   }
   const tipN = Math.min(
     STAKE_TIP_MAX,
@@ -633,29 +648,74 @@ const softSummary = computed(() => result.value?.soft_weights ?? null)
 const lattice = computed(() => result.value?.lattice ?? null)
 const latticeBand = computed(() => lattice.value?.band ?? null)
 
-/**
- * 预测点阵旁展示：特码历史上最新开出的 6 个不重复生肖（新→旧）。
- * 纯展示，与「只选近期生肖」核心集 N / 肖外配额无关；样本不足则有几个列几个。
- */
+/** 最新 6 肖展示条数（不重复生肖） */
 const LATEST_ZODIAC_DISPLAY_COUNT = 6
-const latestSixZodiacs = computed(() => {
+
+/** 单期生肖键：英文码优先，其次中文标签 / 号码表（与最新 6 肖同口径） */
+function drawZodiacKey(draw: {
+  special_number: number
+  zodiac?: string
+  zodiac_label?: string
+}): string {
+  const code = typeof draw.zodiac === 'string' ? draw.zodiac.trim() : ''
+  if (code) return code
+  const fromDraw = zodiacText(draw)
+  if (fromDraw) return fromDraw
+  return heatZodiacLabelByNumber.value.get(draw.special_number) ?? ''
+}
+
+/**
+ * 本池最近一次「相邻两期」重号 / 重肖距最新隔了几期（纯展示）。
+ * newest-first：draws[i] 与 draws[i+1]（更早一期）比较；periodsAgo=i（0=最新一期即重号/重肖）。
+ */
+const latestRepeatGaps = computed(() => {
   const draws = normalizeDraws(rawDraws.value)
-  const seen = new Set<string>()
-  const out: { code: string; label: string }[] = []
-  for (const draw of draws) {
-    const code = typeof draw.zodiac === 'string' ? draw.zodiac.trim() : ''
-    const fromDraw = zodiacText(draw)
-    const fromTable = heatZodiacLabelByNumber.value.get(draw.special_number) ?? ''
-    const label = fromDraw || fromTable || code
-    if (!label) continue
-    const key = code || label
-    if (seen.has(key)) continue
-    seen.add(key)
-    out.push({ code, label })
-    if (out.length >= LATEST_ZODIAC_DISPLAY_COUNT) break
+  let numberAgo: number | null = null
+  let zodiacAgo: number | null = null
+  let numberPair: {
+    number: number
+    label: string
+    period: number | null
+  } | null = null
+  let zodiacPair: {
+    newer: number
+    older: number
+    label: string
+    period: number | null
+  } | null = null
+  for (let index = 0; index < draws.length - 1; index += 1) {
+    const newer = draws[index]
+    const older = draws[index + 1]
+    if (numberAgo == null && newer.special_number === older.special_number) {
+      const key = drawZodiacKey(newer)
+      numberAgo = index
+      numberPair = {
+        number: newer.special_number,
+        label: zodiacText(newer) || key,
+        period: newer.period,
+      }
+    }
+    if (zodiacAgo == null) {
+      const newerKey = drawZodiacKey(newer)
+      const olderKey = drawZodiacKey(older)
+      if (newerKey && olderKey && newerKey === olderKey) {
+        zodiacAgo = index
+        zodiacPair = {
+          newer: newer.special_number,
+          older: older.special_number,
+          label: zodiacText(newer) || newerKey,
+          period: newer.period,
+        }
+      }
+    }
+    if (numberAgo != null && zodiacAgo != null) break
   }
-  return out
+  return { numberAgo, zodiacAgo, numberPair, zodiacPair }
 })
+
+function periodsAgoLabel(ago: number): string {
+  return ago === 0 ? '最新' : `${ago}期前`
+}
 
 /** 三中三：后端从预测带派生；点阵关闭 / 无带时仍回块，前端按 status 展示或隐藏 */
 const tripleSets = computed(() => result.value?.triple_sets ?? null)
@@ -743,6 +803,48 @@ const latestNumberNextDraws = computed(() => {
     })
   }
   return { anchor, successors }
+})
+
+/**
+ * 预测点阵旁：从当前回放锚点起，特码历史上最新开出的 6 个不重复生肖（新→旧）。
+ * 跟 latticeHistoryOffset 同步（本期 / 更早），避免「今日也是同肖时把前天同号吞掉却看不出号码」。
+ * 每项带上首次入列的特码与距最新隔了几期；纯展示，不参与选号。
+ */
+const latestSixZodiacs = computed(() => {
+  const draws = normalizeDraws(rawDraws.value)
+  const out: Array<{
+    code: string
+    label: string
+    number: number
+    period: number | null
+    periodsAgo: number
+  }> = []
+  if (!draws.length) return out
+  const start = Math.max(
+    0,
+    Math.min(latticeHistoryOffset.value, draws.length - 1),
+  )
+  const seen = new Set<string>()
+  for (let index = start; index < draws.length; index += 1) {
+    const draw = draws[index]
+    const code = typeof draw.zodiac === 'string' ? draw.zodiac.trim() : ''
+    const fromDraw = zodiacText(draw)
+    const fromTable = heatZodiacLabelByNumber.value.get(draw.special_number) ?? ''
+    const label = fromDraw || fromTable || code
+    if (!label) continue
+    const key = code || label
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({
+      code,
+      label,
+      number: draw.special_number,
+      period: draw.period,
+      periodsAgo: index,
+    })
+    if (out.length >= LATEST_ZODIAC_DISPLAY_COUNT) break
+  }
+  return out
 })
 
 const latticeReplayWindow = computed(() => {
@@ -1365,7 +1467,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
 
             <p class="text-xs leading-relaxed text-slate-500">
               本页默认走「档位」：默认 8 个码，注数可改；金额按档相加，不先锁一笔总预算。
-              <template v-if="stakeTop === 10">尖刀 10 元最多 2 注，其余 3 元。</template>
+              <template v-if="stakeTop === 10">2 个 10 元、3 个 5 元，其余 3 元。</template>
               <template v-else>一档尖刀 {{ stakeTop }} 元（1～2 注）、二档 10 元（≤3）、五元档（≤5），其余 3 元。</template>
               切到均注 / 侧重 / 单挑 / 随机分配后，才按最大投注金额拆分。
               要改默认请到
@@ -1440,7 +1542,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               </div>
               <p class="text-xs leading-relaxed text-slate-500">
                 <template v-if="mode === 'ladder'">
-                  <template v-if="stakeTop === 10">尖刀 10 最多 2 注，其余 3 元。</template>
+                  <template v-if="stakeTop === 10">2 个 10 元、3 个 5 元，其余 3 元。</template>
                   <template v-else>一档 {{ stakeTop }} 元（1～2）、二档 10 元（≤3）、五元档（≤5），其余 3 元。</template>
                   改注数按档位容量重摊，不从固定总预算里拆。
                 </template>
@@ -1470,7 +1572,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 各注 {{ result.picks[0]?.amount ?? result.bet_unit }} 元（最小单位 {{ result.amount_unit }} 元的倍数）
               </StatChip>
               <StatChip v-else-if="result.mode === 'ladder'" tone="amber" size="sm">
-                {{ stakeTop === 10 ? '尖刀10最多2 · 其余3元' : '尖刀≤2 · 10元≤3 · 5元≤5 · 其余3元' }}
+                {{ stakeTop === 10 ? '10×2 · 5×3 · 其余3' : '尖刀≤2 · 10元≤3 · 5元≤5 · 其余3元' }}
               </StatChip>
               <StatChip v-else tone="amber" size="sm">各注金额不等（均为最小单位倍数）</StatChip>
             </div>
@@ -1611,7 +1713,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 </div>
 
                 <div
-                  v-if="pickSoftReasons(pick).length || pick.in_lattice_band"
+                  v-if="pickSoftReasons(pick).length || pick.in_lattice_band || pick.is_price_pivot"
                   class="flex flex-wrap items-center gap-1"
                 >
                   <StatChip
@@ -1625,6 +1727,12 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   </StatChip>
                   <StatChip v-if="pick.in_lattice_band" tone="aqua" size="xs" outline>
                     预测带内
+                  </StatChip>
+                  <StatChip v-if="pick.is_pivot_support" tone="emerald" size="xs" outline>
+                    支撑
+                  </StatChip>
+                  <StatChip v-if="pick.is_pivot_resistance" tone="bloom" size="xs" outline>
+                    压力
                   </StatChip>
                 </div>
 
@@ -1880,13 +1988,64 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                     <span class="text-[11px] text-slate-500">最新 6 肖</span>
                     <StatChip
                       v-for="(item, index) in latestSixZodiacs"
-                      :key="item.code || item.label"
+                      :key="`${item.code || item.label}-${item.number}-${item.period}`"
                       :tone="index === 0 ? 'nebula' : 'neutral'"
                       size="xs"
-                      :title="index === 0 ? '最新开出' : `往前第 ${index + 1} 个不重复生肖`"
+                      :title="`第 ${item.period ?? '—'} 期特码 ${pad(item.number)} → ${item.label}（${item.periodsAgo === 0 ? '最新' : `${item.periodsAgo}期前`}；同肖更早开出不重复计入）`"
                     >
                       {{ item.label }}
+                      <span class="num ml-1 opacity-80">{{ pad(item.number) }}</span>
                     </StatChip>
+                    <span
+                      class="mx-0.5 text-[11px] text-slate-600"
+                      aria-hidden="true"
+                    >·</span>
+                    <span
+                      class="inline-flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-slate-500"
+                      role="status"
+                    >
+                      <span
+                        class="inline-flex items-center gap-1.5"
+                        :title="latestRepeatGaps.numberPair
+                          ? `最近相邻重号：第 ${latestRepeatGaps.numberPair.period ?? '—'} 期连开 ${pad(latestRepeatGaps.numberPair.number)}${latestRepeatGaps.numberPair.label ? `（${latestRepeatGaps.numberPair.label}）` : ''}（${periodsAgoLabel(latestRepeatGaps.numberAgo!)}）`
+                          : '本池已加载样本内没有相邻两期特码相同'"
+                      >
+                        <span>最近重号</span>
+                        <template v-if="latestRepeatGaps.numberPair && latestRepeatGaps.numberAgo != null">
+                          <StatChip tone="bloom" size="xs">
+                            {{ pad(latestRepeatGaps.numberPair.number) }}
+                          </StatChip>
+                          <StatChip
+                            v-if="latestRepeatGaps.numberPair.label"
+                            tone="nebula"
+                            size="xs"
+                          >
+                            {{ latestRepeatGaps.numberPair.label }}
+                          </StatChip>
+                          <span
+                            class="num rounded-md border border-bloom-400/35 bg-bloom-400/10 px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-bloom-200/90"
+                          >
+                            {{ periodsAgoLabel(latestRepeatGaps.numberAgo) }}
+                          </span>
+                        </template>
+                        <span v-else class="text-slate-600">本池无</span>
+                      </span>
+                      <span
+                        class="inline-flex items-center gap-1.5"
+                        :title="latestRepeatGaps.zodiacPair
+                          ? `最近相邻重肖：第 ${latestRepeatGaps.zodiacPair.period ?? '—'} 期 ${pad(latestRepeatGaps.zodiacPair.newer)} 与上一期 ${pad(latestRepeatGaps.zodiacPair.older)} 同肖「${latestRepeatGaps.zodiacPair.label}」（${periodsAgoLabel(latestRepeatGaps.zodiacAgo!)}）`
+                          : '本池已加载样本内没有相邻两期同肖'"
+                      >
+                        <span>最近重肖</span>
+                        <span
+                          v-if="latestRepeatGaps.zodiacAgo != null"
+                          class="num rounded-md border border-amber-400/35 bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-amber-200/90"
+                        >
+                          {{ periodsAgoLabel(latestRepeatGaps.zodiacAgo) }}
+                        </span>
+                        <span v-else class="text-slate-600">本池无</span>
+                      </span>
+                    </span>
                   </template>
                   <template v-if="latestNumberNextDraws.anchor != null">
                     <span
@@ -1971,6 +2130,60 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               @period-step="onLatticePeriodStep"
               @candidate-click="onLatticeCandidateClick"
             />
+            <div
+              v-if="result.price_pivots"
+              class="space-y-1.5 border-t border-white/5 pt-2"
+            >
+              <p class="text-[11px] leading-relaxed text-slate-500">
+                特码拐点（左右各 {{ result.price_pivots.span }} 期，近
+                {{ result.price_pivots.lookback ?? 60 }} 期）
+                <template v-if="result.price_pivots.enabled">· 近窗抬权</template>
+                <template v-else>· 偏好已关闭</template>
+                · K 线转向：低点=支撑、高点=压力；只优先近窗；不硬塞。
+              </p>
+              <div
+                v-if="(result.price_pivots.preferred_numbers ?? []).length"
+                class="flex flex-wrap gap-x-3 gap-y-1 text-[11px]"
+              >
+                <span class="inline-flex flex-wrap items-center gap-1 text-emerald-300/90">
+                  支撑
+                  <template v-if="(result.price_pivots.support ?? []).length">
+                    <StatChip
+                      v-for="row in result.price_pivots.support"
+                      :key="`sup-${row.number}`"
+                      tone="emerald"
+                      size="xs"
+                    >
+                      {{ pad(row.number) }}
+                      <span v-if="row.count > 1" class="opacity-70">×{{ row.count }}</span>
+                    </StatChip>
+                  </template>
+                  <span v-else class="text-slate-500">—</span>
+                </span>
+                <span class="inline-flex flex-wrap items-center gap-1 text-bloom-300/90">
+                  压力
+                  <template v-if="(result.price_pivots.resistance ?? []).length">
+                    <StatChip
+                      v-for="row in result.price_pivots.resistance"
+                      :key="`res-${row.number}`"
+                      tone="bloom"
+                      size="xs"
+                    >
+                      {{ pad(row.number) }}
+                      <span v-if="row.count > 1" class="opacity-70">×{{ row.count }}</span>
+                    </StatChip>
+                  </template>
+                  <span v-else class="text-slate-500">—</span>
+                </span>
+              </div>
+              <p
+                v-else
+                class="text-[11px] text-amber-200/90"
+                role="status"
+              >
+                样本不足以标出局部高低点，本期不抬权。
+              </p>
+            </div>
           </GlassPanel>
         </MotionReveal>
 
@@ -2151,7 +2364,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 <h2 class="text-lg font-medium text-white">投注串</h2>
                 <p class="text-xs leading-relaxed text-slate-500">
                   按上方热力格勾选重排；档位：
-                  <template v-if="stakeTop === 10">尖刀 10 最多 2 注，其余 3 元</template>
+                  <template v-if="stakeTop === 10">2 个 10 元、3 个 5 元，其余 3 元</template>
                   <template v-else>尖刀 {{ stakeTop }}（1～2）→10 元（≤3）→5 元（≤5）→其余 3 元</template>
                   ；红色（带外预测）一律 3 元。已选 {{ latticeSelectedCount }} 注
                   <template v-if="selectionTicketTotal"> · 合计 {{ selectionTicketTotal }} 元</template>。

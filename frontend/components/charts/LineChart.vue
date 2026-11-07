@@ -1910,30 +1910,31 @@ const hoverInfo = computed(() => {
     })
   }
 
-  // 光标落在竖列候选槽位：整列共用一个 x，补一条整列提示（号码多时以图上的竖列标签为准，
-  // 标签因槽位太密被隐藏时，这里把号码逐列出，保证光标仍能读到每个候选）
+  // 光标落在竖列候选槽位：整列共用一个 x，弹窗**始终**逐列号码+生肖
+  // （图上是否画标签无关；勿再收成「竖列已标出」把名单藏掉）。
   const column = hoverColumn.value
   let columnLines: string[] | null = null
   if (column) {
-    const labels = column.points.map((point) => {
+    // 名单用全部选中点（高亮可只亮悬停单点；名单不能跟着缩成 1 个）
+    const listSource = (columnGeometry.value?.points ?? column.points)
+      .filter((point) => point.selected || point.pinLabel)
+    const labels = listSource.map((point) => {
       const number = point.label
       if (!number) return ''
-      return point.zodiac ? `${number} ${point.zodiac}` : number
+      const hovered = hoverColumnPointValue.value === point.value
+      const body = point.zodiac ? `${number} ${point.zodiac}` : number
+      return hovered ? `▸ ${body}` : body
     }).filter(Boolean)
-    if (column.showLabels) {
-      columnLines = [`共 ${column.count} 个 · 竖列已标出`]
-    } else {
-      const perLine = 4
-      columnLines = []
-      for (let i = 0; i < labels.length; i += perLine) {
-        const chunk = labels.slice(i, i + perLine).join('  ')
-        columnLines.push(i === 0 ? `共 ${column.count} 个：${chunk || '—'}` : chunk)
-      }
-      if (!columnLines.length) columnLines = [`共 ${column.count} 个：—`]
+    const perLine = 4
+    columnLines = []
+    for (let i = 0; i < labels.length; i += perLine) {
+      const chunk = labels.slice(i, i + perLine).join('  ')
+      columnLines.push(i === 0 ? `共 ${labels.length} 个：${chunk || '—'}` : chunk)
     }
+    if (!columnLines.length) columnLines = [`共 ${column.count} 个：—`]
     entries.push({
       name: '本期候选（非真实开奖）',
-      value: column.points[0]?.value ?? 0,
+      value: column.points[0]?.value ?? listSource[0]?.value ?? 0,
       colors: chartTone(props.candidateTone),
       textOverride: columnLines[0],
       isColumn: true,

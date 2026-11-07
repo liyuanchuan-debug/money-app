@@ -79,7 +79,7 @@ DEFAULT_TOTAL_AMOUNT = 50
 DEFAULT_PICK_COUNT = 6
 # 档位（mode=ladder）：金额先按角色定，合计 = 各注之和，不锁死总预算。
 # 尖刀 15/20：尖刀 1～2 → 10 元 ≤3 → 5 元 ≤5 → 其余 3 元；默认 8 码。
-# 尖刀 10：10 元最多 2 注，其余全部 3 元（无二档 / 五元档）。
+# 尖刀 10（投注串默认）：10 元最多 2 注 → 5 元最多 3 注 → 其余 3 元。
 STAKE_TOP_DEFAULT = 10
 STAKE_TOP_CHOICES = (10, 15, 20)
 STAKE_ATTACK_SECOND = 10
@@ -89,6 +89,8 @@ STAKE_DEFENSE = 3
 STAKE_TIP_MAX = 2
 STAKE_ATTACK_SECOND_MAX = 3
 STAKE_REGULAR_MAX = 5
+# 尖刀 10 专用：5 元档最多 3 注（投注串「2 个 10、3 个 5、其余 3」）
+STAKE_TIP10_FIVE_MAX = 3
 STAKE_LADDER_DEFAULT_COUNT = 8
 # 尖刀 15/20：注数达到该值时一档可升到 2 注，否则默认 1 注
 STAKE_TIP_TWO_MIN_COUNT = 20
@@ -224,6 +226,31 @@ LATTICE_BAND_LOW_Q = 0.25
 LATTICE_BAND_HIGH_Q = 0.75
 # 带外衰减尺度：离带边缘 d 个号位 → 权重 1 / (1 + d / LATTICE_DECAY_SCALE)
 LATTICE_DECAY_SCALE = 6.0
+
+# --------------------------------------------------------------------------- #
+# 特码「股价」拐点：支撑位（局部低点）/ 压力位（局部高点）
+#
+# 把特码序列当成 K 线走势找「转向拐点」（默认左右各 1 期 = 三期形态）：
+# - 支撑：``46, 13, 46`` → 中间 13 严格低于左右 → 局部低点
+# - 压力：``15, 46, 13`` → 中间 46 严格高于左右 → 局部高点
+# 作为抽样偏好（加权抬高，不硬塞满票）。口径：样本内结构偏好，不是支撑/
+# 压力会「守住」的承诺，不改变 k/49 与期望值。
+#
+# 回看窗口 ``pivot_lookback``（默认 60）：只在最近 N 期内标拐点并抬权；
+# 更早出现的支撑/压力号不参与优先选号（避免拿 80 期前的 48 压过近窗的 46）。
+# --------------------------------------------------------------------------- #
+DEFAULT_PIVOT_PREFER_ENABLED = True
+DEFAULT_PIVOT_SPAN = 1
+PIVOT_SPAN_MIN = 1
+PIVOT_SPAN_MAX = 5
+DEFAULT_PIVOT_LOOKBACK = 60
+PIVOT_LOOKBACK_MIN = 10
+PIVOT_LOOKBACK_MAX = RECENT_SAMPLE_WINDOW
+# 每多记为一次拐点，相对权重 + 该值；封顶次数避免极端序列独占
+DEFAULT_PIVOT_BOOST = 1.5
+PIVOT_COUNT_CAP = 3
+# 近窗内越晚出现的拐点号，额外乘的抬权上限（gap=0 → +该值；gap→lookback → +0）
+DEFAULT_PIVOT_RECENCY_BOOST = 0.75
 
 # --------------------------------------------------------------------------- #
 # 近期走势加权（**已停用为选择权重**，仅保留展示 / 兼容）
@@ -555,6 +582,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # ---- 预测波动线 + 号码点阵（参与选号）----
     "lattice_enabled": DEFAULT_LATTICE_ENABLED,
     "lattice_window": DEFAULT_LATTICE_WINDOW,
+    # ---- 特码拐点支撑/压力（抽样偏好；默认开；只看近 lookback 期）----
+    "pivot_prefer_enabled": DEFAULT_PIVOT_PREFER_ENABLED,
+    "pivot_span": DEFAULT_PIVOT_SPAN,
+    "pivot_lookback": DEFAULT_PIVOT_LOOKBACK,
     # ---- 角色金额配额（均注模式；主推 : 次选 : 防守，默认 3:2:1）----
     "role_w_primary": DEFAULT_ROLE_WEIGHT_PRIMARY,
     "role_w_secondary": DEFAULT_ROLE_WEIGHT_SECONDARY,
@@ -800,6 +831,24 @@ def clamp_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         lattice_window = DEFAULT_LATTICE_WINDOW
     merged["lattice_window"] = min(
         LATTICE_WINDOW_MAX, max(LATTICE_WINDOW_MIN, lattice_window)
+    )
+
+    # 特码拐点支撑/压力：布尔开关 + 左右跨度（1..5）+ 近窗回看期数
+    merged["pivot_prefer_enabled"] = coerce_bool(
+        merged.get("pivot_prefer_enabled"),
+        default=bool(DEFAULT_SETTINGS["pivot_prefer_enabled"]),
+    )
+    try:
+        pivot_span = int(merged["pivot_span"])
+    except (TypeError, ValueError):
+        pivot_span = DEFAULT_PIVOT_SPAN
+    merged["pivot_span"] = min(PIVOT_SPAN_MAX, max(PIVOT_SPAN_MIN, pivot_span))
+    try:
+        pivot_lookback = int(merged["pivot_lookback"])
+    except (TypeError, ValueError):
+        pivot_lookback = DEFAULT_PIVOT_LOOKBACK
+    merged["pivot_lookback"] = min(
+        PIVOT_LOOKBACK_MAX, max(PIVOT_LOOKBACK_MIN, pivot_lookback)
     )
 
     # 角色金额配额（主推 / 次选 / 防守）：钳到 0..10，缺失 / 脏值回退为默认
@@ -1293,6 +1342,101 @@ def predict_wave_band(
             f"预测波动线取最近 {len(series) - 1} 对相邻差值的分布："
             "中心=中位数、带宽=P25~P75；这是样本内经验分布，不是真实概率。"
         ),
+    }
+
+
+def find_price_pivots(
+    history_numbers: Sequence[int],
+    *,
+    span: int = DEFAULT_PIVOT_SPAN,
+    lookback: int = DEFAULT_PIVOT_LOOKBACK,
+) -> dict[str, Any]:
+    """在特码序列上找 K 线式转向拐点：局部高点（压力）与局部低点（支撑）。
+
+    ``history_numbers`` 约定**最新在前**；只取最近 ``lookback`` 期再翻成旧→新扫拐点
+    （更早的支撑/压力不进偏好池，避免远窗旧号压过近窗新号）。
+
+    默认 ``span=1``（三期形态，与看 K 线拐点同理）：
+    - 支撑：``46, 13, 46`` → 中间 13 严格低于左右邻居
+    - 压力：``15, 46, 13`` → 中间 46 严格高于左右邻居
+    ``span>1`` 时要求左右各 ``span`` 个邻居都更低/更高（更严、更少拐点）。
+    样本短于 ``2*span+1`` 时两边皆空。
+
+    抬权 = ``(1 + boost*命中次数) × (1 + 近窗新鲜度)``：近窗内越晚出现的拐点号越高。
+
+    返回：
+    - ``support`` / ``resistance``：``[{number, count, periods_ago}, ...]``
+    - ``preferred_numbers``：并集号码升序（均已在近 ``lookback`` 期出现过）
+    - ``scores``：``1..49 → 相对权重``（非拐点为 1.0）
+    """
+    span_n = min(PIVOT_SPAN_MAX, max(PIVOT_SPAN_MIN, int(span)))
+    lookback_n = min(
+        PIVOT_LOOKBACK_MAX, max(PIVOT_LOOKBACK_MIN, int(lookback))
+    )
+    newest_first = [
+        int(n)
+        for n in history_numbers
+        if isinstance(n, (int, float)) and NUMBER_MIN <= int(n) <= NUMBER_MAX
+    ]
+    window = newest_first[:lookback_n]
+    series = list(reversed(window))
+    support_counts: Counter[int] = Counter()
+    resistance_counts: Counter[int] = Counter()
+    need = 2 * span_n + 1
+    if len(series) >= need:
+        for index in range(span_n, len(series) - span_n):
+            center = series[index]
+            left = series[index - span_n : index]
+            right = series[index + 1 : index + span_n + 1]
+            if left and right and all(center > value for value in (*left, *right)):
+                resistance_counts[center] += 1
+            if left and right and all(center < value for value in (*left, *right)):
+                support_counts[center] += 1
+
+    periods_ago = compute_periods_since_last(window)
+
+    def _rows(counts: Counter[int]) -> list[dict[str, int]]:
+        rows: list[dict[str, int]] = []
+        for number, count in sorted(
+            counts.items(), key=lambda item: (-item[1], item[0])
+        ):
+            gap = periods_ago.get(number)
+            rows.append(
+                {
+                    "number": number,
+                    "count": count,
+                    "periods_ago": int(gap) if gap is not None else lookback_n,
+                }
+            )
+        # 同次数时更偏近窗出现：再按 periods_ago 升序（稳定二次排序）
+        rows.sort(key=lambda row: (-int(row["count"]), int(row["periods_ago"]), int(row["number"])))
+        return rows
+
+    support_rows = _rows(support_counts)
+    resistance_rows = _rows(resistance_counts)
+    preferred = sorted(set(support_counts) | set(resistance_counts))
+    scores = {number: 1.0 for number in range(NUMBER_MIN, NUMBER_MAX + 1)}
+    for number in preferred:
+        hits = min(
+            PIVOT_COUNT_CAP,
+            int(support_counts.get(number, 0) + resistance_counts.get(number, 0)),
+        )
+        base = 1.0 + DEFAULT_PIVOT_BOOST * hits
+        gap = periods_ago.get(number)
+        if gap is None:
+            # 理论上近窗拐点必出现过；兜底不抬权
+            scores[number] = 1.0
+            continue
+        freshness = 1.0 - (float(gap) / float(lookback_n))
+        scores[number] = base * (1.0 + DEFAULT_PIVOT_RECENCY_BOOST * max(0.0, freshness))
+    return {
+        "span": span_n,
+        "lookback": lookback_n,
+        "support": support_rows,
+        "resistance": resistance_rows,
+        "preferred_numbers": preferred,
+        "scores": scores,
+        "sample_size": len(series),
     }
 
 
@@ -1938,9 +2082,10 @@ def stake_ladder_tier_counts(
     count: int,
     top: int | None = None,
 ) -> tuple[int, int, int, int]:
-    """按注数切分四档容量：``(尖刀, 10元, 5元, 3元)``。
+    """按注数切分四档容量：``(尖刀, 10元二档, 5元, 3元)``。
 
-    - 尖刀 10：10 元最多 ``STAKE_TIP_MAX``（2）注，其余全进 3 元（无二档 / 五元档）
+    - 尖刀 10：10 元最多 ``STAKE_TIP_MAX``（2）→ 5 元最多 ``STAKE_TIP10_FIVE_MAX``（3）
+      → 其余 3 元（无「二档 10」槽，第二项恒 0）
     - 尖刀 15/20：
       - 一档（尖刀）：1～2（注数 ≥ ``STAKE_TIP_TWO_MIN_COUNT`` 时取 2，否则 1）
       - 二档（10 元）：不超过 ``STAKE_ATTACK_SECOND_MAX``
@@ -1953,7 +2098,9 @@ def stake_ladder_tier_counts(
     tip = int(top) if top is not None and int(top) in STAKE_TOP_CHOICES else None
     if tip == STAKE_ATTACK_SECOND:
         tip_n = min(STAKE_TIP_MAX, target)
-        return tip_n, 0, 0, target - tip_n
+        rem = target - tip_n
+        five_n = min(STAKE_TIP10_FIVE_MAX, rem)
+        return tip_n, 0, five_n, rem - five_n
     tip_n = min(STAKE_TIP_MAX, 2 if target >= STAKE_TIP_TWO_MIN_COUNT else 1, target)
     rem = target - tip_n
     second_n = min(STAKE_ATTACK_SECOND_MAX, rem)
@@ -1969,7 +2116,7 @@ def stake_ladder(
 ) -> list[tuple[str, int]]:
     """档位金额表：``(角色, 金额)``，默认 8 码，注数可改。
 
-    尖刀 10：最多 2 注 10 元，其余 3 元。
+    尖刀 10：2 注 10 元 → 最多 3 注 5 元 → 其余 3 元。
     尖刀 15/20：尖刀 → 10 元（≤3）→ 5 元（≤5）→ 其余 3 元。
     ``top`` 只接受 10 / 15 / 20。``count`` 夹在 1–PICK_COUNT_MAX；候选不足时由调用方再截。
     """
@@ -2189,16 +2336,18 @@ def bucket_sampling_weight(
     lattice_scores: Mapping[int, float] | None = None,
     cold_weight: float = 1.0,
     trend_weight: float = 1.0,
+    pivot_weight: float = 1.0,
 ) -> float:
     """桶内抽样的**相对权重**（只有比值有意义，不是概率）。
 
-    = ``点阵权重 × 避冷权重 × 走势偏好倍数``（三项缺省均为 1.0 → 均匀抽样）。
+    = ``点阵 × 避冷 × 走势 × 拐点支撑/压力``（缺省均为 1.0 → 均匀抽样）。
 
     - 点阵（``lattice_scores``）：带内 1.0、带外按 ``1/(1+d/6)`` 衰减 ——
       **只决定抽样概率高低**，不再决定取号顺序；
     - 避冷（``cold_weight``）：沿用 ``avoid_cold_weight`` 的天数衰减 ——
       冷号概率被压低但**不排除**（与旧的「排到队尾」同向、更温和）；
-    - 走势（``trend_weight``）：``trend_sampling_weight`` 的倍数。
+    - 走势（``trend_weight``）：``trend_sampling_weight`` 的倍数（当前恒 1.0）；
+    - 拐点（``pivot_weight``）：特码局部高低点（支撑/压力）抬权，非硬过滤。
 
     返回值恒 ``>= 0``；全 0 时调用方回退为均匀抽样（不会无号可取）。
     """
@@ -2207,6 +2356,7 @@ def bucket_sampling_weight(
         weight *= float(lattice_scores.get(int(number), 1.0))
     weight *= max(0.0, float(cold_weight))
     weight *= max(0.0, float(trend_weight))
+    weight *= max(0.0, float(pivot_weight))
     return max(0.0, weight)
 
 
@@ -3003,7 +3153,7 @@ def recommend(
             pick_count, tip_amount
         )
         if tip_amount == STAKE_ATTACK_SECOND:
-            rule_note = "尖刀 10：10 元最多 2 注，其余 3 元。"
+            rule_note = "尖刀 10：10 元最多 2 注、5 元最多 3 注，其余 3 元。"
         else:
             rule_note = "尖刀 15/20：一档≤2、二档≤3、五元档≤5，其余进 3 元。"
         allocation_notes.append(
@@ -3093,6 +3243,19 @@ def recommend(
         if lattice_enabled
         else None
     )
+    # 特码拐点支撑/压力：抽样偏好（默认开）；只扫近 lookback 期；样本太短时 preferred 空
+    pivot_prefer_enabled = bool(cfg.get("pivot_prefer_enabled"))
+    pivot_span = int(cfg.get("pivot_span") or DEFAULT_PIVOT_SPAN)
+    pivot_lookback = int(cfg.get("pivot_lookback") or DEFAULT_PIVOT_LOOKBACK)
+    price_pivots = find_price_pivots(
+        history, span=pivot_span, lookback=pivot_lookback
+    )
+    pivot_scores: dict[int, float] | None = (
+        {int(n): float(w) for n, w in price_pivots["scores"].items()}
+        if pivot_prefer_enabled
+        else None
+    )
+    pivot_preferred = set(int(n) for n in price_pivots["preferred_numbers"])
     # **展示用**（不再参与选号）：预测带中心所在的波动桶，仅用于前端标注
     lattice_primary = (
         lattice_primary_wave(
@@ -3372,6 +3535,11 @@ def recommend(
                                 trend_counts=trend_counts,
                                 mid_target=mid_target,
                             ),
+                            pivot_weight=(
+                                float(pivot_scores.get(number, 1.0))
+                                if pivot_scores
+                                else 1.0
+                            ),
                         )
                     # 逐号抽：每抽一号后按生肖跨度重滤候选，避免一次抽满再超限
                     for _ in range(quota):
@@ -3532,6 +3700,19 @@ def recommend(
             lattice_enabled
             and lattice_band
             and float(lattice_band["low"]) <= int(pick["diff"]) <= float(lattice_band["high"])
+        )
+        # 特码拐点：是否支撑/压力号 + 抽样抬权倍数（关闭偏好时 weight 恒 1）
+        support_hit = any(
+            int(row["number"]) == number for row in price_pivots["support"]
+        )
+        resistance_hit = any(
+            int(row["number"]) == number for row in price_pivots["resistance"]
+        )
+        pick["is_price_pivot"] = bool(number in pivot_preferred)
+        pick["is_pivot_support"] = bool(support_hit)
+        pick["is_pivot_resistance"] = bool(resistance_hit)
+        pick["pivot_weight"] = round(
+            float(pivot_scores.get(number, 1.0)) if pivot_scores else 1.0, 4
         )
         # 避冷加权附加字段（只增不改）：距上次出现自然日 / 是否被压低 / 权重
         pick["days_since_last"] = days_since_last.get(number)
@@ -3736,6 +3917,26 @@ def recommend(
             "仅供历史审计复现，不建议线上使用。"
         )
 
+    if pivot_prefer_enabled:
+        pref = price_pivots["preferred_numbers"]
+        lookback_used = int(price_pivots.get("lookback") or pivot_lookback)
+        if pref:
+            notes.append(
+                f"特码拐点偏好已开启（左右各 {pivot_span} 期，只看最近 {lookback_used} 期）："
+                f"支撑 {len(price_pivots['support'])} 个、压力 {len(price_pivots['resistance'])} 个"
+                f"（并集 {len(pref)} 个号），近窗内越晚出现的拐点号抬权越高；"
+                f"更早于 {lookback_used} 期的支撑/压力不参与优先选号。"
+                "把特码当走势找局部高低点，是样本内结构偏好，不是支撑/压力会守住，"
+                "也不承诺提高命中率。"
+            )
+        else:
+            notes.append(
+                f"特码拐点偏好已开启（左右各 {pivot_span} 期，只看最近 {lookback_used} 期），"
+                "但近窗样本不足以标出局部高低点，本期抽样不抬权。"
+            )
+    else:
+        notes.append("特码拐点支撑/压力偏好已关闭：抽样不按局部高低点抬权。")
+
     # 三中三：仅从本期预测带内选号；点阵关闭 / 无带宽 → 不编造号码
     if not lattice_enabled:
         triple_sets = empty_triple_sets(
@@ -3920,6 +4121,24 @@ def recommend(
         },
         # 三中三：从本期预测带内选 3 组 × 每组 3 号（纯展示；英文 status）
         "triple_sets": triple_sets,
+        # 特码拐点支撑/压力（抽样偏好摘要；scores 不回传，避免 49 键噪音）
+        "price_pivots": {
+            "enabled": pivot_prefer_enabled,
+            "span": pivot_span,
+            "lookback": int(price_pivots.get("lookback") or pivot_lookback),
+            "sample_size": int(price_pivots["sample_size"]),
+            "support": list(price_pivots["support"]),
+            "resistance": list(price_pivots["resistance"]),
+            "preferred_numbers": list(price_pivots["preferred_numbers"]),
+            "boost": DEFAULT_PIVOT_BOOST,
+            "recency_boost": DEFAULT_PIVOT_RECENCY_BOOST,
+            "rule": (
+                f"只在最近 {int(price_pivots.get('lookback') or pivot_lookback)} 期内"
+                f"按 K 线转向找拐点（左右各 {pivot_span} 期）；"
+                "例：46→13→46 中间 13=支撑，15→46→13 中间 46=压力；"
+                "近窗越新抬权越高；更早的拐点号不优先；只抬抽样权重，不硬塞满票。"
+            ),
+        },
         "focus_order": [{"type": w, "label": WAVE_LABELS[w]} for w in focus],
         # 桶内取号方式（英文枚举 + 中文标签）：seeded_random / ranked
         "pick_sampling": pick_sampling,

@@ -11,6 +11,13 @@ import {
   LATTICE_WINDOW_DEFAULT,
   LATTICE_WINDOW_MAX,
   LATTICE_WINDOW_MIN,
+  PIVOT_LOOKBACK_DEFAULT,
+  PIVOT_LOOKBACK_MAX,
+  PIVOT_LOOKBACK_MIN,
+  PIVOT_PREFER_DEFAULT,
+  PIVOT_SPAN_DEFAULT,
+  PIVOT_SPAN_MAX,
+  PIVOT_SPAN_MIN,
   MIN_BET_AMOUNT,
   PICK_SAMPLING_OPTIONS,
   REPEAT_NUMBER_WEIGHT_DEFAULT,
@@ -121,6 +128,10 @@ const form = reactive({
   // 预测波动线 + 号码点阵（定义抽样概率分布：带内号码概率更高）；默认开启（2026-10-09）
   lattice_enabled: true,
   lattice_window: LATTICE_WINDOW_DEFAULT,
+  // 特码拐点支撑/压力：抽样抬权（默认开）；只看近 lookback 期
+  pivot_prefer_enabled: PIVOT_PREFER_DEFAULT,
+  pivot_span: PIVOT_SPAN_DEFAULT,
+  pivot_lookback: PIVOT_LOOKBACK_DEFAULT,
   // 波动桶注数分配：均衡分散（默认）—— 非空桶均分（形状骨架），避免「一坨」
   wave_alloc: 'balanced' as WaveAlloc,
   // 桶内取号方式：种子随机（默认）—— 期号确定性加权抽样；换期换样本、同期可复现
@@ -257,6 +268,13 @@ async function load() {
     form.lattice_window = typeof settings.lattice_window === 'number'
       ? settings.lattice_window
       : LATTICE_WINDOW_DEFAULT
+    form.pivot_prefer_enabled = settings.pivot_prefer_enabled !== false
+    form.pivot_span = typeof settings.pivot_span === 'number'
+      ? settings.pivot_span
+      : PIVOT_SPAN_DEFAULT
+    form.pivot_lookback = typeof settings.pivot_lookback === 'number'
+      ? settings.pivot_lookback
+      : PIVOT_LOOKBACK_DEFAULT
     // 只在后端返回合法枚举时覆盖，避免把状态搞成取值之外的脏值
     if (isWaveAlloc(settings.wave_alloc)) form.wave_alloc = settings.wave_alloc
     if (isPickSampling(settings.pick_sampling)) form.pick_sampling = settings.pick_sampling
@@ -409,6 +427,9 @@ async function save() {
       stale_weight: STALE_WEIGHT_DEFAULT,
       lattice_enabled: form.lattice_enabled,
       lattice_window: form.lattice_window,
+      pivot_prefer_enabled: form.pivot_prefer_enabled,
+      pivot_span: form.pivot_span,
+      pivot_lookback: form.pivot_lookback,
       wave_alloc: form.wave_alloc,
       pick_sampling: form.pick_sampling,
       role_w_primary: form.role_w_primary,
@@ -445,6 +466,13 @@ async function save() {
     form.lattice_window = typeof settings.lattice_window === 'number'
       ? settings.lattice_window
       : LATTICE_WINDOW_DEFAULT
+    form.pivot_prefer_enabled = settings.pivot_prefer_enabled !== false
+    form.pivot_span = typeof settings.pivot_span === 'number'
+      ? settings.pivot_span
+      : PIVOT_SPAN_DEFAULT
+    form.pivot_lookback = typeof settings.pivot_lookback === 'number'
+      ? settings.pivot_lookback
+      : PIVOT_LOOKBACK_DEFAULT
     // 只在后端返回合法枚举时覆盖，避免把状态搞成取值之外的脏值
     if (isWaveAlloc(settings.wave_alloc)) form.wave_alloc = settings.wave_alloc
     if (isPickSampling(settings.pick_sampling)) form.pick_sampling = settings.pick_sampling
@@ -580,7 +608,7 @@ const readonlyInputClass
                   均注：各注先保底 1 个单位，余量按下方「角色配额」分给主推 / 次选 / 防守（1:1:1 即严格均分）。
                   侧重：主推约占 4/6 单位，其余均分；单挑：只出 1 注（整份最大投注
                   押在一个号上）；随机分配：按最小单位随机拆给各注。四种模式的每一注金额都是最小单位的正整数倍。
-                  档位默认 8 码（注数可改）：尖刀 10（默认）= 10 元最多 2 注、其余 3 元；尖刀 15/20 = 尖刀 + 二档 10 元（≤3）+ 五元档（≤5）+ 其余 3 元。合计随各注相加。
+                  档位默认 8 码（注数可改）：尖刀 10（默认）= 2 个 10 元、3 个 5 元、其余 3 元；尖刀 15/20 = 尖刀 + 二档 10 元（≤3）+ 五元档（≤5）+ 其余 3 元。合计随各注相加。
                   保存后作为默认值：生成财富密码时按此模式分配筹码；在「波浪买入法」页面里临时切换只影响当次，
                   不改这里的默认值。
                 </p>
@@ -1045,6 +1073,76 @@ const readonlyInputClass
                     <span class="num text-slate-300">{{ LATTICE_WINDOW_DEFAULT }}</span> 期。
                     样本不足两对差值时不生成预测波动线，点阵不参与选号。
                   </p>
+                </div>
+              </div>
+
+              <!-- 特码拐点支撑 / 压力 -->
+              <div class="space-y-4 rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-4">
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                  <div class="space-y-1">
+                    <p id="pivot-label" class="text-sm font-medium text-slate-200">
+                      特码拐点 · 支撑 / 压力
+                    </p>
+                    <p class="text-xs leading-relaxed text-slate-500">
+                      把特码当 K 线找转向拐点：例如 46→13→46 中间 13 是支撑，
+                      15→46→13 中间 46 是压力。只在最近若干期内标这些号并抬权，
+                      近窗越新越高；更早的不优先。不硬塞、不承诺命中率。
+                    </p>
+                  </div>
+                  <GlassButton
+                    role="switch"
+                    :aria-checked="form.pivot_prefer_enabled"
+                    aria-labelledby="pivot-label"
+                    :variant="form.pivot_prefer_enabled ? 'primary' : 'glass'"
+                    class="min-h-[44px] shrink-0 px-4 text-base"
+                    @click="form.pivot_prefer_enabled = !form.pivot_prefer_enabled"
+                  >
+                    {{ form.pivot_prefer_enabled ? '已开启' : '已关闭' }}
+                  </GlassButton>
+                </div>
+                <div class="grid gap-4 sm:grid-cols-2">
+                  <div class="space-y-2">
+                    <label for="pivot-span" class="block text-sm font-medium text-slate-200">
+                      左右跨度（期）
+                    </label>
+                    <input
+                      id="pivot-span"
+                      v-model.number="form.pivot_span"
+                      type="number"
+                      :min="PIVOT_SPAN_MIN"
+                      :max="PIVOT_SPAN_MAX"
+                      inputmode="numeric"
+                      :disabled="!form.pivot_prefer_enabled"
+                      :class="form.pivot_prefer_enabled ? inputClass : readonlyInputClass"
+                    >
+                    <p class="text-xs text-slate-500">
+                      默认
+                      <span class="num text-slate-300">{{ PIVOT_SPAN_DEFAULT }}</span>
+                      （三期转向）；加大则左右要看更多期才算拐点。范围
+                      <span class="num text-slate-300">{{ PIVOT_SPAN_MIN }}</span>–<span class="num text-slate-300">{{ PIVOT_SPAN_MAX }}</span>。
+                    </p>
+                  </div>
+                  <div class="space-y-2">
+                    <label for="pivot-lookback" class="block text-sm font-medium text-slate-200">
+                      近窗回看（期）
+                    </label>
+                    <input
+                      id="pivot-lookback"
+                      v-model.number="form.pivot_lookback"
+                      type="number"
+                      :min="PIVOT_LOOKBACK_MIN"
+                      :max="PIVOT_LOOKBACK_MAX"
+                      inputmode="numeric"
+                      :disabled="!form.pivot_prefer_enabled"
+                      :class="form.pivot_prefer_enabled ? inputClass : readonlyInputClass"
+                    >
+                    <p class="text-xs text-slate-500">
+                      默认
+                      <span class="num text-slate-300">{{ PIVOT_LOOKBACK_DEFAULT }}</span>
+                      ：只在最近这么多期内找拐点；范围
+                      <span class="num text-slate-300">{{ PIVOT_LOOKBACK_MIN }}</span>–<span class="num text-slate-300">{{ PIVOT_LOOKBACK_MAX }}</span>。
+                    </p>
+                  </div>
                 </div>
               </div>
 
