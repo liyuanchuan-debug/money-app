@@ -18,6 +18,11 @@ export interface LotterySettings {
   /** 避开重肖：true=候选池排除最新同肖；默认 false */
   exclude_repeat_zodiac: boolean
   /**
+   * 连续两期同号/同肖：true=本期预测剔除该生肖整组（默认 true）。
+   * 例：46→34 同肖已连两期 → 10/22/34/46 不进本期预测号。
+   */
+  exclude_streak2: boolean
+  /**
    * 近期生肖规则：true=启用核心集（最新 N 肖）+ 肖外配额；默认 true。
    */
   restrict_recent_zodiacs: boolean
@@ -114,6 +119,7 @@ export interface LotterySettingsPatch {
   stake_top?: number
   odds?: number
   exclude_repeat_zodiac?: boolean
+  exclude_streak2?: boolean
   restrict_recent_zodiacs?: boolean
   recent_zodiac_limit?: number
   max_outside_recent_zodiacs?: number

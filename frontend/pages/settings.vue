@@ -110,6 +110,8 @@ const form = reactive({
   mode: 'even' as ChipMode,
   stake_top: 10 as 10 | 15 | 20,
   exclude_repeat_zodiac: false,
+  // 连续两期同号/同肖：本期预测剔除该生肖整组（默认开）
+  exclude_streak2: true,
   // 近期生肖：核心集最新 N 肖 + 肖外最多 M 个（默认开 / N=6 / M=2）
   restrict_recent_zodiacs: RESTRICT_RECENT_ZODIACS_DEFAULT,
   recent_zodiac_limit: RECENT_ZODIAC_LIMIT_DEFAULT,
@@ -248,6 +250,7 @@ async function load() {
     form.odds = typeof settings.odds === 'number' ? settings.odds : 47
     // 缺字号 / 旧后端：默认不避开重肖、保留重号（与 DEFAULT_SETTINGS 一致）
     form.exclude_repeat_zodiac = settings.exclude_repeat_zodiac === true
+    form.exclude_streak2 = settings.exclude_streak2 !== false
     // 缺字段时按默认开启（与 DEFAULT_SETTINGS 一致）
     form.restrict_recent_zodiacs = settings.restrict_recent_zodiacs === true
     form.recent_zodiac_limit = typeof settings.recent_zodiac_limit === 'number'
@@ -414,6 +417,7 @@ async function save() {
       mode: form.mode,
       stake_top: form.stake_top,
       exclude_repeat_zodiac: form.exclude_repeat_zodiac,
+      exclude_streak2: form.exclude_streak2,
       restrict_recent_zodiacs: form.restrict_recent_zodiacs,
       recent_zodiac_limit: form.recent_zodiac_limit,
       max_outside_recent_zodiacs: form.max_outside_recent_zodiacs,
@@ -447,6 +451,7 @@ async function save() {
     form.amount_unit = settings.amount_unit
     form.odds = typeof settings.odds === 'number' ? settings.odds : 47
     form.exclude_repeat_zodiac = settings.exclude_repeat_zodiac === true
+    form.exclude_streak2 = settings.exclude_streak2 !== false
     form.restrict_recent_zodiacs = settings.restrict_recent_zodiacs === true
     form.recent_zodiac_limit = typeof settings.recent_zodiac_limit === 'number'
       ? settings.recent_zodiac_limit
@@ -856,6 +861,31 @@ const readonlyInputClass
                     @click="form.exclude_repeat_zodiac = !form.exclude_repeat_zodiac"
                   >
                     {{ form.exclude_repeat_zodiac ? '已开启' : '已关闭' }}
+                  </GlassButton>
+                </div>
+              </div>
+
+              <!-- 连续两期同号/同肖：默认开 -->
+              <div class="space-y-2">
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                  <div class="space-y-1">
+                    <p id="exclude-streak2-label" class="text-sm font-medium text-slate-200">
+                      连续两期同号 / 同肖
+                    </p>
+                    <p class="text-xs leading-relaxed text-slate-500">
+                      开启（默认）后：最近相邻两期若已连开同号或同肖，本期预测剔除该生肖整组。
+                      例如 46→34 同肖连出后，10/22/34/46 不再进入本期预测号。这是硬排除，不是概率。
+                    </p>
+                  </div>
+                  <GlassButton
+                    role="switch"
+                    :aria-checked="form.exclude_streak2"
+                    aria-labelledby="exclude-streak2-label"
+                    :variant="form.exclude_streak2 ? 'primary' : 'glass'"
+                    class="min-h-[44px] shrink-0 px-4 text-base"
+                    @click="form.exclude_streak2 = !form.exclude_streak2"
+                  >
+                    {{ form.exclude_streak2 ? '已开启' : '已关闭' }}
                   </GlassButton>
                 </div>
               </div>

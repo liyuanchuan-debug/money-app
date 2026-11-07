@@ -551,6 +551,7 @@ def test_lottery_public_contract_unchanged():
         "stake_top",
         "odds",
         "exclude_repeat_zodiac",
+        "exclude_streak2",
         "restrict_recent_zodiacs",
         "recent_zodiac_limit",
         "max_outside_recent_zodiacs",

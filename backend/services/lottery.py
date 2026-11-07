@@ -164,6 +164,8 @@ SOFT_WEIGHT_MAX = 1.0
 # 设置项仍保留（兼容旧库 / 设置页），但 ``recommend()`` 生成路径已不再
 # 按核心集收窄候选池、也不再执行「肖外最多 M 个」取号拦截。
 # --------------------------------------------------------------------------- #
+# 连续两期同号 / 同肖：本期预测硬排除（默认开）
+DEFAULT_EXCLUDE_STREAK2 = True
 DEFAULT_RESTRICT_RECENT_ZODIACS = False
 DEFAULT_RECENT_ZODIAC_LIMIT = 6
 RECENT_ZODIAC_LIMIT_MIN = 1
@@ -383,6 +385,7 @@ SAMPLING_SEED_SETTING_KEYS = (
     "small_max",
     "normal_max",
     "exclude_repeat_zodiac",
+    "exclude_streak2",
     "include_repeat_number",
     "restrict_pick_zodiacs",
     "max_pick_zodiacs",
@@ -537,6 +540,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "odds": DEFAULT_ODDS,
     # 避开重肖：默认关闭（同肖号可以入选）；旧数据缺失该字段时也回退为 False
     "exclude_repeat_zodiac": False,
+    # 连续两期同号/同肖：本期预测剔除该号或整组生肖（默认开）
+    "exclude_streak2": DEFAULT_EXCLUDE_STREAK2,
     # 近期生肖：默认开启；核心集 = 最新 N 肖（默认 6），肖外最多 M 个（默认 2）
     "restrict_recent_zodiacs": DEFAULT_RESTRICT_RECENT_ZODIACS,
     "recent_zodiac_limit": DEFAULT_RECENT_ZODIAC_LIMIT,
@@ -616,6 +621,62 @@ def coerce_bool(value: Any, default: bool = False) -> bool:
 def zodiac_group(number: int) -> int:
     """同肖分组键：n 与 n±12 同肖，1..49 共 12 组。"""
     return (number - 1) % ZODIAC_STEP
+
+
+def streak2_blocked_numbers(
+    latest: int,
+    previous: int | None,
+    *,
+    enabled: bool = True,
+) -> dict[str, Any]:
+    """最近相邻两期若已同号或同肖，则本期预测剔除对应号码。
+
+    - 同号连续（如 40→40）：剔除该号整组生肖（同肖也已连出两期）
+    - 异号同肖连续（如 46→34）：剔除该生肖整组（10/22/34/46）
+    - 未连出两期：不剔除
+
+    返回英文 ``kind``：``repeat_number`` / ``repeat_zodiac`` / ``None``；
+    ``numbers`` 为升序列表。口径：硬排除候选，不是概率。
+    """
+    if not enabled or previous is None:
+        return {
+            "enabled": bool(enabled),
+            "applied": False,
+            "kind": None,
+            "numbers": [],
+            "zodiac_group": None,
+            "latest": int(latest) if latest is not None else None,
+            "previous": int(previous) if previous is not None else None,
+        }
+    latest_n = int(latest)
+    previous_n = int(previous)
+    same_number = latest_n == previous_n
+    same_zodiac = zodiac_group(latest_n) == zodiac_group(previous_n)
+    if not same_number and not same_zodiac:
+        return {
+            "enabled": True,
+            "applied": False,
+            "kind": None,
+            "numbers": [],
+            "zodiac_group": None,
+            "latest": latest_n,
+            "previous": previous_n,
+        }
+    group = zodiac_group(latest_n)
+    blocked = [
+        number
+        for number in range(NUMBER_MIN, NUMBER_MAX + 1)
+        if zodiac_group(number) == group
+    ]
+    return {
+        "enabled": True,
+        "applied": True,
+        "kind": "repeat_number" if same_number else "repeat_zodiac",
+        "numbers": blocked,
+        "zodiac_group": group,
+        "latest": latest_n,
+        "previous": previous_n,
+    }
 
 
 def zodiac_numbers(number: int, include_self: bool = True) -> list[int]:
@@ -713,6 +774,10 @@ def clamp_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     merged["exclude_repeat_zodiac"] = coerce_bool(
         merged.get("exclude_repeat_zodiac"),
         default=bool(DEFAULT_SETTINGS["exclude_repeat_zodiac"]),
+    )
+    merged["exclude_streak2"] = coerce_bool(
+        merged.get("exclude_streak2"),
+        default=bool(DEFAULT_SETTINGS["exclude_streak2"]),
     )
     # 近期生肖：缺失 / 脏值回退默认 True；N 钳到 1..12；肖外配额 M 钳到 0..注数上限
     merged["restrict_recent_zodiacs"] = coerce_bool(
@@ -1069,6 +1134,7 @@ def build_candidate_pools(
     exclude_repeat_zodiac: bool = False,
     include_repeat_number: bool = False,
     allowed_zodiac_groups: Sequence[int] | None = None,
+    blocked_numbers: Sequence[int] | None = None,
 ) -> dict[str, list[dict[str, int]]]:
     """构造三类波动候选池。
 
@@ -1079,11 +1145,17 @@ def build_candidate_pools(
       默认 ``False``：同肖号可以入选（只标记、不排除）。
     - ``allowed_zodiac_groups``：非 ``None`` 时只保留这些生肖分组键内的号码
       （「近期最新开过的 N 个生肖」硬过滤）；``None`` = 不限制。
+    - ``blocked_numbers``：额外硬排除集合（如连续两期同号/同肖的 streak2 整组）。
     """
     latest_group = zodiac_group(latest)
     allowed_set = (
         {int(group) for group in allowed_zodiac_groups}
         if allowed_zodiac_groups is not None
+        else None
+    )
+    blocked_set = (
+        {int(number) for number in blocked_numbers}
+        if blocked_numbers is not None
         else None
     )
     pools: dict[str, list[dict[str, int]]] = {wave: [] for wave in WAVE_ORDER}
@@ -1092,6 +1164,8 @@ def build_candidate_pools(
         if number == latest and not include_repeat_number:
             continue
         if exclude_repeat_zodiac and zodiac_group(number) == latest_group:
+            continue
+        if blocked_set is not None and number in blocked_set:
             continue
         if allowed_set is not None and zodiac_group(number) not in allowed_set:
             continue
@@ -3291,14 +3365,23 @@ def recommend(
     # 拦截已关闭：硬收窄恒关；肖外配额不参与取号（标注仍可比对核心集）
     max_outside_recent = pick_count  # 等价「不限额」
     allowed_zodiac_groups = None
+    # 连续两期同号/同肖 → 本期预测剔除该生肖整组（默认开）
+    streak2 = streak2_blocked_numbers(
+        latest,
+        previous,
+        enabled=bool(cfg.get("exclude_streak2", DEFAULT_EXCLUDE_STREAK2)),
+    )
+    streak2_blocked = list(streak2["numbers"]) if streak2["applied"] else None
     pools = build_candidate_pools(
         latest,
         cfg["small_max"],
         cfg["normal_max"],
         exclude_repeat_zodiac=bool(cfg["exclude_repeat_zodiac"]),
         # 上期出过的号不避开（只打「重号」信息标签），所以候选池保留重号
+        # （若已连出两期同号/同肖，则由 streak2 整组硬排除，优先生效）
         include_repeat_number=bool(cfg["include_repeat_number"]),
         allowed_zodiac_groups=None,
+        blocked_numbers=streak2_blocked,
     )
     # 出现热度硬排除已停用：近 100 期未出现的号仍可进入财富密码（只打「冷号」信息标签）。
     heat_window = HEAT_ABSENT_WINDOW
@@ -3838,6 +3921,34 @@ def recommend(
             "单票生肖跨度已关闭：本期号码不限制覆盖几个不重复生肖。"
         )
 
+    # 连续两期同号 / 同肖：本期预测硬排除
+    if streak2.get("enabled"):
+        if streak2.get("applied"):
+            kind = streak2.get("kind")
+            blocked = list(streak2.get("numbers") or [])
+            if kind == "repeat_number":
+                reason = (
+                    f"最近两期连开同号 {streak2['latest']}，"
+                    f"本期剔除该生肖整组 {len(blocked)} 个号"
+                )
+            else:
+                reason = (
+                    f"最近两期连开同肖（{streak2['previous']}→{streak2['latest']}），"
+                    f"本期剔除该生肖整组 {len(blocked)} 个号"
+                )
+            notes.append(
+                f"连续两期同号/同肖已开启：{reason}，不再进入本期预测号。"
+                "这是硬排除，不是概率，也不承诺提高命中率。"
+            )
+        else:
+            notes.append(
+                "连续两期同号/同肖已开启：最近相邻两期未连出同号或同肖，本期不因此剔除。"
+            )
+    else:
+        notes.append(
+            "连续两期同号/同肖已关闭：即使最近两期连出同号或同肖，也不因此剔除预测号。"
+        )
+
     # 角色金额配额（均注模式）：说明主推/次选/防守的分配口径
     if mode == MODE_EVEN and not role_weights_are_uniform(role_weights):
         role_text = "、".join(
@@ -3950,7 +4061,13 @@ def recommend(
         )
     else:
         band_numbers = [
-            int(row["number"]) for row in lattice_rows if row.get("in_band")
+            int(row["number"])
+            for row in lattice_rows
+            if row.get("in_band")
+            and (
+                not streak2.get("applied")
+                or int(row["number"]) not in set(streak2.get("numbers") or [])
+            )
         ]
         triple_sets = build_triple_sets(
             band_numbers,
@@ -4004,6 +4121,17 @@ def recommend(
             "applied": False,
             "excluded_count": 0,
             "excluded_numbers": sorted(heat_absent),
+        },
+        # 连续两期同号/同肖硬排除摘要
+        "streak2": {
+            "enabled": bool(streak2.get("enabled")),
+            "applied": bool(streak2.get("applied")),
+            "kind": streak2.get("kind"),
+            "zodiac_group": streak2.get("zodiac_group"),
+            "latest": streak2.get("latest"),
+            "previous": streak2.get("previous"),
+            "excluded_count": len(streak2.get("numbers") or []),
+            "excluded_numbers": list(streak2.get("numbers") or []),
         },
         # 近期生肖摘要：仅展示；pick_filter=False 表示不拦截选号
         "recent_zodiacs": {

@@ -56,6 +56,8 @@ class SettingsOut(BaseModel):
     odds: float
     # 避开重肖：True=候选池排除最新同肖；默认 False
     exclude_repeat_zodiac: bool
+    # 连续两期同号/同肖：True=本期预测剔除该生肖整组；默认 True
+    exclude_streak2: bool = True
     # 近期生肖规则：True=启用核心集 + 肖外配额；默认 True
     restrict_recent_zodiacs: bool
     # 近期生肖核心集个数（1..12）；默认 6
@@ -131,6 +133,10 @@ class SettingsPatch(BaseModel):
     )
     exclude_repeat_zodiac: bool | None = Field(
         default=None, description="True=避开最新一期同肖；默认 False"
+    )
+    exclude_streak2: bool | None = Field(
+        default=None,
+        description="True=最近两期已同号/同肖则本期剔除该生肖整组；默认 True",
     )
     restrict_recent_zodiacs: bool | None = Field(
         default=None,

@@ -95,7 +95,9 @@ from services.lottery import (
     resolve_zodiac_date,
     role_amount_weights,
     soft_penalty_weight,
+    streak2_blocked_numbers,
     zodiac_group,
+    DEFAULT_EXCLUDE_STREAK2,
 )
 from services.mark_six import zodiac_label, zodiac_of
 
@@ -365,6 +367,13 @@ def _engine_ranking(
     ``WAVE_ORDER``（小→常→大）。这里只是「1..49 的展示/候选名次」，
     不代表线上选号顺序（线上是配额 + 期号种子随机）。
     """
+    history = list(ctx.get("history") or [])
+    previous = int(history[1]) if len(history) > 1 else None
+    streak2 = streak2_blocked_numbers(
+        latest,
+        previous,
+        enabled=bool(cfg.get("exclude_streak2", DEFAULT_EXCLUDE_STREAK2)),
+    )
     pools = build_candidate_pools(
         latest,
         cfg["small_max"],
@@ -372,8 +381,9 @@ def _engine_ranking(
         exclude_repeat_zodiac=bool(cfg["exclude_repeat_zodiac"]),
         include_repeat_number=bool(cfg["include_repeat_number"]),
         allowed_zodiac_groups=resolve_allowed_zodiac_groups(
-            cfg, ctx.get("history") or []
+            cfg, history
         ),
+        blocked_numbers=list(streak2["numbers"]) if streak2["applied"] else None,
     )
     cold_enabled = bool(cfg["avoid_cold_enabled"])
     ordered = {
@@ -570,6 +580,13 @@ def _coverage(
     history_numbers: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     picks = sorted({int(n) for n in numbers})
+    history = list(history_numbers or [])
+    previous = int(history[1]) if len(history) > 1 else None
+    streak2 = streak2_blocked_numbers(
+        latest,
+        previous,
+        enabled=bool(cfg.get("exclude_streak2", DEFAULT_EXCLUDE_STREAK2)),
+    )
     pools = build_candidate_pools(
         latest,
         cfg["small_max"],
@@ -577,8 +594,9 @@ def _coverage(
         exclude_repeat_zodiac=bool(cfg["exclude_repeat_zodiac"]),
         include_repeat_number=bool(cfg["include_repeat_number"]),
         allowed_zodiac_groups=resolve_allowed_zodiac_groups(
-            cfg, history_numbers or []
+            cfg, history
         ),
+        blocked_numbers=list(streak2["numbers"]) if streak2["applied"] else None,
     )
     universe = sorted({int(row["number"]) for rows in pools.values() for row in rows})
     universe_set = set(universe)

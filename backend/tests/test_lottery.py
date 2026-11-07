@@ -1117,6 +1117,72 @@ def test_copy_text_user_sample_format():
 # --------------------------------------------------------------------------- #
 # 11. 避开重肖开关（默认关闭）
 # --------------------------------------------------------------------------- #
+def test_streak2_blocked_numbers_same_zodiac_and_same_number():
+    """46→34 同肖 / 40→40 同号：整组剔除；异肖不剔除。"""
+    from services.lottery import streak2_blocked_numbers, zodiac_group
+
+    zodiac_hit = streak2_blocked_numbers(34, 46, enabled=True)
+    assert zodiac_hit["applied"] is True
+    assert zodiac_hit["kind"] == "repeat_zodiac"
+    assert set(zodiac_hit["numbers"]) == {10, 22, 34, 46}
+
+    number_hit = streak2_blocked_numbers(40, 40, enabled=True)
+    assert number_hit["applied"] is True
+    assert number_hit["kind"] == "repeat_number"
+    assert all(zodiac_group(n) == zodiac_group(40) for n in number_hit["numbers"])
+
+    miss = streak2_blocked_numbers(34, 40, enabled=True)
+    assert miss["applied"] is False
+    assert miss["numbers"] == []
+
+    off = streak2_blocked_numbers(34, 46, enabled=False)
+    assert off["applied"] is False
+
+
+def test_recommend_excludes_streak2_zodiac_from_picks():
+    """最近两期 46→34 同肖后，本期预测不得再出 10/22/34/46。"""
+    blocked = {10, 22, 34, 46}
+    history = [34, 46, 18, 7, 33, 12, 41, 5, 26, 9, 1, 2, 3, 4, 8]
+    on = recommend(
+        latest=34,
+        previous=46,
+        history_numbers=history,
+        settings={
+            "pick_count": 8,
+            "mode": "ladder",
+            "lattice_enabled": False,
+            "exclude_streak2": True,
+            "exclude_repeat_zodiac": False,
+            "include_repeat_number": True,
+            "restrict_pick_zodiacs": False,
+        },
+        period=9101,
+    )
+    picked = {int(p["number"]) for p in on["picks"]}
+    assert picked.isdisjoint(blocked)
+    assert on["streak2"]["applied"] is True
+    assert set(on["streak2"]["excluded_numbers"]) == blocked
+    assert any("连开同肖" in note for note in on["notes"])
+
+    off = recommend(
+        latest=34,
+        previous=46,
+        history_numbers=history,
+        settings={
+            "pick_count": 8,
+            "mode": "ladder",
+            "lattice_enabled": False,
+            "exclude_streak2": False,
+            "exclude_repeat_zodiac": False,
+            "include_repeat_number": True,
+            "restrict_pick_zodiacs": False,
+        },
+        period=9101,
+    )
+    assert off["streak2"]["applied"] is False
+    assert any("连续两期同号/同肖已关闭" in note for note in off["notes"])
+
+
 def test_build_candidate_pools_respects_exclude_repeat_zodiac():
     from services.lottery import build_candidate_pools
 
