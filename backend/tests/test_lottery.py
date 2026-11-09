@@ -714,9 +714,9 @@ def test_pick_count_clamped(raw: int):
 
 
 def test_pick_count_default():
-    assert DEFAULT_SETTINGS["pick_count"] == 6
-    assert clamp_settings({})["pick_count"] == 6
-    assert clamp_settings(None)["pick_count"] == 6
+    assert DEFAULT_SETTINGS["pick_count"] == 9
+    assert clamp_settings({})["pick_count"] == 9
+    assert clamp_settings(None)["pick_count"] == 9
 
 
 @pytest.mark.parametrize("raw", [0, -1, 999])

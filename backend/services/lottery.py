@@ -48,7 +48,7 @@ MODE_WEIGHTED = "weighted"
 MODE_SINGLE = "single"
 # 随机分配：把最大投注金额按金额最小单位随机拆给各注（各注金额允许不等）。
 MODE_RANDOM = "random"
-# 档位：默认 8 码金额按角色写死，合计是各注相加，不从总预算反拆；注数可改（1–10）
+# 档位：默认 9 码（2×10 + 3×5 + 4×3）金额按角色写死，合计是各注相加，不从总预算反拆；注数可改（1–10）
 MODE_LADDER = "ladder"
 MODE_LABELS = {
     MODE_EVEN: "均注",
@@ -76,10 +76,10 @@ MIN_BET_AMOUNT = 5
 TOTAL_AMOUNT_MIN = 5
 TOTAL_AMOUNT_MAX = 100
 DEFAULT_TOTAL_AMOUNT = 50
-DEFAULT_PICK_COUNT = 6
+DEFAULT_PICK_COUNT = 9
 # 档位（mode=ladder）：金额先按角色定，合计 = 各注之和，不锁死总预算。
-# 尖刀 15/20：尖刀 1～2 → 10 元 ≤3 → 5 元 ≤5 → 其余 3 元；默认 8 码。
-# 尖刀 10（投注串默认）：10 元最多 2 注 → 5 元最多 3 注 → 其余 3 元。
+# 尖刀 15/20：尖刀 1～2 → 10 元 ≤3 → 5 元 ≤5 → 其余 3 元；默认 9 码。
+# 尖刀 10（投注串 / 逆向 2-3-4 默认）：10 元最多 2 注 → 5 元最多 3 注 → 其余 3 元（9 注=4 个 3 元）。
 STAKE_TOP_DEFAULT = 10
 STAKE_TOP_CHOICES = (10, 15, 20)
 STAKE_ATTACK_SECOND = 10
@@ -91,7 +91,7 @@ STAKE_ATTACK_SECOND_MAX = 3
 STAKE_REGULAR_MAX = 5
 # 尖刀 10 专用：5 元档最多 3 注（投注串「2 个 10、3 个 5、其余 3」）
 STAKE_TIP10_FIVE_MAX = 3
-STAKE_LADDER_DEFAULT_COUNT = 8
+STAKE_LADDER_DEFAULT_COUNT = 9
 # 尖刀 15/20：注数达到该值时一档可升到 2 注，否则默认 1 注
 STAKE_TIP_TWO_MIN_COUNT = 20
 LADDER_ROLE_LABELS = {
@@ -166,6 +166,8 @@ SOFT_WEIGHT_MAX = 1.0
 # --------------------------------------------------------------------------- #
 # 连续两期同号 / 同肖：本期预测硬排除（默认开）
 DEFAULT_EXCLUDE_STREAK2 = True
+# 逆向博弈叠加：引擎选号之上重排 10/5/3 并微调换号（默认开；NO_EDGE）
+DEFAULT_REVERSE_GAME_ENABLED = True
 DEFAULT_RESTRICT_RECENT_ZODIACS = False
 DEFAULT_RECENT_ZODIAC_LIMIT = 6
 RECENT_ZODIAC_LIMIT_MIN = 1
@@ -386,6 +388,7 @@ SAMPLING_SEED_SETTING_KEYS = (
     "normal_max",
     "exclude_repeat_zodiac",
     "exclude_streak2",
+    "reverse_game_enabled",
     "include_repeat_number",
     "restrict_pick_zodiacs",
     "max_pick_zodiacs",
@@ -542,6 +545,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "exclude_repeat_zodiac": False,
     # 连续两期同号/同肖：本期预测剔除该号或整组生肖（默认开）
     "exclude_streak2": DEFAULT_EXCLUDE_STREAK2,
+    # 逆向博弈叠加：默认关；开启后在引擎票上重排档位/微调换号（不承诺命中）
+    "reverse_game_enabled": DEFAULT_REVERSE_GAME_ENABLED,
     # 近期生肖：默认开启；核心集 = 最新 N 肖（默认 6），肖外最多 M 个（默认 2）
     "restrict_recent_zodiacs": DEFAULT_RESTRICT_RECENT_ZODIACS,
     "recent_zodiac_limit": DEFAULT_RECENT_ZODIAC_LIMIT,
@@ -779,6 +784,10 @@ def clamp_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         merged.get("exclude_streak2"),
         default=bool(DEFAULT_SETTINGS["exclude_streak2"]),
     )
+    merged["reverse_game_enabled"] = coerce_bool(
+        merged.get("reverse_game_enabled"),
+        default=bool(DEFAULT_SETTINGS["reverse_game_enabled"]),
+    )
     # 近期生肖：缺失 / 脏值回退默认 True；N 钳到 1..12；肖外配额 M 钳到 0..注数上限
     merged["restrict_recent_zodiacs"] = coerce_bool(
         merged.get("restrict_recent_zodiacs"),
@@ -954,6 +963,23 @@ def effective_trend_bias(cfg: dict[str, Any] | None) -> str:
 def resolve_trend_bias(cfg: dict[str, Any]) -> dict[str, Any]:
     """对配置应用读取口径（只改 ``trend_bias`` → 恒 ``neutral``，其余字段原样）。"""
     return {**cfg, "trend_bias": effective_trend_bias(cfg)}
+
+
+# 档位旧产品默认：6（早期 DEFAULT_PICK_COUNT）/ 8（STAKE_LADDER_DEFAULT_COUNT）
+# → 现统一 9（2×10 + 3×5 + 4×3）
+_LEGACY_LADDER_PICK_COUNTS = frozenset({6, 8})
+
+
+def resolve_legacy_ladder_pick_count(cfg: dict[str, Any]) -> dict[str, Any]:
+    """档位模式下把库内旧默认注数 6/8 升到 9（读取口径，不改其它模式）。"""
+    out = dict(cfg)
+    try:
+        count = int(out.get("pick_count") or 0)
+    except (TypeError, ValueError):
+        return out
+    if out.get("mode") == MODE_LADDER and count in _LEGACY_LADDER_PICK_COUNTS:
+        out["pick_count"] = DEFAULT_PICK_COUNT
+    return out
 
 
 def merge_settings_patch(
@@ -2188,7 +2214,7 @@ def stake_ladder(
     top: int = STAKE_TOP_DEFAULT,
     count: int | None = None,
 ) -> list[tuple[str, int]]:
-    """档位金额表：``(角色, 金额)``，默认 8 码，注数可改。
+    """档位金额表：``(角色, 金额)``，默认 9 码（2-3-4），注数可改。
 
     尖刀 10：2 注 10 元 → 最多 3 注 5 元 → 其余 3 元。
     尖刀 15/20：尖刀 → 10 元（≤3）→ 5 元（≤5）→ 其余 3 元。
@@ -3216,7 +3242,7 @@ def recommend(
         if amount_seed not in (None, ""):
             seed_key = f"{seed_key}|explicit={amount_seed}"
 
-    # 档位：金额按角色表写死（默认 8 码，注数跟 pick_count），不走总预算拆分。
+    # 档位：金额按角色表写死（默认 9 码，注数跟 pick_count），不走总预算拆分。
     ladder_rows: list[tuple[str, int]] | None = None
     if mode == MODE_LADDER:
         ladder_rows = stake_ladder(int(cfg["stake_top"]), pick_count)
@@ -3802,6 +3828,74 @@ def recommend(
         pick["avoid_cold_penalized"] = bool(cold_enabled and cold_weight < 1.0)
         pick["avoid_cold_weight"] = round(float(cold_weight), 4)
 
+    # 逆向博弈叠加（默认关）：引擎票之上重排 10/5/3、微调换号；NO_EDGE
+    from services.reverse_game import apply_reverse_game
+
+    in_band_numbers = [
+        int(row["number"])
+        for row in lattice_rows
+        if lattice_enabled and row.get("in_band")
+    ]
+    reverse_game_result = apply_reverse_game(
+        picks,
+        enabled=bool(cfg.get("reverse_game_enabled", DEFAULT_REVERSE_GAME_ENABLED)),
+        mode=mode,
+        latest=int(latest),
+        previous=previous,
+        history_numbers=history,
+        days_since_last=days_since_last,
+        in_band_numbers=in_band_numbers,
+        small_max=int(cfg["small_max"]),
+        normal_max=int(cfg["normal_max"]),
+        streak2_blocked=streak2_blocked,
+        recent_zodiac_limit=int(cfg.get("recent_zodiac_limit") or DEFAULT_RECENT_ZODIAC_LIMIT),
+    )
+    picks = list(reverse_game_result["picks"])
+    reverse_game_summary = dict(reverse_game_result["summary"])
+    reverse_game_notes = list(reverse_game_result.get("notes") or [])
+    if reverse_game_result.get("applied") and mode == MODE_LADDER:
+        total = sum(int(p.get("amount") or 0) for p in picks)
+        staked_total = total
+        cold_staked_total = total
+    # 换入的新号补齐生肖 / 走势 / 软标签（与引擎 annex 口径一致）
+    for pick in picks:
+        number = int(pick["number"])
+        if "zodiac" not in pick or pick.get("trend_count") is None:
+            pick_zodiac = (
+                zodiac_of(number, zodiac_date) if zodiac_date is not None else None
+            )
+            pick["zodiac"] = pick_zodiac
+            pick["zodiac_label"] = zodiac_label(pick_zodiac)
+            count = int(trend_counts.get(number, 0))
+            pick["trend_count"] = count
+            pick["trend_note"] = f"近{used_window}期出现{count}次"
+            pick["is_outside_recent_zodiac"] = bool(
+                core_zodiac_set is not None
+                and zodiac_group(number) not in core_zodiac_set
+            )
+            reasons = soft_reasons.get(number, [])
+            pick["soft_reasons"] = list(reasons)
+            pick["soft_weight"] = 1.0
+            pick["soft_penalized"] = False
+            pick["is_stale"] = "stale" in reasons
+            pick["periods_since_last"] = periods_since_last.get(number)
+            cold_w = avoid_cold_weight(
+                days_since_last.get(number),
+                enabled=cold_enabled,
+                threshold=cold_days,
+            )
+            pick["avoid_cold_penalized"] = bool(cold_enabled and cold_w < 1.0)
+            pick["avoid_cold_weight"] = round(float(cold_w), 4)
+            pick["lattice_weight"] = round(
+                float(lattice_scores.get(number, 1.0)) if lattice_scores else 1.0,
+                4,
+            )
+            pick["is_price_pivot"] = bool(number in pivot_preferred)
+            pick["pivot_weight"] = round(
+                float(pivot_scores.get(number, 1.0)) if pivot_scores else 1.0,
+                4,
+            )
+
     notes: list[str] = [*allocation_notes]
     if history_capped:
         notes.append(
@@ -3948,6 +4042,8 @@ def recommend(
         notes.append(
             "连续两期同号/同肖已关闭：即使最近两期连出同号或同肖，也不因此剔除预测号。"
         )
+
+    notes.extend(reverse_game_notes)
 
     # 角色金额配额（均注模式）：说明主推/次选/防守的分配口径
     if mode == MODE_EVEN and not role_weights_are_uniform(role_weights):
@@ -4133,6 +4229,8 @@ def recommend(
             "excluded_count": len(streak2.get("numbers") or []),
             "excluded_numbers": list(streak2.get("numbers") or []),
         },
+        # 逆向博弈叠加摘要（默认关；开启后档位重排/微调换号）
+        "reverse_game": reverse_game_summary,
         # 近期生肖摘要：仅展示；pick_filter=False 表示不拦截选号
         "recent_zodiacs": {
             "enabled": False,

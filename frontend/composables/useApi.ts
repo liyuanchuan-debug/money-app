@@ -23,6 +23,11 @@ export interface LotterySettings {
    */
   exclude_streak2: boolean
   /**
+   * 逆向博弈叠加：true=引擎票上按温号/预字/事不过三重排 10/5/3（默认 true）。
+   * 样本内档位偏好，不承诺命中率。
+   */
+  reverse_game_enabled: boolean
+  /**
    * 近期生肖规则：true=启用核心集（最新 N 肖）+ 肖外配额；默认 true。
    */
   restrict_recent_zodiacs: boolean
@@ -120,6 +125,7 @@ export interface LotterySettingsPatch {
   odds?: number
   exclude_repeat_zodiac?: boolean
   exclude_streak2?: boolean
+  reverse_game_enabled?: boolean
   restrict_recent_zodiacs?: boolean
   recent_zodiac_limit?: number
   max_outside_recent_zodiacs?: number
@@ -187,6 +193,9 @@ export interface Pick {
   is_pivot_resistance?: boolean
   /** 拐点抽样抬权倍数（关闭偏好时恒 1） */
   pivot_weight?: number
+  /** 逆向博弈标签英文码：preview | ultra_hot | ultra_cold | warm_blind | active_cold | other */
+  reverse_tag?: string
+  reverse_tag_label?: string
   /**
    * 号码 → 生肖的固定映射（英文码 + 汉字标签），随农历年（春节）轮转。
    * 与 `latest_zodiac` 指向同一组号码（农历年只决定这一组叫什么名字）。
@@ -370,6 +379,49 @@ export interface RecommendResult {
     }>
     /** 本池 walk-forward：实开落在当时预测带的命中统计 */
     hit_stats?: LatticeBandHitStatsPayload | null
+  }
+  /**
+   * 逆向博弈叠加摘要（默认开；开启后重排 10/5/3）。
+   * direction: follow | reverse；不承诺命中率。
+   */
+  reverse_game?: {
+    enabled: boolean
+    applied: boolean
+    direction: 'follow' | 'reverse' | string | null
+    direction_label: string | null
+    zodiac_streak?: number
+    hot_zodiac_group?: number | null
+    /** 近窗高频旺肖 */
+    wang_zodiac?: boolean
+    wang_zodiac_group?: number | null
+    wang_hits?: number
+    /** 宏观：hot=热盘最新N肖 / cold=冷盘非最新N肖 / mixed */
+    macro_zone?: 'hot' | 'cold' | 'mixed' | string
+    macro_zone_label?: string | null
+    macro_streak?: number
+    /** 定盘：hot=顺热 | cold=顺冷 */
+    prefer_zone?: 'hot' | 'cold' | string
+    prefer_label?: string | null
+    hot_zodiac_groups?: number[]
+    preview_numbers?: number[]
+    tip_numbers?: number[]
+    mid_numbers?: number[]
+    defense_numbers?: number[]
+    /** 本期唯一上期防守号（原号或同肖号二选一），仅 3 元 */
+    repeat_guard_number?: number | null
+    /** repeat_number=防重号 | repeat_zodiac=防重肖 */
+    prev_guard_kind?: 'repeat_number' | 'repeat_zodiac' | string | null
+    prev_guard_label?: string | null
+    /** 上期生肖组；(n-1)%12 */
+    prev_zodiac_group?: number | null
+    prev_zodiac_max?: number
+    prev_zodiac_count?: number
+    /** 若选防重肖，则为该同肖号；选防重号时为 null */
+    same_zodiac_cold_partner?: number | null
+    comeback_number?: number | null
+    replaced_numbers?: number[]
+    tier_counts?: { tip10: number; mid5: number; def3: number }
+    rule?: string
   }
   /**
    * 特码拐点支撑/压力摘要（抽样偏好；scores 不回传）。

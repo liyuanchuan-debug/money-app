@@ -25,6 +25,7 @@ from services.lottery import (
     DEFAULT_SETTINGS,
     clamp_settings,
     merge_settings_patch,
+    resolve_legacy_ladder_pick_count,
     resolve_trend_bias,
     with_derived_settings,
 )
@@ -1054,8 +1055,10 @@ class PostgresStore(Store):
         raw = await self._raw_settings(GLOBAL_SETTINGS_USER_ID)
         if user_id is not None and user_id != GLOBAL_SETTINGS_USER_ID:
             raw.update(await self._raw_settings(user_id))
-        # 读取口径：没手动设置过走势加权 → 强制 neutral（存量旧默认 hot 也如此）
-        return resolve_trend_bias(clamp_settings(raw))
+        # 读取口径：走势加权 → neutral；档位旧注数 6/8 → 9
+        return resolve_legacy_ladder_pick_count(
+            resolve_trend_bias(clamp_settings(raw))
+        )
 
     async def update_settings(
         self, patch: dict[str, Any], user_id: int | None = None
@@ -1078,7 +1081,7 @@ class PostgresStore(Store):
                         json.dumps(merged[key]),
                     )
         # 「近期走势加权去掉」：落库可暂存用户偏好键，读取侧恒 resolve 成 neutral
-        return resolve_trend_bias(merged)
+        return resolve_legacy_ladder_pick_count(resolve_trend_bias(merged))
 
     async def upsert_recommend_round(
         self, round_row: dict[str, Any]
@@ -1534,8 +1537,10 @@ class MemoryStore(Store):
         raw = dict(self._settings[GLOBAL_SETTINGS_USER_ID])
         if user_id is not None and int(user_id) != GLOBAL_SETTINGS_USER_ID:
             raw.update(self._bucket(int(user_id)))
-        # 与 PostgresStore 同口径：没手动设置过走势加权 → 强制 neutral
-        return resolve_trend_bias(clamp_settings(raw))
+        # 与 PostgresStore 同口径：走势加权 → neutral；档位旧注数 6/8 → 9
+        return resolve_legacy_ladder_pick_count(
+            resolve_trend_bias(clamp_settings(raw))
+        )
 
     async def update_settings(
         self, patch: dict[str, Any], user_id: int | None = None
@@ -1546,8 +1551,8 @@ class MemoryStore(Store):
         # 仅接受可写设置项；用户显式提交 trend_bias 时打上「手动设置过」标记
         merged = merge_settings_patch(current, patch)
         self._settings[target] = dict(merged)
-        # 与 PostgresStore 同口径：读取侧恒 resolve 成 neutral（走势加权已停用）
-        return resolve_trend_bias(merged)
+        # 与 PostgresStore 同口径：读取侧恒 resolve
+        return resolve_legacy_ladder_pick_count(resolve_trend_bias(merged))
 
     async def upsert_recommend_round(
         self, round_row: dict[str, Any]

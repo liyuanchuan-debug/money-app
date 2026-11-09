@@ -103,7 +103,7 @@ const form = reactive({
   // 与后端 services/lottery.py 的 DEFAULT_SETTINGS 对齐（10 / 30 / 不避重肖）
   small_max: 10,
   normal_max: 30,
-  pick_count: 10,
+  pick_count: 9,
   total_amount: 50,
   amount_unit: 5,
   odds: 47,
@@ -112,6 +112,8 @@ const form = reactive({
   exclude_repeat_zodiac: false,
   // 连续两期同号/同肖：本期预测剔除该生肖整组（默认开）
   exclude_streak2: true,
+  // 逆向博弈叠加：默认开
+  reverse_game_enabled: true,
   // 近期生肖：核心集最新 N 肖 + 肖外最多 M 个（默认开 / N=6 / M=2）
   restrict_recent_zodiacs: RESTRICT_RECENT_ZODIACS_DEFAULT,
   recent_zodiac_limit: RECENT_ZODIAC_LIMIT_DEFAULT,
@@ -251,6 +253,7 @@ async function load() {
     // 缺字号 / 旧后端：默认不避开重肖、保留重号（与 DEFAULT_SETTINGS 一致）
     form.exclude_repeat_zodiac = settings.exclude_repeat_zodiac === true
     form.exclude_streak2 = settings.exclude_streak2 !== false
+    form.reverse_game_enabled = settings.reverse_game_enabled !== false
     // 缺字段时按默认开启（与 DEFAULT_SETTINGS 一致）
     form.restrict_recent_zodiacs = settings.restrict_recent_zodiacs === true
     form.recent_zodiac_limit = typeof settings.recent_zodiac_limit === 'number'
@@ -418,6 +421,7 @@ async function save() {
       stake_top: form.stake_top,
       exclude_repeat_zodiac: form.exclude_repeat_zodiac,
       exclude_streak2: form.exclude_streak2,
+      reverse_game_enabled: form.reverse_game_enabled,
       restrict_recent_zodiacs: form.restrict_recent_zodiacs,
       recent_zodiac_limit: form.recent_zodiac_limit,
       max_outside_recent_zodiacs: form.max_outside_recent_zodiacs,
@@ -452,6 +456,7 @@ async function save() {
     form.odds = typeof settings.odds === 'number' ? settings.odds : 47
     form.exclude_repeat_zodiac = settings.exclude_repeat_zodiac === true
     form.exclude_streak2 = settings.exclude_streak2 !== false
+    form.reverse_game_enabled = settings.reverse_game_enabled !== false
     form.restrict_recent_zodiacs = settings.restrict_recent_zodiacs === true
     form.recent_zodiac_limit = typeof settings.recent_zodiac_limit === 'number'
       ? settings.recent_zodiac_limit
@@ -613,7 +618,7 @@ const readonlyInputClass
                   均注：各注先保底 1 个单位，余量按下方「角色配额」分给主推 / 次选 / 防守（1:1:1 即严格均分）。
                   侧重：主推约占 4/6 单位，其余均分；单挑：只出 1 注（整份最大投注
                   押在一个号上）；随机分配：按最小单位随机拆给各注。四种模式的每一注金额都是最小单位的正整数倍。
-                  档位默认 8 码（注数可改）：尖刀 10（默认）= 2 个 10 元、3 个 5 元、其余 3 元；尖刀 15/20 = 尖刀 + 二档 10 元（≤3）+ 五元档（≤5）+ 其余 3 元。合计随各注相加。
+                  档位默认 9 码（注数可改）：尖刀 10（默认）= 2 个 10 元、3 个 5 元、4 个 3 元；尖刀 15/20 = 尖刀 + 二档 10 元（≤3）+ 五元档（≤5）+ 其余 3 元。合计随各注相加。
                   保存后作为默认值：生成财富密码时按此模式分配筹码；在「波浪买入法」页面里临时切换只影响当次，
                   不改这里的默认值。
                 </p>
@@ -646,7 +651,7 @@ const readonlyInputClass
                   :class="inputClass"
                 >
                 <p class="text-xs text-slate-500">
-                  均注 / 侧重 / 随机分配模式下的默认注数（1-10，默认 10）；单挑模式恒为 1 注。
+                  均注 / 侧重 / 随机分配 / 档位模式下的默认注数（1-10，默认 9）；单挑模式恒为 1 注。
                 </p>
               </div>
 
@@ -886,6 +891,33 @@ const readonlyInputClass
                     @click="form.exclude_streak2 = !form.exclude_streak2"
                   >
                     {{ form.exclude_streak2 ? '已开启' : '已关闭' }}
+                  </GlassButton>
+                </div>
+              </div>
+
+              <!-- 逆向博弈叠加：默认开 -->
+              <div class="space-y-2">
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                  <div class="space-y-1">
+                    <p id="reverse-game-label" class="text-sm font-medium text-slate-200">
+                      逆向博弈叠加
+                    </p>
+                    <p class="text-xs leading-relaxed text-slate-500">
+                      开启后：先定盘（顺热=最新 N 肖 / 顺冷=非最新 N 肖；连满三防变盘，
+                      未满三顺应），再按单肖事不过三、防重号/防重肖二选一（有且仅 1 个进 3 元、
+                      禁 10/5）、预字/极寒只防重排 10/5/3。遗漏按自然日。默认开启。
+                      样本内档位偏好，不承诺提高命中率。
+                    </p>
+                  </div>
+                  <GlassButton
+                    role="switch"
+                    :aria-checked="form.reverse_game_enabled"
+                    aria-labelledby="reverse-game-label"
+                    :variant="form.reverse_game_enabled ? 'primary' : 'glass'"
+                    class="min-h-[44px] shrink-0 px-4 text-base"
+                    @click="form.reverse_game_enabled = !form.reverse_game_enabled"
+                  >
+                    {{ form.reverse_game_enabled ? '已开启' : '已关闭' }}
                   </GlassButton>
                 </div>
               </div>

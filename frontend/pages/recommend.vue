@@ -50,8 +50,8 @@ const BET_COUNT_MAX = 10
 
 /** 临时预览用的筹码模式：初值仍来自设置页保存的默认值 */
 const mode = ref<ChipMode>('ladder')
-/** 临时预览：注数（档位默认 6，可改；其它模式同样跟本页控件） */
-const betCount = ref(6)
+/** 临时预览：注数（档位 / 逆向 2-3-4 默认 9，可改；其它模式同样跟本页控件） */
+const betCount = ref(9)
 /** 档位尖刀：10 / 15 / 20，只影响第一注主攻（默认 10） */
 const stakeTop = ref<10 | 15 | 20>(10)
 const stakeTopOptions = [10, 15, 20] as const
@@ -111,6 +111,13 @@ if (settings.value?.stake_top === 10 || settings.value?.stake_top === 15 || sett
   stakeTop.value = settings.value.stake_top
 } else {
   stakeTop.value = 10
+}
+// 临场注数：其它模式跟设置；档位 / 逆向 2-3-4 强制 9（覆盖库内旧默认 6/8）
+if (typeof settings.value?.pick_count === 'number') {
+  betCount.value = clampBetCount(settings.value.pick_count)
+}
+if (mode.value === 'ladder') {
+  betCount.value = 9
 }
 if (typeof settings.value?.trend_window === 'number') {
   trendWindow.value = settings.value.trend_window
@@ -1185,6 +1192,13 @@ function clearCopyFeedback() {
   copyError.value = ''
 }
 
+watch(mode, (next) => {
+  // 切回档位时对齐 2-3-4（9 注）；其它模式不改用户临场注数
+  if (next === 'ladder' && (betCount.value === 6 || betCount.value === 8)) {
+    betCount.value = 9
+  }
+})
+
 watch([mode, betCount, trendWindow, stakeTop], async () => {
   clearCopyFeedback()
   rerollCount.value = 0
@@ -1484,8 +1498,8 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
             </div>
 
             <p class="text-xs leading-relaxed text-slate-500">
-              本页默认走「档位」：默认 8 个码，注数可改；金额按档相加，不先锁一笔总预算。
-              <template v-if="stakeTop === 10">2 个 10 元、3 个 5 元，其余 3 元。</template>
+              本页默认走「档位」：默认 9 个码（2-3-4），注数可改；金额按档相加，不先锁一笔总预算。
+              <template v-if="stakeTop === 10">2 个 10 元、3 个 5 元、4 个 3 元。</template>
               <template v-else>一档尖刀 {{ stakeTop }} 元（1～2 注）、二档 10 元（≤3）、五元档（≤5），其余 3 元。</template>
               切到均注 / 侧重 / 单挑 / 随机分配后，才按最大投注金额拆分。
               要改默认请到
@@ -1633,6 +1647,86 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               <template v-else>本次无重号 / 同肖 / 冷号标签。</template>
             </p>
 
+            <!-- 逆向博弈定盘：顺热/顺冷、是否满三 —— 徽章一眼可见 -->
+            <div
+              v-if="result.reverse_game?.enabled"
+              class="space-y-2"
+            >
+              <div class="flex flex-wrap items-center gap-2">
+                <StatChip tone="aqua" size="sm" dot>逆向定盘</StatChip>
+                <StatChip
+                  :tone="result.reverse_game.prefer_zone === 'cold' ? 'nebula' : 'bloom'"
+                  size="sm"
+                >
+                  {{
+                    result.reverse_game.prefer_zone === 'cold'
+                      ? '顺冷'
+                      : result.reverse_game.prefer_zone === 'hot'
+                        ? '顺热'
+                        : (result.reverse_game.prefer_label || '定盘中')
+                  }}
+                </StatChip>
+                <StatChip
+                  :tone="result.reverse_game.direction === 'reverse' ? 'amber' : 'emerald'"
+                  size="sm"
+                >
+                  <template v-if="result.reverse_game.direction === 'reverse'">
+                    已满三·防变盘
+                  </template>
+                  <template v-else>
+                    未满三·顺应
+                  </template>
+                </StatChip>
+                <StatChip
+                  v-if="result.reverse_game.macro_streak != null"
+                  tone="neutral"
+                  size="sm"
+                >
+                  {{ result.reverse_game.macro_zone === 'hot' ? '热盘' : result.reverse_game.macro_zone === 'cold' ? '冷盘' : '大盘' }}
+                  连 {{ result.reverse_game.macro_streak }} 期
+                </StatChip>
+                <StatChip
+                  v-if="result.reverse_game.zodiac_streak != null && result.reverse_game.zodiac_streak >= 3"
+                  tone="amber"
+                  size="sm"
+                >
+                  单肖连 {{ result.reverse_game.zodiac_streak }}·禁主攻
+                </StatChip>
+                <StatChip
+                  v-if="result.reverse_game.repeat_guard_number != null"
+                  :tone="result.reverse_game.prev_guard_kind === 'repeat_zodiac' ? 'nebula' : 'neutral'"
+                  size="sm"
+                >
+                  {{
+                    result.reverse_game.prev_guard_kind === 'repeat_zodiac'
+                      ? '防重肖'
+                      : '防重号'
+                  }}
+                  {{ pad(result.reverse_game.repeat_guard_number) }}·仅3元
+                </StatChip>
+                <StatChip tone="bloom" size="sm">
+                  上期肖名额≤1·禁10/5
+                </StatChip>
+              </div>
+              <p class="text-xs leading-relaxed text-slate-500">
+                <template v-if="result.reverse_game.prefer_zone === 'cold'">
+                  本期主攻偏「非最新 N 肖」温冷号。
+                </template>
+                <template v-else>
+                  本期主攻偏「最新 N 肖」强势/温号。
+                </template>
+                <template v-if="result.reverse_game.direction === 'reverse'">
+                  大盘已满三，按防变盘反向押注。
+                </template>
+                <template v-else>
+                  大盘未满三，继续顺应原盘。
+                </template>
+                防重号与防重肖有且仅 1 个名额：要么上期原号，要么同肖合适遗漏号，
+                绝不可兼买；该号只进 3 元，禁 10/5。预字/极寒只防。
+                样本内档位重排，不承诺命中率。
+              </p>
+            </div>
+
             <!-- 各注金额一览（随机分配下通常不等，如实列出） -->
             <div class="space-y-1.5">
               <p class="text-xs text-slate-500">
@@ -1731,7 +1825,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 </div>
 
                 <div
-                  v-if="pickSoftReasons(pick).length || pick.in_lattice_band || pick.is_price_pivot"
+                  v-if="pickSoftReasons(pick).length || pick.in_lattice_band || pick.is_price_pivot || pick.reverse_tag_label"
                   class="flex flex-wrap items-center gap-1"
                 >
                   <StatChip
@@ -1751,6 +1845,9 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   </StatChip>
                   <StatChip v-if="pick.is_pivot_resistance" tone="bloom" size="xs" outline>
                     压力
+                  </StatChip>
+                  <StatChip v-if="pick.reverse_tag_label" tone="neutral" size="xs" outline>
+                    {{ pick.reverse_tag_label }}
                   </StatChip>
                 </div>
 
