@@ -1693,6 +1693,13 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   单肖连 {{ result.reverse_game.zodiac_streak }}·禁主攻
                 </StatChip>
                 <StatChip
+                  v-if="result.reverse_game.cold_relay_number != null"
+                  tone="amber"
+                  size="sm"
+                >
+                  极寒接力 {{ pad(result.reverse_game.cold_relay_number) }}·10元
+                </StatChip>
+                <StatChip
                   v-if="result.reverse_game.repeat_guard_number != null"
                   :tone="result.reverse_game.prev_guard_kind === 'repeat_zodiac' ? 'nebula' : 'neutral'"
                   size="sm"
@@ -1704,7 +1711,18 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   }}
                   {{ pad(result.reverse_game.repeat_guard_number) }}·仅3元
                 </StatChip>
-                <StatChip tone="bloom" size="sm">
+                <StatChip
+                  v-if="result.reverse_game.cold_break"
+                  tone="bloom"
+                  size="sm"
+                >
+                  破极寒·禁10-40温号
+                </StatChip>
+                <StatChip
+                  v-else
+                  tone="bloom"
+                  size="sm"
+                >
                   上期肖名额≤1·禁10/5
                 </StatChip>
               </div>
@@ -1721,9 +1739,14 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 <template v-else>
                   大盘未满三，继续顺应原盘。
                 </template>
-                防重号与防重肖有且仅 1 个名额：要么上期原号，要么同肖合适遗漏号，
-                绝不可兼买；该号只进 3 元，禁 10/5。预字/极寒只防。
-                样本内档位重排，不承诺命中率。
+                <template v-if="result.reverse_game.cold_break && result.reverse_game.cold_relay_number != null">
+                  上期属极寒破局：同肖 80–120 天替补进 10 元主攻，严禁 10–40 天大众温号；
+                  上期原号最多进 3 元防重号。
+                </template>
+                <template v-else>
+                  防重号与防重肖有且仅 1 个：要么原号要么同肖合适遗漏号，只进 3 元，禁 10/5。
+                </template>
+                预字只防。样本内档位重排，不承诺命中率。
               </p>
             </div>
 

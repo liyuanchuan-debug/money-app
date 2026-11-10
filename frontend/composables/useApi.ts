@@ -407,11 +407,16 @@ export interface RecommendResult {
     tip_numbers?: number[]
     mid_numbers?: number[]
     defense_numbers?: number[]
-    /** 本期唯一上期防守号（原号或同肖号二选一），仅 3 元 */
+    /** 本期防守号（原号或同肖号），仅 3 元 */
     repeat_guard_number?: number | null
-    /** repeat_number=防重号 | repeat_zodiac=防重肖 */
-    prev_guard_kind?: 'repeat_number' | 'repeat_zodiac' | string | null
+    /** repeat_number=防重号 | repeat_zodiac=防重肖 | cold_relay=极寒接力 */
+    prev_guard_kind?: 'repeat_number' | 'repeat_zodiac' | 'cold_relay' | string | null
     prev_guard_label?: string | null
+    /** 上期原号开出前是否极寒破局（遗漏>80） */
+    cold_break?: boolean
+    latest_pre_omit_days?: number | null
+    /** 极寒替补号（80-120），强制 10 元主攻 */
+    cold_relay_number?: number | null
     /** 上期生肖组；(n-1)%12 */
     prev_zodiac_group?: number | null
     prev_zodiac_max?: number

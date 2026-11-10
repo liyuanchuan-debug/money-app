@@ -3849,6 +3849,7 @@ def recommend(
         normal_max=int(cfg["normal_max"]),
         streak2_blocked=streak2_blocked,
         recent_zodiac_limit=int(cfg.get("recent_zodiac_limit") or DEFAULT_RECENT_ZODIAC_LIMIT),
+        history_dates=dates_list,
     )
     picks = list(reverse_game_result["picks"])
     reverse_game_summary = dict(reverse_game_result["summary"])

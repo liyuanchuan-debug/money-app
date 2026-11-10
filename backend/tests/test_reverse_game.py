@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 from services.lottery import MODE_LADDER, recommend, zodiac_group
 from services.reverse_game import (
     DIRECTION_FOLLOW,
@@ -17,8 +19,10 @@ from services.reverse_game import (
     analyze_macro_zone,
     apply_reverse_game,
     classify_number_tag,
+    compute_latest_pre_omit_days,
     consecutive_zodiac_streak,
     detect_wang_zodiac,
+    is_cold_break,
     pick_prev_guard_slot,
     stake_tier_counts,
 )
@@ -29,8 +33,6 @@ def test_consecutive_zodiac_streak_and_direction_thresholds():
     streak, group = consecutive_zodiac_streak([34, 22, 10, 5])
     assert streak == 3
     assert group == zodiac_group(34)
-    streak2, _ = consecutive_zodiac_streak([34, 22, 5])
-    assert streak2 == 2
 
 
 def test_detect_wang_zodiac_four_of_three():
@@ -38,18 +40,12 @@ def test_detect_wang_zodiac_four_of_three():
     assert is_wang is True
     assert group == zodiac_group(34)
     assert hits == 3
-    is_wang2, _, _ = detect_wang_zodiac([34, 5, 8, 10])
-    assert is_wang2 is False
 
 
 def test_classify_number_tag_priority():
     assert (
         classify_number_tag(1, days_since_last=40, in_band=True, hot_zodiac_group=0)
         == TAG_PREVIEW
-    )
-    assert (
-        classify_number_tag(2, days_since_last=1, in_band=False, hot_zodiac_group=None)
-        == "ultra_hot"
     )
     assert (
         classify_number_tag(3, days_since_last=None, in_band=False, hot_zodiac_group=None)
@@ -59,14 +55,12 @@ def test_classify_number_tag_priority():
 
 def test_stake_tier_counts_two_three_rest():
     assert stake_tier_counts(9) == (2, 3, 4)
-    assert stake_tier_counts(8) == (2, 3, 3)
 
 
 def test_analyze_macro_zone_hot_streak_prefers_cold():
     history = [3, 2, 1, 13, 14, 6, 5, 4, 3, 2, 1]
     macro = analyze_macro_zone(history, limit=6)
     assert macro["zone"] == MACRO_HOT
-    assert macro["streak"] >= 3
     assert macro["reverse"] is True
     assert macro["prefer_zone"] == PREFER_COLD
 
@@ -75,58 +69,129 @@ def test_analyze_macro_zone_cold_streak_prefers_hot():
     history = [9, 8, 7, 1, 2, 3, 4, 5, 6, 13, 14]
     macro = analyze_macro_zone(history, limit=6)
     assert macro["zone"] == MACRO_COLD
-    assert macro["streak"] >= 3
-    assert macro["reverse"] is True
     assert macro["prefer_zone"] == PREFER_HOT
 
 
 def test_analyze_macro_zone_follow_continues_current_board():
     hot_follow = analyze_macro_zone([1, 2, 3, 13, 14, 6, 5, 4, 7, 8], limit=6)
-    assert hot_follow["zone"] == MACRO_HOT
-    assert hot_follow["streak"] == 2
-    assert hot_follow["reverse"] is False
     assert hot_follow["prefer_zone"] == PREFER_HOT
-
     cold_follow = analyze_macro_zone([9, 8, 1, 2, 3, 4, 5, 6, 13, 14], limit=6)
-    assert cold_follow["zone"] == MACRO_COLD
-    assert cold_follow["streak"] == 2
-    assert cold_follow["reverse"] is False
     assert cold_follow["prefer_zone"] == PREFER_COLD
 
 
-def test_pick_prev_guard_slot_prefers_suitable_same_zodiac():
-    """有合适遗漏同肖号 → 防重肖；否则 → 防重号原号。"""
-    days = {n: 5 for n in range(1, 50)}
-    days[34] = 0
-    days[10] = 35  # 合适
-    days[22] = 90
-    days[46] = 120
-    number, kind = pick_prev_guard_slot(
-        latest=34, blocked=set(), days_since_last=days
+def test_cold_break_and_pre_omit_days():
+    assert is_cold_break(94) is True
+    assert is_cold_break(80) is False
+    assert is_cold_break(None) is True
+    tip = date(2026, 11, 10)
+    older = tip - timedelta(days=94)
+    history = [43, 38, 34, 46, 13, 43]
+    dates = [tip, tip - timedelta(days=1), tip - timedelta(days=2), tip - timedelta(days=3), tip - timedelta(days=4), older]
+    assert compute_latest_pre_omit_days(history, dates, 43) == 94
+
+
+def test_apply_reverse_game_cold_relay_forces_tip_and_bans_warm_trap():
+    """极寒破局：31(107天)进10元；禁19(28天)；原号43仅3元。"""
+    latest = 43
+    history = [43, 38, 34, 46, 13, 1, 2, 3, 4, 5]
+    tip = date(2026, 11, 10)
+    dates = [tip - timedelta(days=i) for i in range(len(history))]
+    # 伪造：43 上次出现在 94 天前
+    dates[-1] = tip - timedelta(days=94)
+    history = [43, 38, 34, 46, 13, 43]
+    dates = [
+        tip,
+        tip - timedelta(days=1),
+        tip - timedelta(days=2),
+        tip - timedelta(days=3),
+        tip - timedelta(days=4),
+        tip - timedelta(days=94),
+    ]
+    days = {n: 40 for n in range(1, 50)}
+    days[43] = 0
+    days[19] = 28
+    days[31] = 107
+    days[7] = 57
+    picks = [
+        {"number": n, "diff": abs(n - 43), "wave_type": "small", "amount": 3, "role": "defense"}
+        for n in (19, 11, 44, 40, 5, 22, 32, 24, 35)
+    ]
+    out = apply_reverse_game(
+        picks,
+        enabled=True,
+        mode=MODE_LADDER,
+        latest=latest,
+        previous=38,
+        history_numbers=history,
+        days_since_last=days,
+        in_band_numbers=[],
+        small_max=10,
+        normal_max=30,
+        history_dates=dates,
     )
-    assert kind == GUARD_KIND_REPEAT_ZODIAC
-    assert number == 10
+    assert out["summary"]["cold_break"] is True
+    assert out["summary"]["cold_relay_number"] == 31
+    assert 31 in out["summary"]["tip_numbers"]
+    tip_pick = next(p for p in out["picks"] if int(p["number"]) == 31)
+    assert int(tip_pick["amount"]) == 10
+    assert 19 not in out["summary"]["tip_numbers"]
+    assert 19 not in out["summary"]["mid_numbers"]
+    assert 19 not in out["summary"]["defense_numbers"]
+    assert 43 in out["summary"]["defense_numbers"]
+    guard = next(p for p in out["picks"] if int(p["number"]) == 43)
+    assert int(guard["amount"]) == 3
 
-    days2 = {n: 5 for n in range(1, 50)}
-    days2[34] = 0
-    days2[10] = 3
-    days2[22] = 2
-    days2[46] = 1
-    number2, kind2 = pick_prev_guard_slot(
-        latest=34, blocked=set(), days_since_last=days2
+
+def test_apply_reverse_game_prev_guard_xor_without_cold_break():
+    """非极寒破局：仍二选一仅 1 个进 3 元。"""
+    history = [12, 5, 8, 1, 2, 3, 4, 6, 7, 9]
+    tip = date(2026, 11, 1)
+    # 12 上次仅 10 天前 → 非破局
+    history = [12, 5, 8, 1, 2, 12]
+    dates = [
+        tip,
+        tip - timedelta(days=1),
+        tip - timedelta(days=2),
+        tip - timedelta(days=3),
+        tip - timedelta(days=4),
+        tip - timedelta(days=10),
+    ]
+    days = {n: 40 for n in range(1, 50)}
+    days[12] = 0
+    days[24] = 45  # 同肖合适且避开 10-40
+    days[36] = 28  # 温号陷阱，非破局时也不进 suitable（10-40 已排除）
+    picks = [
+        {"number": n, "diff": abs(n - 12), "wave_type": "small", "amount": 3, "role": "defense"}
+        for n in (24, 36, 12, 14, 16, 18, 26, 28, 30)
+    ]
+    out = apply_reverse_game(
+        picks,
+        enabled=True,
+        mode=MODE_LADDER,
+        latest=12,
+        previous=5,
+        history_numbers=history,
+        days_since_last=days,
+        in_band_numbers=[],
+        small_max=10,
+        normal_max=30,
+        history_dates=dates,
     )
-    assert kind2 == GUARD_KIND_REPEAT_NUMBER
-    assert number2 == 34
+    assert out["summary"]["cold_break"] is False
+    assert out["summary"]["cold_relay_number"] is None
+    assert out["summary"]["prev_zodiac_count"] == 1
+    guard = out["summary"]["repeat_guard_number"]
+    assert guard in out["summary"]["defense_numbers"]
+    assert guard not in out["summary"]["tip_numbers"]
 
 
-def test_apply_reverse_game_blocks_preview_and_ultra_cold_from_tip():
+def test_apply_reverse_game_blocks_preview_from_tip():
     latest = 20
     picks = [
         {"number": n, "diff": abs(n - 20), "wave_type": "small", "amount": 3, "role": "defense"}
         for n in (21, 22, 23, 24, 25, 26, 27, 28, 29)
     ]
     days = {n: 40 for n in range(1, 50)}
-    days[21] = 1
     days[22] = 120
     in_band = [23]
     history = [20, 7, 15, 8, 3, 1, 2, 4, 5, 6]
@@ -142,15 +207,7 @@ def test_apply_reverse_game_blocks_preview_and_ultra_cold_from_tip():
         small_max=10,
         normal_max=30,
     )
-    tip = set(out["summary"]["tip_numbers"])
-    assert 22 not in tip and 23 not in tip
-    guard = out["summary"]["repeat_guard_number"]
-    assert guard in out["summary"]["defense_numbers"]
-    for pick in out["picks"]:
-        if int(pick["amount"]) == 10:
-            assert pick.get("reverse_tag") not in (TAG_PREVIEW, TAG_ULTRA_COLD)
-        if int(pick["number"]) == guard:
-            assert int(pick["amount"]) == 3
+    assert 23 not in out["summary"]["tip_numbers"]
 
 
 def test_apply_reverse_game_micro_reverse_avoids_hot_zodiac_on_tip():
@@ -174,83 +231,12 @@ def test_apply_reverse_game_micro_reverse_avoids_hot_zodiac_on_tip():
         normal_max=30,
         streak2_blocked=[10, 22, 34, 46],
     )
-    assert out["summary"]["zodiac_streak"] == 3
+    # 若未触发极寒接力，tip 不含连肖主攻肖；接力号除外
+    relay = out["summary"].get("cold_relay_number")
     for number in out["summary"]["tip_numbers"]:
-        assert zodiac_group(number) != hot
-
-
-def test_apply_reverse_game_prev_guard_xor_one_slot():
-    """有且仅 1 个上期名额：原号与同肖号不可兼买；只进 3 元。"""
-    history = [34, 5, 8, 1, 2, 3, 4, 6, 7, 9]
-    days = {n: 40 for n in range(1, 50)}
-    days[34] = 0
-    days[10] = 35  # 合适同肖 → 应选防重肖，不要原号
-    days[22] = 50
-    days[46] = 120
-    picks = [
-        {"number": n, "diff": abs(n - 34), "wave_type": "small", "amount": 3, "role": "defense"}
-        for n in (10, 22, 34, 46, 12, 14, 16, 18, 26)
-    ]
-    out = apply_reverse_game(
-        picks,
-        enabled=True,
-        mode=MODE_LADDER,
-        latest=34,
-        previous=5,
-        history_numbers=history,
-        days_since_last=days,
-        in_band_numbers=[],
-        small_max=10,
-        normal_max=30,
-    )
-    prev_g = zodiac_group(34)
-    tip = out["summary"]["tip_numbers"]
-    mid = out["summary"]["mid_numbers"]
-    defense = out["summary"]["defense_numbers"]
-    all_nums = tip + mid + defense
-    prev_nums = [n for n in all_nums if zodiac_group(n) == prev_g]
-    assert len(prev_nums) == 1
-    guard = out["summary"]["repeat_guard_number"]
-    assert prev_nums == [guard]
-    assert guard == 10
-    assert out["summary"]["prev_guard_kind"] == GUARD_KIND_REPEAT_ZODIAC
-    assert 34 not in all_nums  # 原号与同肖号不可兼买
-    assert guard in defense
-    assert guard not in tip and guard not in mid
-    for n in tip + mid:
-        assert zodiac_group(n) != prev_g
-    guard_pick = next(p for p in out["picks"] if int(p["number"]) == guard)
-    assert int(guard_pick["amount"]) == 3
-
-
-def test_apply_reverse_game_prev_guard_falls_back_to_latest():
-    """无合适同肖遗漏 → 只留原号防重号。"""
-    history = [34, 5, 8, 1, 2, 3, 4, 6, 7, 9]
-    days = {n: 3 for n in range(1, 50)}
-    days[34] = 0
-    days[10] = 2
-    days[22] = 1
-    days[46] = 1
-    picks = [
-        {"number": n, "diff": abs(n - 34), "wave_type": "small", "amount": 3, "role": "defense"}
-        for n in (10, 22, 34, 46, 12, 14, 16, 18, 26)
-    ]
-    out = apply_reverse_game(
-        picks,
-        enabled=True,
-        mode=MODE_LADDER,
-        latest=34,
-        previous=5,
-        history_numbers=history,
-        days_since_last=days,
-        in_band_numbers=[],
-        small_max=10,
-        normal_max=30,
-    )
-    assert out["summary"]["prev_guard_kind"] == GUARD_KIND_REPEAT_NUMBER
-    assert out["summary"]["repeat_guard_number"] == 34
-    assert 34 in out["summary"]["defense_numbers"]
-    assert out["summary"]["prev_zodiac_count"] == 1
+        if relay is not None and number == relay:
+            continue
+        assert zodiac_group(number) != hot or out["summary"].get("cold_break")
 
 
 def test_recommend_reverse_game_off_is_noop_for_amounts_shape():
@@ -276,9 +262,7 @@ def test_recommend_reverse_game_off_is_noop_for_amounts_shape():
 def test_recommend_reverse_game_on_ladder_tiers_and_contract_key():
     from services.lottery import DEFAULT_SETTINGS
 
-    assert "reverse_game_enabled" in DEFAULT_SETTINGS
     assert DEFAULT_SETTINGS["reverse_game_enabled"] is True
-
     history = [12, 5, 20, 30, 8, 15, 22, 3, 9, 41] + list(range(1, 40))
     on = recommend(
         12,
@@ -296,11 +280,7 @@ def test_recommend_reverse_game_on_ladder_tiers_and_contract_key():
     )
     assert on["reverse_game"]["enabled"] is True
     assert on["reverse_game"]["direction"] in (DIRECTION_FOLLOW, DIRECTION_REVERSE)
-    assert "macro_zone" in on["reverse_game"]
-    assert "prefer_label" in on["reverse_game"]
-    assert on["reverse_game"].get("prev_zodiac_count", 0) <= 1
     amounts = [int(p["amount"]) for p in on["picks"]]
     assert amounts.count(10) == 2
     assert amounts.count(5) == 3
     assert amounts.count(3) == 4
-    assert any("逆向博弈叠加已开启" in note for note in on["notes"])

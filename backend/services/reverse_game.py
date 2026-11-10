@@ -7,13 +7,15 @@
 - **大盘**：顺热=最新 N 肖；顺冷=非最新 N 肖；连 ≥3 → 防变盘反向；未满三 → 顺应原盘；
 - **微观**：单肖连出 ≥3 → 该肖不做主攻；旺肖可抬热号权重，但上期肖受防重号铁律约束；
 - **死穴**：极寒(100+)与预字只防不作主攻；
-- **防重号 / 防重肖（有且仅 1 个）**：
-  上期原号与上期生肖共用 1 个防守名额：要么只留原号（防重号），要么只留同肖里
-  遗漏最合适的一号（防重肖），绝不可两者兼买；该号必须且只能进 3 元，禁 10/5。
+- **防重号 / 极寒接力**：
+  上期原号开出前若遗漏 >80 天（破极寒），且同肖仍有 80–120 天极寒替补：
+  替补强制进 10 元主攻；严禁同肖 10–40 天常规温号；原号最多进 3 元防重号。
+  非极寒破局时：上期原号/同肖合适号仍二选一仅 1 个进 3 元。
 """
 
 from __future__ import annotations
 
+from datetime import date as Date
 from typing import Any, Mapping, Sequence
 
 from services.lottery import (
@@ -83,19 +85,28 @@ ULTRA_HOT_DAYS_MAX = 2
 ULTRA_COLD_DAYS_MIN = 100
 # 旺肖内遗漏超此天数的号禁止主攻
 WANG_TIP_COLD_BAN_DAYS = 80
-# 上期原号 / 上期肖共用防守名额：有且仅 1 个
+# 非极寒接力时：上期原号/同肖合适号共用防守名额有且仅 1 个
 PREV_ZODIAC_MAX = 1
-# 英文枚举：选中的那 1 个防守是防重号还是防重肖
+# 英文枚举
 GUARD_KIND_REPEAT_NUMBER = "repeat_number"
 GUARD_KIND_REPEAT_ZODIAC = "repeat_zodiac"
+GUARD_KIND_COLD_RELAY = "cold_relay"
 GUARD_KIND_LABELS = {
     GUARD_KIND_REPEAT_NUMBER: "防重号（上期原号）",
     GUARD_KIND_REPEAT_ZODIAC: "防重肖（同肖合适遗漏）",
+    GUARD_KIND_COLD_RELAY: "极寒接力（同肖80-120替补）",
 }
-# 同肖号「遗漏最合适」窗口（自然日）
+# 同肖号「遗漏最合适」窗口（非极寒接力时的 3 元防重肖）
 SAME_ZODIAC_SUITABLE_MIN = 20
 SAME_ZODIAC_SUITABLE_MAX = 60
 SAME_ZODIAC_IDEAL_DAYS = 35
+# 极寒破局 / 极寒替补 / 大众温号陷阱（自然日）
+COLD_BREAK_MIN_DAYS = 80
+COLD_RELAY_MIN_DAYS = 80
+COLD_RELAY_MAX_DAYS = 120
+COLD_RELAY_IDEAL_DAYS = 100
+WARM_TRAP_MIN_DAYS = 10
+WARM_TRAP_MAX_DAYS = 40
 
 STREAK_REVERSE_AT = 3
 # 近窗内同肖出现次数 ≥ 此值 → 旺肖（如 4 天出 3 天）
@@ -312,6 +323,53 @@ def _force_into_defense(
     return out[:target]
 
 
+def compute_latest_pre_omit_days(
+    history_numbers: Sequence[int],
+    history_dates: Sequence[Any] | None,
+    latest: int,
+) -> int | None:
+    """上期原号在开出前的遗漏自然日；样本内此前从未出现 → ``None``（视作极寒）。"""
+    latest = int(latest)
+    series = [
+        int(n)
+        for n in history_numbers
+        if isinstance(n, (int, float)) and NUMBER_MIN <= int(n) <= NUMBER_MAX
+    ]
+    if not series or series[0] != latest:
+        # 仍按值搜：找到最新一期该号后再找更早一次
+        tip_idx = next((i for i, n in enumerate(series) if n == latest), None)
+        if tip_idx is None:
+            return None
+    else:
+        tip_idx = 0
+    prev_idx = next(
+        (i for i, n in enumerate(series[tip_idx + 1 :], tip_idx + 1) if n == latest),
+        None,
+    )
+    if prev_idx is None:
+        return None
+    if history_dates is not None:
+        parsed: list[Date | None] = []
+        for raw in history_dates:
+            if isinstance(raw, Date):
+                parsed.append(raw)
+            else:
+                parsed.append(None)
+        tip_d, prev_d = parsed[tip_idx] if tip_idx < len(parsed) else None, (
+            parsed[prev_idx] if prev_idx < len(parsed) else None
+        )
+        if len(parsed) == len(series) and tip_d is not None and prev_d is not None:
+            return int((tip_d - prev_d).days)
+    return int(prev_idx - tip_idx)
+
+
+def is_cold_break(latest_pre_omit_days: int | None) -> bool:
+    """上期原号开出前遗漏 >80 天（或样本内首次出现）→ 极寒破局。"""
+    if latest_pre_omit_days is None:
+        return True
+    return int(latest_pre_omit_days) > COLD_BREAK_MIN_DAYS
+
+
 def _pick_same_zodiac_suitable(
     *,
     latest: int,
@@ -333,6 +391,9 @@ def _pick_same_zodiac_suitable(
             continue
         if not (SAME_ZODIAC_SUITABLE_MIN <= int(days) <= SAME_ZODIAC_SUITABLE_MAX):
             continue
+        # 避开 10–40 大众温号陷阱
+        if WARM_TRAP_MIN_DAYS <= int(days) <= WARM_TRAP_MAX_DAYS:
+            continue
         candidates.append(number)
     if not candidates:
         return None
@@ -345,13 +406,46 @@ def _pick_same_zodiac_suitable(
     return candidates[0]
 
 
+def _pick_cold_relay_number(
+    *,
+    latest: int,
+    prev_group: int,
+    blocked: set[int],
+    days_since_last: Mapping[int, int | None],
+) -> int | None:
+    """同肖极寒替补：遗漏落在 80–120 天，优先靠近 100。"""
+    candidates: list[int] = []
+    for number in range(NUMBER_MIN, NUMBER_MAX + 1):
+        if number == int(latest):
+            continue
+        if number in blocked:
+            continue
+        if zodiac_group(number) != int(prev_group):
+            continue
+        days = days_since_last.get(number)
+        if days is None:
+            continue
+        if not (COLD_RELAY_MIN_DAYS <= int(days) <= COLD_RELAY_MAX_DAYS):
+            continue
+        candidates.append(number)
+    if not candidates:
+        return None
+
+    def _relay_key(number: int) -> tuple:
+        days = int(days_since_last.get(number) or COLD_RELAY_IDEAL_DAYS)
+        return (abs(days - COLD_RELAY_IDEAL_DAYS), number)
+
+    candidates.sort(key=_relay_key)
+    return candidates[0]
+
+
 def pick_prev_guard_slot(
     *,
     latest: int,
     blocked: set[int],
     days_since_last: Mapping[int, int | None],
 ) -> tuple[int, str]:
-    """二选一：有合适同肖号 → 防重肖；否则 → 防重号（原号）。"""
+    """非极寒接力时二选一：有合适同肖号 → 防重肖；否则 → 防重号（原号）。"""
     latest = int(latest)
     prev_group = zodiac_group(latest)
     partner = _pick_same_zodiac_suitable(
@@ -363,6 +457,20 @@ def pick_prev_guard_slot(
     if partner is not None:
         return int(partner), GUARD_KIND_REPEAT_ZODIAC
     return latest, GUARD_KIND_REPEAT_NUMBER
+
+
+def _is_warm_trap(
+    number: int,
+    *,
+    prev_group: int,
+    days_since_last: Mapping[int, int | None],
+) -> bool:
+    if zodiac_group(number) != int(prev_group):
+        return False
+    days = days_since_last.get(number)
+    if days is None:
+        return False
+    return WARM_TRAP_MIN_DAYS <= int(days) <= WARM_TRAP_MAX_DAYS
 
 
 def _other_cold_zodiac_warm_pool(
@@ -407,40 +515,77 @@ def enforce_prev_zodiac_cap(
     blocked: set[int],
     days_since_last: Mapping[int, int | None],
     hot_groups: set[int],
-) -> tuple[list[int], int, str]:
-    """强制：上期原号/上期肖有且仅 1 个进 3 元（二选一，禁 10/5）。
+    latest_pre_omit_days: int | None,
+) -> tuple[list[int], int, str, int | None]:
+    """上期肖重构：极寒接力优先，否则原号/同肖二选一进 3 元。
 
-    返回 ``(新票, 防守号, guard_kind)``。
+    返回 ``(新票, 防守号, defense_kind, 主攻极寒替补或 None)``。
     """
     latest = int(latest)
     prev_group = zodiac_group(latest)
     target = tip_n + mid_n + def_n
-    guard_number, guard_kind = pick_prev_guard_slot(
-        latest=latest,
-        blocked=blocked,
-        days_since_last=days_since_last,
+
+    cold_break = is_cold_break(latest_pre_omit_days)
+    cold_relay = (
+        _pick_cold_relay_number(
+            latest=latest,
+            prev_group=prev_group,
+            blocked=blocked,
+            days_since_last=days_since_last,
+        )
+        if cold_break
+        else None
     )
+
+    if cold_relay is not None:
+        # 极寒接力：替补进 10 元；原号进 3 元；禁 10–40 温号
+        tip_extra = int(cold_relay)
+        guard_number = latest
+        guard_kind = GUARD_KIND_REPEAT_NUMBER
+        allowed_prev = {latest, tip_extra}
+    else:
+        tip_extra = None
+        guard_number, guard_kind = pick_prev_guard_slot(
+            latest=latest,
+            blocked=blocked,
+            days_since_last=days_since_last,
+        )
+        allowed_prev = {int(guard_number)}
+
     if target <= 0:
-        return selected, guard_number, guard_kind
+        return selected, int(guard_number), str(guard_kind), tip_extra
 
-    allowed_prev = [int(guard_number)]
-    allowed_prev_set = set(allowed_prev)
-
-    # 先清掉所有上期肖，主攻/中坚绝不留
-    core = [n for n in selected if zodiac_group(n) != prev_group]
-    used = set(core)
+    # 清掉上期肖与温号陷阱，主攻/中坚先只用其它肖
+    core = [
+        n
+        for n in selected
+        if zodiac_group(n) != prev_group
+        and not (
+            cold_relay is not None
+            and _is_warm_trap(n, prev_group=prev_group, days_since_last=days_since_last)
+        )
+    ]
 
     tip: list[int] = []
     mid: list[int] = []
-    # 先用非上期肖填 tip/mid
+    used: set[int] = set()
+
+    # 极寒替补强制占主攻第一位
+    if tip_extra is not None and tip_n > 0:
+        tip.append(tip_extra)
+        used.add(tip_extra)
+
     for number in core:
+        if number in used:
+            continue
         if len(tip) < tip_n:
             tip.append(number)
+            used.add(number)
         elif len(mid) < mid_n:
             mid.append(number)
+            used.add(number)
         else:
             break
-    used = set(tip + mid)
 
     warm_pool = _other_cold_zodiac_warm_pool(
         prev_group=prev_group,
@@ -454,6 +599,10 @@ def enforce_prev_zodiac_cap(
             break
         if number in used:
             continue
+        if cold_relay is not None and _is_warm_trap(
+            number, prev_group=prev_group, days_since_last=days_since_last
+        ):
+            continue
         if len(tip) < tip_n:
             tip.append(number)
             used.add(number)
@@ -461,20 +610,12 @@ def enforce_prev_zodiac_cap(
             mid.append(number)
             used.add(number)
 
-    # 防守：先放唯一上期名额（原号或同肖号二选一），再填其它
+    # 防守：原号（或非接力时的唯一名额）
     defense: list[int] = []
-    for number in allowed_prev:
-        if def_n <= 0:
-            break
-        if number in used:
-            continue
-        # 唯一防守号允许突破 streak2（原号或同肖合适号）
-        defense.append(number)
-        used.add(number)
-        if len(defense) >= def_n:
-            break
+    if def_n > 0 and int(guard_number) not in used:
+        defense.append(int(guard_number))
+        used.add(int(guard_number))
 
-    # 防守余位：原票非上期肖 + 冷肖温号
     defense_fill = [
         n for n in selected if n not in used and zodiac_group(n) != prev_group
     ] + [
@@ -493,17 +634,26 @@ def enforce_prev_zodiac_cap(
             break
         if number in used:
             continue
+        if cold_relay is not None and _is_warm_trap(
+            number, prev_group=prev_group, days_since_last=days_since_last
+        ):
+            continue
+        if zodiac_group(number) == prev_group and number not in allowed_prev:
+            continue
         defense.append(number)
         used.add(number)
 
-    # 仍不足：任意合法号（仍禁超额上期肖）
     if len(tip) + len(mid) + len(defense) < target:
         for number in range(NUMBER_MIN, NUMBER_MAX + 1):
             if number in used:
                 continue
-            if number in blocked and number not in allowed_prev_set:
+            if number in blocked and number not in allowed_prev:
                 continue
-            if zodiac_group(number) == prev_group and number not in allowed_prev_set:
+            if zodiac_group(number) == prev_group and number not in allowed_prev:
+                continue
+            if cold_relay is not None and _is_warm_trap(
+                number, prev_group=prev_group, days_since_last=days_since_last
+            ):
                 continue
             if len(tip) < tip_n:
                 tip.append(number)
@@ -516,7 +666,7 @@ def enforce_prev_zodiac_cap(
             used.add(number)
 
     out = (tip + mid + defense)[:target]
-    return out, int(guard_number), str(guard_kind)
+    return out, int(guard_number), str(guard_kind), tip_extra
 
 
 def apply_reverse_game(
@@ -533,20 +683,39 @@ def apply_reverse_game(
     normal_max: int = 30,
     streak2_blocked: Sequence[int] | None = None,
     recent_zodiac_limit: int = DEFAULT_RECENT_ZODIAC_LIMIT,
+    history_dates: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """在引擎 picks 上叠加逆向博弈定盘选号。"""
     del previous  # 防同号用 latest（上期特码）
     band_set = {int(n) for n in (in_band_numbers or [])}
     blocked = {int(n) for n in (streak2_blocked or [])}
     prev_group = zodiac_group(int(latest))
-    # 先定二选一防守号，允许突破 streak2 进 3 元
-    _guard_preview, _guard_kind_preview = pick_prev_guard_slot(
-        latest=int(latest),
-        blocked=set(),  # 预览时不看 blocked，稍后进防守时再放行
-        days_since_last=days_since_last,
+    latest_pre_omit_days = compute_latest_pre_omit_days(
+        history_numbers, history_dates, int(latest)
     )
+    cold_break_on = is_cold_break(latest_pre_omit_days)
+    cold_relay_preview = (
+        _pick_cold_relay_number(
+            latest=int(latest),
+            prev_group=prev_group,
+            blocked=set(),
+            days_since_last=days_since_last,
+        )
+        if cold_break_on
+        else None
+    )
+    if cold_relay_preview is not None:
+        _guard_preview, _guard_kind_preview = int(latest), GUARD_KIND_REPEAT_NUMBER
+    else:
+        _guard_preview, _guard_kind_preview = pick_prev_guard_slot(
+            latest=int(latest),
+            blocked=set(),
+            days_since_last=days_since_last,
+        )
     blocked.discard(int(latest))
     blocked.discard(int(_guard_preview))
+    if cold_relay_preview is not None:
+        blocked.discard(int(cold_relay_preview))
 
     micro_streak, micro_group = consecutive_zodiac_streak(history_numbers)
     wang_on, wang_group, wang_hits = detect_wang_zodiac(history_numbers)
@@ -562,7 +731,6 @@ def apply_reverse_game(
     direction = (
         DIRECTION_REVERSE if macro_reverse else DIRECTION_FOLLOW
     )
-    # 防重号/防重肖：二选一仅 1 个进 3 元；禁 10/5；不可兼买
     comeback_tip_ok = False
 
     empty_summary: dict[str, Any] = {
@@ -588,6 +756,9 @@ def apply_reverse_game(
         "repeat_guard_number": int(_guard_preview),
         "prev_guard_kind": _guard_kind_preview,
         "prev_guard_label": GUARD_KIND_LABELS.get(_guard_kind_preview),
+        "cold_break": bool(cold_break_on),
+        "latest_pre_omit_days": latest_pre_omit_days,
+        "cold_relay_number": cold_relay_preview,
         "prev_zodiac_group": int(prev_group),
         "prev_zodiac_max": PREV_ZODIAC_MAX,
         "same_zodiac_cold_partner": (
@@ -598,10 +769,9 @@ def apply_reverse_game(
         "comeback_number": None,
         "replaced_numbers": [],
         "rule": (
-            "大盘：顺热=最新N肖、顺冷=非最新N肖；连≥3防变盘反向，未满三顺应；"
-            "单肖连≥3不做主攻；"
-            "防重号/防重肖有且仅1个：要么原号要么同肖合适遗漏号，仅进3元，禁10/5；"
-            "极寒/预字只防；不承诺命中率。"
+            "大盘：顺热/顺冷；连≥3防变盘；"
+            "极寒破局(>80天)：同肖80-120替补强制10元，禁10-40温号，原号仅3元；"
+            "非破局：防重号/防重肖二选一仅3元；极寒/预字只防；不承诺命中率。"
         ),
     }
 
@@ -688,8 +858,14 @@ def apply_reverse_game(
         return zodiac_group(number) == prev_group
 
     def _tip_ok(number: int) -> bool:
-        # 上期原号 / 上期肖：严禁 10 元主攻
+        # 极寒替补允许进主攻；上期原号 / 其它上期肖 / 10–40 温号禁主攻
+        if cold_relay_preview is not None and number == int(cold_relay_preview):
+            return True
         if number == int(latest) or _is_prev_zodiac(number):
+            return False
+        if cold_break_on and _is_warm_trap(
+            number, prev_group=prev_group, days_since_last=days_since_last
+        ):
             return False
         if _dead_tip(number):
             return False
@@ -699,21 +875,25 @@ def apply_reverse_game(
             return False
         days = _days(number)
         if prefer_zone == PREFER_HOT:
-            # 顺热：强势热号 / 温号；极热允许（非上期肖）
             return tags[number] in (
                 TAG_ULTRA_HOT,
                 TAG_WARM_BLIND,
                 TAG_ACTIVE_COLD,
                 TAG_OTHER,
             )
-        # 顺冷：主攻 30–60 温冷号
         if days is None:
             return False
         return COLD_TIP_MIN <= int(days) <= COLD_TIP_MAX
 
     def _mid_ok(number: int) -> bool:
-        # 上期原号 / 上期肖：严禁 5 元中坚
+        # 上期原号 / 上期肖 / 极寒替补 / 温号陷阱：严禁 5 元
         if number == int(latest) or _is_prev_zodiac(number):
+            return False
+        if cold_relay_preview is not None and number == int(cold_relay_preview):
+            return False
+        if cold_break_on and _is_warm_trap(
+            number, prev_group=prev_group, days_since_last=days_since_last
+        ):
             return False
         if tags[number] == TAG_PREVIEW:
             return False
@@ -722,7 +902,6 @@ def apply_reverse_game(
         days = _days(number)
         if days is None:
             return False
-        # 中坚：顺应大盘的 20–50 温号
         return MID_WARM_MIN <= int(days) <= MID_WARM_MAX
 
     def _rank_tip(number: int) -> tuple:
@@ -844,33 +1023,42 @@ def apply_reverse_game(
         )
 
     target_n = len(picks)
-    # 强制：上期原号/上期肖二选一，有且仅 1 个进 3 元
-    selected, prev_guard_number, prev_guard_kind = enforce_prev_zodiac_cap(
-        selected[:target_n] if len(selected) > target_n else selected,
-        latest=int(latest),
-        tip_n=tip_n,
-        mid_n=mid_n,
-        def_n=def_n,
-        blocked=blocked,
-        days_since_last=days_since_last,
-        hot_groups=hot_groups,
+    selected, prev_guard_number, prev_guard_kind, cold_relay_number = (
+        enforce_prev_zodiac_cap(
+            selected[:target_n] if len(selected) > target_n else selected,
+            latest=int(latest),
+            tip_n=tip_n,
+            mid_n=mid_n,
+            def_n=def_n,
+            blocked=blocked,
+            days_since_last=days_since_last,
+            hot_groups=hot_groups,
+            latest_pre_omit_days=latest_pre_omit_days,
+        )
     )
     same_zodiac_cold_partner = (
         int(prev_guard_number)
         if prev_guard_kind == GUARD_KIND_REPEAT_ZODIAC
         else None
     )
+    allowed_prev_fill = {int(prev_guard_number)}
+    if cold_relay_number is not None:
+        allowed_prev_fill.add(int(cold_relay_number))
     used = set(selected)
     while len(selected) < target_n:
         progressed = False
         for number in engine_numbers + list(range(NUMBER_MIN, NUMBER_MAX + 1)):
             if number in used:
                 continue
-            if number in blocked and number != int(prev_guard_number):
+            if number in blocked and number not in allowed_prev_fill:
                 continue
             if (
                 zodiac_group(number) == prev_group
-                and number != int(prev_guard_number)
+                and number not in allowed_prev_fill
+            ):
+                continue
+            if cold_break_on and _is_warm_trap(
+                number, prev_group=prev_group, days_since_last=days_since_last
             ):
                 continue
             used.add(number)
@@ -942,6 +1130,9 @@ def apply_reverse_game(
         )
         row["is_comeback_tip"] = False
         row["is_prev_guard"] = number == int(prev_guard_number)
+        row["is_cold_relay"] = bool(
+            cold_relay_number is not None and number == int(cold_relay_number)
+        )
         row["is_same_zodiac_cold_partner"] = bool(
             same_zodiac_cold_partner is not None
             and number == int(same_zodiac_cold_partner)
@@ -966,16 +1157,23 @@ def apply_reverse_game(
         knife += f"；微观单肖连 {micro_streak} 期，该肖不进主攻"
     if wang_on and wang_group is not None:
         knife += f"；旺肖组={wang_group}（近{WANG_WINDOW}期{wang_hits}次）"
-    knife += (
-        f"；{guard_label} {int(prev_guard_number):02d} 仅 3 元"
-        f"（上期肖名额 {prev_zodiac_count}/{PREV_ZODIAC_MAX}，禁10/5）"
-    )
+    if cold_relay_number is not None:
+        knife += (
+            f"；极寒破局(开出前遗漏"
+            f"{latest_pre_omit_days if latest_pre_omit_days is not None else '样本首见'}天)"
+            f"→替补 {int(cold_relay_number):02d} 进10元；"
+            f"原号 {int(prev_guard_number):02d} 仅3元；禁同肖10-40温号"
+        )
+    else:
+        knife += (
+            f"；{guard_label} {int(prev_guard_number):02d} 仅 3 元"
+            f"（上期肖名额 {prev_zodiac_count}/{PREV_ZODIAC_MAX}，禁10/5）"
+        )
 
     notes = [
         f"逆向博弈叠加已开启：{knife}。"
         f"最新{int(recent_zodiac_limit) or DEFAULT_RECENT_ZODIAC_LIMIT}肖组="
-        f"{len(hot_groups)} 个；预字/极寒(>{ULTRA_COLD_DAYS_MIN}天)不进主攻；"
-        f"防重号与防重肖二选一，绝不兼买。"
+        f"{len(hot_groups)} 个；预字不进主攻。"
         "样本内档位重排，不是庄家必开，也不承诺提高命中率。"
     ]
     if replaced:
@@ -1015,8 +1213,13 @@ def apply_reverse_game(
         "repeat_guard_number": int(prev_guard_number),
         "prev_guard_kind": prev_guard_kind,
         "prev_guard_label": guard_label,
+        "cold_break": bool(cold_break_on),
+        "latest_pre_omit_days": latest_pre_omit_days,
+        "cold_relay_number": cold_relay_number,
         "prev_zodiac_group": int(prev_group),
-        "prev_zodiac_max": PREV_ZODIAC_MAX,
+        "prev_zodiac_max": (
+            2 if cold_relay_number is not None else PREV_ZODIAC_MAX
+        ),
         "prev_zodiac_count": int(prev_zodiac_count),
         "same_zodiac_cold_partner": same_zodiac_cold_partner,
         "comeback_number": None,
