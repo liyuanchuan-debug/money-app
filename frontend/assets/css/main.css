@@ -33,8 +33,7 @@
   }
 
   body {
-    /* 不给 body 上底色，避免遮住 -z / z-0 的环境光背景层 */
-    background-color: transparent;
+    background-color: #05060f;
     min-height: 100vh;
     min-height: 100dvh;
     font-family:
@@ -147,56 +146,50 @@
     );
   }
 
-  /* ---------- L1：页面分区承载面 ---------- */
+  /* ---------- L1：页面分区承载面（不透明面板；已去掉 backdrop-blur） ---------- */
   .glass-panel {
     position: relative;
     border-radius: var(--glass-radius-l1);
     border: 1px solid rgba(255, 255, 255, 0.1);
     background-image: linear-gradient(
         180deg,
-        rgba(255, 255, 255, 0.075) 0%,
-        rgba(255, 255, 255, 0.025) 42%,
-        rgba(255, 255, 255, 0.012) 100%
+        rgba(255, 255, 255, 0.06) 0%,
+        rgba(255, 255, 255, 0.02) 42%,
+        transparent 100%
       ),
-      linear-gradient(180deg, rgba(9, 11, 26, 0.62), rgba(9, 11, 26, 0.5));
-    -webkit-backdrop-filter: blur(18px) saturate(140%);
-    backdrop-filter: blur(18px) saturate(140%);
+      linear-gradient(180deg, rgba(12, 14, 28, 0.96), rgba(9, 11, 22, 0.94));
     box-shadow:
-      inset 0 1px 0 0 rgba(255, 255, 255, 0.14),
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.1),
       0 24px 60px -30px rgba(3, 4, 12, 0.92);
   }
 
   /* L1 变体：更强染色（hero / 关键分区） */
   .glass-panel-strong {
-    border-color: rgba(255, 255, 255, 0.16);
+    border-color: rgba(255, 255, 255, 0.14);
     background-image: linear-gradient(
         180deg,
-        rgba(255, 255, 255, 0.12) 0%,
-        rgba(255, 255, 255, 0.04) 45%,
-        rgba(255, 255, 255, 0.02) 100%
+        rgba(255, 255, 255, 0.09) 0%,
+        rgba(255, 255, 255, 0.03) 45%,
+        transparent 100%
       ),
-      linear-gradient(180deg, rgba(12, 14, 38, 0.7), rgba(9, 11, 26, 0.58));
-    -webkit-backdrop-filter: blur(30px) saturate(160%);
-    backdrop-filter: blur(30px) saturate(160%);
+      linear-gradient(180deg, rgba(16, 18, 40, 0.98), rgba(10, 12, 26, 0.96));
     box-shadow:
-      inset 0 1px 0 0 rgba(255, 255, 255, 0.2),
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.14),
       0 30px 70px -34px rgba(3, 4, 12, 0.95);
   }
 
   /* L1 变体：更弱（嵌在大面板里的小分区） */
   .glass-panel-soft {
     border-color: rgba(255, 255, 255, 0.07);
-    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.01));
-    -webkit-backdrop-filter: blur(10px) saturate(130%);
-    backdrop-filter: blur(10px) saturate(130%);
-    box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.08);
+    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.01)),
+      linear-gradient(180deg, rgba(12, 14, 28, 0.9), rgba(9, 11, 22, 0.88));
+    box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.06);
   }
 
-  /* L1 变体：无模糊（叠在玻璃上时避免重复模糊） */
+  /* L1 变体：嵌套扁平面 */
   .glass-panel-plain {
-    -webkit-backdrop-filter: none;
-    backdrop-filter: none;
-    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.015));
+    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.012)),
+      linear-gradient(180deg, rgba(12, 14, 28, 0.92), rgba(9, 11, 22, 0.9));
   }
 
   /* ---------- 琉璃渐变描边（L2 / L3 共用） ---------- */
@@ -260,26 +253,24 @@
     opacity: 1;
   }
 
-  /* ---------- L2：可交互卡片 ---------- */
+  /* ---------- L2：可交互卡片（不透明；已去掉 backdrop-blur） ---------- */
   .glass-card {
     position: relative;
     isolation: isolate;
     overflow: hidden;
     border-radius: var(--glass-radius-l2);
-    border: 1px solid rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.08);
     background-image: linear-gradient(
         180deg,
-        rgba(255, 255, 255, 0.085) 0%,
-        rgba(255, 255, 255, 0.02) 60%,
-        rgba(255, 255, 255, 0.01) 100%
+        rgba(255, 255, 255, 0.06) 0%,
+        rgba(255, 255, 255, 0.015) 60%,
+        transparent 100%
       ),
-      linear-gradient(180deg, rgba(10, 12, 28, 0.66), rgba(10, 12, 28, 0.52));
-    -webkit-backdrop-filter: blur(20px) saturate(150%);
-    backdrop-filter: blur(20px) saturate(150%);
+      linear-gradient(180deg, rgba(14, 16, 34, 0.96), rgba(10, 12, 28, 0.94));
     box-shadow:
-      inset 0 1px 0 0 rgba(255, 255, 255, 0.16),
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.12),
       0 26px 60px -30px rgba(3, 4, 12, 0.95),
-      0 10px 30px -22px rgba(124, 77, 255, 0.5);
+      0 10px 30px -22px rgba(124, 77, 255, 0.28);
     transition:
       transform 0.45s cubic-bezier(0.22, 1, 0.36, 1),
       box-shadow 0.45s cubic-bezier(0.22, 1, 0.36, 1),
@@ -305,22 +296,20 @@
       0 0 34px -12px rgba(34, 211, 238, 0.6);
   }
 
-  /* ---------- L3：控件（按钮 / 输入） ---------- */
+  /* ---------- L3：控件（按钮 / 输入；已去掉 backdrop-blur） ---------- */
   .glass-control {
     position: relative;
     overflow: hidden;
     border-radius: var(--glass-radius-l3);
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.1);
     background-image: linear-gradient(
         180deg,
-        rgba(255, 255, 255, 0.14) 0%,
-        rgba(255, 255, 255, 0.05) 100%
+        rgba(255, 255, 255, 0.1) 0%,
+        rgba(255, 255, 255, 0.03) 100%
       ),
-      linear-gradient(180deg, rgba(12, 14, 32, 0.55), rgba(12, 14, 32, 0.45));
-    -webkit-backdrop-filter: blur(14px) saturate(160%);
-    backdrop-filter: blur(14px) saturate(160%);
+      linear-gradient(180deg, rgba(16, 18, 36, 0.96), rgba(12, 14, 30, 0.94));
     box-shadow:
-      inset 0 1px 0 0 rgba(255, 255, 255, 0.24),
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.18),
       0 16px 36px -20px rgba(3, 4, 12, 0.92);
     transition:
       transform 0.3s cubic-bezier(0.22, 1, 0.36, 1),
@@ -396,8 +385,6 @@
   .glass-control-ghost {
     border-color: transparent;
     background-image: none;
-    -webkit-backdrop-filter: none;
-    backdrop-filter: none;
     box-shadow: none;
   }
   .glass-control-ghost:hover:not(:disabled) {
@@ -406,16 +393,14 @@
     box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.16);
   }
 
-  /* 玻璃输入 */
+  /* 输入框（不透明；已去掉 backdrop-blur） */
   .glass-input {
     border-radius: var(--glass-radius-l3);
     border: 1px solid rgba(255, 255, 255, 0.12);
-    background-image: linear-gradient(180deg, rgba(5, 7, 18, 0.62), rgba(5, 7, 18, 0.5));
-    -webkit-backdrop-filter: blur(12px);
-    backdrop-filter: blur(12px);
+    background-image: linear-gradient(180deg, rgba(8, 10, 22, 0.98), rgba(5, 7, 18, 0.96));
     box-shadow:
-      inset 0 1px 0 0 rgba(255, 255, 255, 0.08),
-      inset 0 14px 30px -22px rgba(0, 0, 0, 0.9);
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.06),
+      inset 0 14px 30px -22px rgba(0, 0, 0, 0.7);
     transition:
       border-color 0.25s ease,
       box-shadow 0.25s ease,
@@ -443,9 +428,7 @@
     background-image:
       radial-gradient(circle at 32% 24%, rgba(255, 255, 255, 0.62), rgba(255, 255, 255, 0.06) 38%, transparent 58%),
       radial-gradient(circle at 72% 80%, rgba(34, 211, 238, 0.32), transparent 62%),
-      linear-gradient(160deg, rgba(255, 255, 255, 0.16), rgba(6, 8, 20, 0.88));
-    -webkit-backdrop-filter: blur(8px) saturate(150%);
-    backdrop-filter: blur(8px) saturate(150%);
+      linear-gradient(160deg, rgba(255, 255, 255, 0.16), rgba(6, 8, 20, 0.96));
     box-shadow:
       inset 0 1px 1px rgba(255, 255, 255, 0.7),
       inset 0 -8px 16px rgba(0, 0, 0, 0.6),

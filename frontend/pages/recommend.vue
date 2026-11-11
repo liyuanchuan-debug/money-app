@@ -62,7 +62,7 @@ const activeWaveTab = ref<'small' | 'normal' | 'big'>('small')
 const trendDistExpanded = ref(false)
 const copied = ref(false)
 /** 最近一次复制来源，用于对应按钮显示「已复制」 */
-const copiedSource = ref<'ticket' | 'triple' | `group-${number}` | ''>('')
+const copiedSource = ref<'ticket' | ''>('')
 const copyError = ref('')
 const generateHit = useHitPulse()
 const copyHit = useHitPulse()
@@ -303,7 +303,6 @@ function normalizeRecommendResult(raw: unknown): RecommendResult | undefined {
   const asArray = <T>(value: T[] | null | undefined): T[] =>
     Array.isArray(value) ? value : []
   const soft = source.soft_weights
-  const triple = source.triple_sets
   const pivots = source.price_pivots
   return {
     ...(source as RecommendResult),
@@ -319,14 +318,6 @@ function normalizeRecommendResult(raw: unknown): RecommendResult | undefined {
             support: asArray(pivots.support),
             resistance: asArray(pivots.resistance),
             preferred_numbers: asArray(pivots.preferred_numbers),
-          },
-        }
-      : {}),
-    ...(triple
-      ? {
-          triple_sets: {
-            ...triple,
-            sets: asArray(triple.sets),
           },
         }
       : {}),
@@ -741,37 +732,6 @@ const latestRepeatGaps = computed(() => {
 function periodsAgoLabel(ago: number): string {
   return ago === 0 ? '最新' : `${ago}期前`
 }
-
-/** 三中三：后端从预测带派生；点阵关闭 / 无带时仍回块，前端按 status 展示或隐藏 */
-const tripleSets = computed(() => result.value?.triple_sets ?? null)
-const tripleSetsReady = computed(() => tripleSets.value?.status === 'ok')
-const showTripleSets = computed(() => {
-  const block = tripleSets.value
-  if (!block) return false
-  // 点阵未开 → 整块隐藏；有带但不足 / 已生成 → 展示（不足时给「数据不足」）
-  if (block.status === 'disabled') return false
-  return true
-})
-/** status=ok 且有组时才展示复制按钮 / 生成可粘贴文案 */
-const canCopyTripleSets = computed(
-  () => tripleSetsReady.value && (tripleSets.value?.sets?.length ?? 0) > 0,
-)
-
-function formatTripleGroupLine(index: number, numbers: number[]): string {
-  return `${index}组: ${numbers.map(pad).join(' ')}`
-}
-
-/** 整块三中三剪贴板文案（中文标签 + 零填充号码） */
-const tripleSetsCopyText = computed(() => {
-  const sets = tripleSets.value?.sets
-  if (!canCopyTripleSets.value || !sets?.length) return ''
-  return ['三中三', ...sets.map(g => formatTripleGroupLine(g.index, g.numbers))].join('\n')
-})
-
-/** 三中三区块是否应展示复制成功 / 失败反馈 */
-const tripleCopyFeedback = computed(
-  () => copiedSource.value === 'triple' || copiedSource.value.startsWith('group-'),
-)
 
 const WAVE_TREND_WINDOW_DEFAULT = 100
 const WAVE_TREND_WINDOW_OPTIONS = [30, 60, 100, 0]
@@ -1257,10 +1217,7 @@ const roleTones: Record<string, 'aqua' | 'neutral' | 'nebula'> = {
 const chipModes = CHIP_MODE_OPTIONS
 const trendWindowOptions = TREND_WINDOW_OPTIONS
 
-async function writeClipboard(
-  text: string,
-  source: 'ticket' | 'triple' | `group-${number}`,
-) {
+async function writeClipboard(text: string, source: 'ticket') {
   if (!text) return
   try {
     await navigator.clipboard.writeText(text)
@@ -1283,17 +1240,6 @@ async function copy() {
   const text = displayCopyText.value
   if (!text) return
   await writeClipboard(text, 'ticket')
-}
-
-async function copyTripleSets() {
-  const text = tripleSetsCopyText.value
-  if (!text) return
-  await writeClipboard(text, 'triple')
-}
-
-async function copyTripleGroup(group: { index: number; numbers: number[] }) {
-  if (!canCopyTripleSets.value || !group.numbers?.length) return
-  await writeClipboard(formatTripleGroupLine(group.index, group.numbers), `group-${group.index}`)
 }
 
 useHead({ title: '波浪买入法 · 四叶沙盘' })
@@ -1958,100 +1904,6 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
             </MotionReveal>
           </div>
         </section>
-
-        <!-- 三中三：从本期预测带内选 3 组 × 每组 3 号（不发明带外号码） -->
-        <MotionReveal v-if="showTripleSets" :index="5">
-          <GlassPanel padding="md" rounded="3xl" class="space-y-3">
-            <div class="flex flex-wrap items-start justify-between gap-2">
-              <div class="space-y-1">
-                <h2 class="text-lg font-medium text-white">三中三</h2>
-                <p class="text-xs text-slate-500">
-                  从本期预测带内选号组成 3 组，每组 3 个。
-                  <template v-if="tripleSetsReady && tripleSets?.reuse">
-                    带内仅 {{ tripleSets.band_count }} 个号，组间允许复用。
-                  </template>
-                  <template v-else-if="tripleSetsReady">
-                    带内号码充足，三组互不重复。
-                  </template>
-                </p>
-              </div>
-              <StatChip v-if="canCopyTripleSets" tone="neutral" size="sm">复制到剪贴板</StatChip>
-            </div>
-
-            <p
-              v-if="!tripleSetsReady"
-              class="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-200"
-              role="status"
-            >
-              {{ tripleSets?.note || '数据不足，无法组成三中三。' }}
-            </p>
-
-            <template v-else>
-              <div
-                class="grid gap-2 sm:grid-cols-3"
-                role="list"
-                aria-label="三中三推荐组"
-              >
-                <GlassCard
-                  v-for="group in tripleSets?.sets ?? []"
-                  :key="group.index"
-                  as="article"
-                  padding="sm"
-                  class="flex flex-col gap-2"
-                  role="listitem"
-                >
-                  <div class="flex items-center justify-between gap-2">
-                    <p class="text-[11px] text-slate-400">第 {{ group.index }} 组</p>
-                    <GlassButton
-                      v-if="canCopyTripleSets"
-                      variant="glass"
-                      class="min-h-[32px] px-2.5 text-xs"
-                      @click="copyTripleGroup(group)"
-                    >
-                      {{ copied && copiedSource === `group-${group.index}` ? '已复制' : '复制' }}
-                    </GlassButton>
-                  </div>
-                  <div class="flex flex-wrap items-center gap-2">
-                    <SpecialBall
-                      v-for="num in group.numbers"
-                      :key="`${group.index}-${num}`"
-                      :number="num"
-                      size="sm"
-                      tone="aqua"
-                    />
-                  </div>
-                </GlassCard>
-              </div>
-
-              <div v-if="canCopyTripleSets" class="relative">
-                <GlassButton
-                  variant="primary"
-                  size="lg"
-                  block
-                  class="min-h-[48px]"
-                  @click="copyTripleSets"
-                >
-                  {{ copied && copiedSource === 'triple' ? '已复制 ✓' : '一键复制三中三' }}
-                </GlassButton>
-                <PulseRing :trigger="copyHit.key" tone="aqua" :rings="2" />
-              </div>
-              <p
-                v-if="copyError && tripleCopyFeedback"
-                class="text-center text-xs text-bloom-300"
-                role="alert"
-              >
-                {{ copyError }}
-              </p>
-              <p
-                v-else-if="copied && tripleCopyFeedback"
-                class="text-center text-xs text-emerald-300"
-                role="status"
-              >
-                已复制到剪贴板
-              </p>
-            </template>
-          </GlassPanel>
-        </MotionReveal>
 
         <MotionReveal v-if="lattice?.enabled && latticeBand && waveTrendChart.pointCount" :index="6" class="min-w-0">
           <GlassPanel padding="lg" rounded="3xl" class="min-w-0 space-y-3 overflow-hidden">
