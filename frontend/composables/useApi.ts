@@ -264,6 +264,8 @@ export interface RecommendResult {
   reason_code?: string | null
   /** `no_ticket` 时的中文说明（正常出票为 `null`），可直接展示给用户 */
   reason_message?: string | null
+  /** 换批序号：0=首屏默认样本；点生成后累加 */
+  pick_seed?: number
   latest: number
   latest_zodiac: number[]
   /**
@@ -415,8 +417,18 @@ export interface RecommendResult {
     /** 上期原号开出前是否极寒破局（遗漏>80） */
     cold_break?: boolean
     latest_pre_omit_days?: number | null
-    /** 极寒替补号（80-120），强制 10 元主攻 */
+    /** 同肖次级极寒（80-100），进 5 元中坚或 3 元防守 */
     cold_relay_number?: number | null
+    /** 次级极寒实际档位金额：5 或 3 */
+    cold_relay_amount?: number | null
+    /** 换批序号：0=首屏默认样本；点生成后累加 */
+    pick_batch?: number
+    zodiac_count?: number
+    zodiac_cap?: number
+    same_zodiac_peak?: number
+    same_zodiac_max?: number
+    dead_slot_count?: number
+    dead_slot_max?: number
     /** 上期生肖组；(n-1)%12 */
     prev_zodiac_group?: number | null
     prev_zodiac_max?: number

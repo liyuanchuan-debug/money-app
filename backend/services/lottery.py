@@ -3612,7 +3612,8 @@ def recommend(
                 focus,
                 {wave: len(ordered_pools[wave]) for wave in WAVE_ORDER},
             )
-            if pick_sampling == PICK_SAMPLING_SEEDED_RANDOM:
+            # 点「换一批」时即使用户设置了 ranked，也走种子抽样，否则号码永远不变
+            if pick_sampling == PICK_SAMPLING_SEEDED_RANDOM or pick_batch > 0:
                 rng = _random_source(
                     sampling_seed_key(
                         period=period,
@@ -3850,6 +3851,7 @@ def recommend(
         streak2_blocked=streak2_blocked,
         recent_zodiac_limit=int(cfg.get("recent_zodiac_limit") or DEFAULT_RECENT_ZODIAC_LIMIT),
         history_dates=dates_list,
+        pick_seed=pick_seed,
     )
     picks = list(reverse_game_result["picks"])
     reverse_game_summary = dict(reverse_game_result["summary"])
@@ -4370,6 +4372,7 @@ def recommend(
         # 桶内取号方式（英文枚举 + 中文标签）：seeded_random / ranked
         "pick_sampling": pick_sampling,
         "pick_sampling_label": PICK_SAMPLING_LABELS.get(pick_sampling, pick_sampling),
+        "pick_seed": pick_batch,
         "wave_alloc": wave_alloc,
         "wave_alloc_label": WAVE_ALLOC_LABELS.get(wave_alloc, wave_alloc),
         "picks": picks,

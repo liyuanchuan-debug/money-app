@@ -95,8 +95,7 @@ const amountSeed = computed(() =>
  * 改注数 / 模式时归零，回到该结构下的默认样本。
  */
 const pickRerollCount = ref(0)
-const pickSeed = computed(() =>
-  pickRerollCount.value > 0 ? pickRerollCount.value : undefined)
+const generating = ref(false)
 
 /**
  * 设置与样本口径互不依赖，并行拉取；推荐结果依赖 mode（来自设置），必须等设置回来。
@@ -268,23 +267,34 @@ const latestSampleNumber = computed(
   () => normalizeDraws(rawDraws.value)[0]?.special_number ?? null,
 )
 
-const {
-  data: rawResult,
-  refresh,
-  pending,
-  error,
-} = await useAsyncData<RecommendResult>('recommend', () =>
-  api.recommend({
+function recommendPayload() {
+  return {
     mode: mode.value,
     bet_count: betCount.value,
     amount_seed: amountSeed.value,
-    pick_seed: pickSeed.value,
-    // 走势偏好已停用：固定 neutral；trend_window 只影响走势分布参考展示
-    trend_bias: 'neutral',
+    // 必须带整数：undefined 会被 JSON 丢掉，后端永远当成第 0 批
+    pick_seed: pickRerollCount.value,
+    trend_bias: 'neutral' as const,
     trend_window: trendWindow.value,
     stake_top: mode.value === 'ladder' ? stakeTop.value : undefined,
-  }),
+  }
+}
+
+const {
+  data: rawResult,
+  pending,
+  error,
+} = await useAsyncData<RecommendResult>(
+  () =>
+    `recommend:${mode.value}:${betCount.value}:${trendWindow.value}:${stakeTop.value}:${pickRerollCount.value}:${rerollCount.value}`,
+  () => api.recommend(recommendPayload()),
+  {
+    // 禁止用 SSR/静态 payload 顶掉换批结果（固定 key 时 refresh 会一直吐首屏那批号）
+    getCachedData: () => undefined,
+  },
 )
+
+const generateBusy = computed(() => pending.value || generating.value)
 
 /**
  * 展示层归一化：把 recommend payload 里「模板按数组用」的字段补齐为数组。
@@ -1159,29 +1169,38 @@ watch(mode, (next) => {
   }
 })
 
-watch([mode, betCount, trendWindow, stakeTop], async () => {
+watch([mode, betCount, trendWindow, stakeTop], () => {
   clearCopyFeedback()
   rerollCount.value = 0
   pickRerollCount.value = 0
-  await refresh()
 })
 
-/** 显式重新生成：换一批号码（pick_seed +1）；首屏仍是 batch=0 默认样本 */
+/** 显式重新生成：换一批号码。直接 POST，不走 useAsyncData 缓存。 */
 async function generate() {
-  if (pending.value) return
+  if (generateBusy.value) return
+  generating.value = true
   clearCopyFeedback()
   pickRerollCount.value += 1
-  await refresh()
-  generateHit.fire()
+  try {
+    rawResult.value = await api.recommend(recommendPayload())
+    generateHit.fire()
+  } finally {
+    generating.value = false
+  }
 }
 
 /** 重新随机：换一个显式种子，得到另一份金额分配（仅随机分配模式可点） */
 async function reroll() {
-  if (pending.value) return
+  if (generateBusy.value) return
+  generating.value = true
   rerollCount.value += 1
   clearCopyFeedback()
-  await refresh()
-  generateHit.fire()
+  try {
+    rawResult.value = await api.recommend(recommendPayload())
+    generateHit.fire()
+  } finally {
+    generating.value = false
+  }
 }
 
 function pad(n: number) {
@@ -1391,11 +1410,11 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 variant="primary"
                 size="lg"
                 class="min-h-[48px] w-full sm:w-auto"
-                :loading="pending"
-                :disabled="pending"
+                :loading="generateBusy"
+                :disabled="generateBusy"
                 @click="generate"
               >
-                {{ pending ? '生成中…' : '生成财富密码' }}
+                {{ generateBusy ? '生成中…' : (pickRerollCount > 0 ? `换一批（第 ${pickRerollCount} 批）` : '生成财富密码') }}
               </GlassButton>
               <PulseRing :trigger="generateHit.key" tone="aqua" :rings="2" />
             </div>
@@ -1638,12 +1657,24 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 >
                   单肖连 {{ result.reverse_game.zodiac_streak }}·禁主攻
                 </StatChip>
+                <StatChip tone="aqua" size="sm">
+                  换批 {{ result.pick_seed ?? result.reverse_game.pick_batch ?? pickRerollCount }}
+                </StatChip>
+                <StatChip
+                  v-if="result.reverse_game.zodiac_count != null"
+                  tone="neutral"
+                  size="sm"
+                >
+                  生肖 {{ result.reverse_game.zodiac_count }}/{{ result.reverse_game.zodiac_cap ?? 6 }}
+                  ·同肖≤{{ result.reverse_game.same_zodiac_max ?? 2 }}
+                  ·极寒/预字 {{ result.reverse_game.dead_slot_count ?? 0 }}/{{ result.reverse_game.dead_slot_max ?? 2 }}
+                </StatChip>
                 <StatChip
                   v-if="result.reverse_game.cold_relay_number != null"
                   tone="amber"
                   size="sm"
                 >
-                  极寒接力 {{ pad(result.reverse_game.cold_relay_number) }}·10元
+                  同肖极寒接力 {{ pad(result.reverse_game.cold_relay_number) }}·{{ result.reverse_game.cold_relay_amount ?? 5 }}元
                 </StatChip>
                 <StatChip
                   v-if="result.reverse_game.repeat_guard_number != null"
@@ -1685,14 +1716,19 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 <template v-else>
                   大盘未满三，继续顺应原盘。
                 </template>
-                <template v-if="result.reverse_game.cold_break && result.reverse_game.cold_relay_number != null">
-                  上期属极寒破局：同肖 80–120 天替补进 10 元主攻，严禁 10–40 天大众温号；
+                <template v-if="result.reverse_game.cold_break">
+                  上期刚开极寒号：本期强制顺冷。严禁把同肖 20–40 天常规温号当作唯一主攻；
+                  <template v-if="result.reverse_game.cold_relay_number != null">
+                    同肖 80–100 天次级极寒 {{ pad(result.reverse_game.cold_relay_number) }}
+                    进 {{ result.reverse_game.cold_relay_amount ?? 5 }} 元（中坚或防守），防庄家同肖换极寒杀温号。
+                  </template>
                   上期原号最多进 3 元防重号。
                 </template>
                 <template v-else>
                   防重号与防重肖有且仅 1 个：要么原号要么同肖合适遗漏号，只进 3 元，禁 10/5。
                 </template>
-                预字只防。样本内档位重排，不承诺命中率。
+                埋伏结构：全票最多 6 个生肖、同肖最多 2 个号；极寒/预字合计最多 2 个，只进 3 元防守。
+                样本内档位重排，不承诺命中率。
               </p>
             </div>
 
