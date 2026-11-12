@@ -13,6 +13,9 @@
   严禁把该生肖遗漏 20–40 天的常规温号当作唯一主攻；
   必须在该生肖挑一个遗漏 80–100 天的次级极寒号，放入 5 元中坚或 3 元防守；
   原号最多进 3 元防重号。非破局时：上期原号/同肖合适号仍二选一仅 1 个进 3 元。
+- **极寒连三变盘**：连续 3 期开出遗漏>80 的极寒号 → 下一期强制顺热回补，
+  10 元锁定最新 N 肖里遗漏 10–20 天的活跃号（不足再 20–40 常规温号）；
+  极寒号绝不再作主攻；遗漏>120 的极品极寒只进 3 元防守。
 """
 
 from __future__ import annotations
@@ -133,6 +136,12 @@ AMOUNT_DEF = 3
 TICKET_ZODIAC_MAX = 6  # 超过 6 肖 = 买白菜
 SAME_ZODIAC_MAX = 2  # 同肖最多 2 号
 DEAD_SLOT_MAX = 2  # 极寒 + 预字合计上限，且只进 3 元
+# 极寒连三变盘：10 元锁最新 N 肖活跃号；>120 只进 3 元
+HOT_TIP_LOCK_MIN_DAYS = 10
+HOT_TIP_LOCK_MAX_DAYS = 20
+HOT_TIP_LOCK_FALLBACK_MIN_DAYS = 20
+HOT_TIP_LOCK_FALLBACK_MAX_DAYS = 40
+SHATTER_COLD_MIN_DAYS = 120
 
 
 def _is_dead_slot(number: int, tags: Mapping[int, str]) -> bool:
@@ -492,6 +501,46 @@ def _pick_skeleton(
     }
 
 
+def _force_into_tip(
+    selected: list[int],
+    *,
+    number: int,
+    tip_n: int,
+    mid_n: int,
+    def_n: int,
+    used: set[int],
+) -> list[int]:
+    """把 ``number`` 放进 10 元主攻档（满则挤掉末位主攻）。"""
+    if tip_n <= 0:
+        return selected
+    target = tip_n + mid_n + def_n
+    number = int(number)
+    if number in selected[:tip_n]:
+        return selected[:target]
+    selected = [n for n in selected if n != number]
+    used.discard(number)
+    tip = selected[:tip_n]
+    rest = selected[tip_n:target]
+    if len(tip) >= tip_n:
+        dropped = tip[-1]
+        tip = [number] + tip[:-1]
+        used.discard(dropped)
+    else:
+        tip = [number] + tip
+    used.add(number)
+    out = tip[:tip_n] + rest
+    filler = [
+        n
+        for n in range(NUMBER_MIN, NUMBER_MAX + 1)
+        if n not in used and n not in out
+    ]
+    while len(out) < target and filler:
+        n = filler.pop(0)
+        out.append(n)
+        used.add(n)
+    return out[:target]
+
+
 def _force_into_mid(
     selected: list[int],
     *,
@@ -575,27 +624,26 @@ def _force_into_defense(
     return out[:target]
 
 
-def compute_latest_pre_omit_days(
-    history_numbers: Sequence[int],
-    history_dates: Sequence[Any] | None,
-    latest: int,
-) -> int | None:
-    """上期原号在开出前的遗漏自然日；样本内此前从未出现 → ``None``（视作极寒）。"""
-    latest = int(latest)
-    series = [
+def _history_series(history_numbers: Sequence[int]) -> list[int]:
+    return [
         int(n)
         for n in history_numbers
         if isinstance(n, (int, float)) and NUMBER_MIN <= int(n) <= NUMBER_MAX
     ]
-    if not series or series[0] != latest:
-        # 仍按值搜：找到最新一期该号后再找更早一次
-        tip_idx = next((i for i, n in enumerate(series) if n == latest), None)
-        if tip_idx is None:
-            return None
-    else:
-        tip_idx = 0
+
+
+def compute_pre_omit_at_index(
+    history_numbers: Sequence[int],
+    history_dates: Sequence[Any] | None,
+    index: int,
+) -> int | None:
+    """第 ``index`` 期（最新=0）该号开出前的遗漏自然日；此前从未出现 → ``None``。"""
+    series = _history_series(history_numbers)
+    if index < 0 or index >= len(series):
+        return None
+    number = series[index]
     prev_idx = next(
-        (i for i, n in enumerate(series[tip_idx + 1 :], tip_idx + 1) if n == latest),
+        (i for i, n in enumerate(series[index + 1 :], index + 1) if n == number),
         None,
     )
     if prev_idx is None:
@@ -607,12 +655,120 @@ def compute_latest_pre_omit_days(
                 parsed.append(raw)
             else:
                 parsed.append(None)
-        tip_d, prev_d = parsed[tip_idx] if tip_idx < len(parsed) else None, (
-            parsed[prev_idx] if prev_idx < len(parsed) else None
-        )
-        if len(parsed) == len(series) and tip_d is not None and prev_d is not None:
-            return int((tip_d - prev_d).days)
-    return int(prev_idx - tip_idx)
+        if len(parsed) == len(series):
+            tip_d = parsed[index]
+            prev_d = parsed[prev_idx]
+            if tip_d is not None and prev_d is not None:
+                return int((tip_d - prev_d).days)
+    return int(prev_idx - index)
+
+
+def compute_latest_pre_omit_days(
+    history_numbers: Sequence[int],
+    history_dates: Sequence[Any] | None,
+    latest: int,
+) -> int | None:
+    """上期原号在开出前的遗漏自然日；样本内此前从未出现 → ``None``（视作极寒）。"""
+    series = _history_series(history_numbers)
+    latest = int(latest)
+    if not series:
+        return None
+    if series[0] == latest:
+        tip_idx = 0
+    else:
+        tip_idx = next((i for i, n in enumerate(series) if n == latest), None)
+        if tip_idx is None:
+            return None
+    return compute_pre_omit_at_index(history_numbers, history_dates, tip_idx)
+
+
+def consecutive_cold_break_streak(
+    history_numbers: Sequence[int],
+    history_dates: Sequence[Any] | None = None,
+) -> int:
+    """从最新一期往前，连续「开出前遗漏>80」的期数。
+
+    样本内首次出现（遗漏未知）只对最新一期计极寒，避免短历史把所有独号连成「连三」。
+    """
+    series = _history_series(history_numbers)
+    streak = 0
+    for index in range(len(series)):
+        omit = compute_pre_omit_at_index(history_numbers, history_dates, index)
+        if index == 0:
+            cold = is_cold_break(omit)
+        else:
+            cold = omit is not None and is_cold_break(omit)
+        if cold:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def _pick_hot_active_tips(
+    *,
+    hot_groups: set[int],
+    blocked: set[int],
+    days_since_last: Mapping[int, int | None],
+    need: int,
+    exclude: set[int],
+) -> list[int]:
+    """最新 N 肖里优先 10–20 天活跃号，不足再 20–40 常规温号。"""
+
+    def _collect(min_days: int, max_days: int) -> list[int]:
+        found: list[int] = []
+        for number in range(NUMBER_MIN, NUMBER_MAX + 1):
+            if number in blocked or number in exclude:
+                continue
+            if hot_groups and zodiac_group(number) not in hot_groups:
+                continue
+            days = days_since_last.get(number)
+            if days is None:
+                continue
+            if min_days <= int(days) <= max_days:
+                found.append(number)
+        ideal = (min_days + max_days) / 2
+        found.sort(key=lambda n: (abs(int(days_since_last.get(n) or 0) - ideal), n))
+        return found
+
+    picked: list[int] = []
+    for min_days, max_days in (
+        (HOT_TIP_LOCK_MIN_DAYS, HOT_TIP_LOCK_MAX_DAYS),
+        (HOT_TIP_LOCK_FALLBACK_MIN_DAYS, HOT_TIP_LOCK_FALLBACK_MAX_DAYS),
+    ):
+        for number in _collect(min_days, max_days):
+            if number in picked:
+                continue
+            picked.append(number)
+            if len(picked) >= need:
+                return picked
+    return picked
+
+
+def _pick_shatter_cold(
+    *,
+    blocked: set[int],
+    days_since_last: Mapping[int, int | None],
+    exclude: set[int],
+) -> int | None:
+    """遗漏>120 或样本内从未出现的极品极寒，供 3 元防守。"""
+    candidates: list[int] = []
+    for number in range(NUMBER_MIN, NUMBER_MAX + 1):
+        if number in blocked or number in exclude:
+            continue
+        days = days_since_last.get(number)
+        if days is None or int(days) > SHATTER_COLD_MIN_DAYS:
+            candidates.append(number)
+    if not candidates:
+        return None
+
+    def _key(number: int) -> tuple:
+        days = days_since_last.get(number)
+        depth = 10_000 if days is None else int(days)
+        return (-depth, number)
+
+    candidates.sort(key=_key)
+    return candidates[0]
 
 
 def is_cold_break(latest_pre_omit_days: int | None) -> bool:
@@ -1015,6 +1171,8 @@ def apply_reverse_game(
         history_numbers, history_dates, int(latest)
     )
     cold_break_on = is_cold_break(latest_pre_omit_days)
+    cold_streak = consecutive_cold_break_streak(history_numbers, history_dates)
+    cold_triple_on = cold_streak >= STREAK_REVERSE_AT
     cold_relay_preview = (
         _pick_cold_relay_number(
             latest=int(latest),
@@ -1022,7 +1180,7 @@ def apply_reverse_game(
             blocked=set(),
             days_since_last=days_since_last,
         )
-        if cold_break_on
+        if cold_break_on and not cold_triple_on
         else None
     )
     if cold_relay_preview is not None:
@@ -1046,15 +1204,27 @@ def apply_reverse_game(
     hot_groups = set(macro["hot_groups"])
     prefer_zone = str(macro["prefer_zone"])  # hot | cold
     prefer_label = str(macro.get("prefer_label") or PREFER_LABELS.get(prefer_zone, prefer_zone))
-    # 上期刚开极寒号：本期强制顺冷（防庄家杀温号的同肖接力前提）
-    if cold_break_on:
+    live_hot_groups = set(
+        recent_special_zodiac_groups(
+            history_numbers, limit=int(recent_zodiac_limit) or DEFAULT_RECENT_ZODIAC_LIMIT
+        )
+    )
+    # 极寒连三：强制顺热回补（覆盖单期顺冷）；否则上期刚开极寒 → 顺冷
+    if cold_triple_on:
+        prefer_zone = PREFER_HOT
+        prefer_label = PREFER_LABELS[PREFER_HOT]
+        if live_hot_groups:
+            hot_groups = live_hot_groups
+    elif cold_break_on:
         prefer_zone = PREFER_COLD
         prefer_label = PREFER_LABELS[PREFER_COLD]
 
     micro_reverse = micro_streak >= STREAK_REVERSE_AT
     macro_reverse = bool(macro["reverse"])
     direction = (
-        DIRECTION_REVERSE if macro_reverse else DIRECTION_FOLLOW
+        DIRECTION_REVERSE
+        if (macro_reverse or cold_triple_on)
+        else DIRECTION_FOLLOW
     )
     comeback_tip_ok = False
 
@@ -1082,6 +1252,10 @@ def apply_reverse_game(
         "prev_guard_kind": _guard_kind_preview,
         "prev_guard_label": GUARD_KIND_LABELS.get(_guard_kind_preview),
         "cold_break": bool(cold_break_on),
+        "cold_streak": int(cold_streak),
+        "cold_triple": bool(cold_triple_on),
+        "hot_tip_lock": [],
+        "shatter_cold_number": None,
         "latest_pre_omit_days": latest_pre_omit_days,
         "cold_relay_number": cold_relay_preview,
         "cold_relay_amount": None,
@@ -1097,6 +1271,7 @@ def apply_reverse_game(
         "replaced_numbers": [],
         "rule": (
             "大盘：顺热/顺冷；连≥3防变盘；上期刚开极寒则强制顺冷；"
+            "极寒连三则强制顺热回补，10元锁最新N肖10-20天活跃号，>120只进3元；"
             "埋伏结构：全票生肖≤6、同肖≤2、极寒/预字合计≤2且只进3元；"
             "同肖极寒接力：禁20-40温号独占主攻，80-100次级极寒进5元或3元，原号仅3元；"
             "非破局：防重号/防重肖二选一仅3元；不承诺命中率。"
@@ -1191,17 +1366,21 @@ def apply_reverse_game(
             return False
         if number == int(latest) or _is_prev_zodiac(number):
             return False
-        if cold_break_on and _is_warm_trap(
+        days_tip = _days(number)
+        if days_tip is None or int(days_tip) > COLD_BREAK_MIN_DAYS:
+            if cold_triple_on:
+                return False
+        if cold_break_on and not cold_triple_on and _is_warm_trap(
             number, prev_group=prev_group, days_since_last=days_since_last
         ):
             return False
-        days_tip = _days(number)
         if (
             days_tip is not None
             and WARM_TRAP_MIN_DAYS <= int(days_tip) <= WARM_TRAP_MAX_DAYS
             and cold_break_on
+            and not cold_triple_on
         ):
-            # 破极寒后：任何生肖的 20–40 温号都不能当唯一主攻
+            # 单期破极寒：任何生肖的 20–40 温号都不能当唯一主攻
             return False
         if _dead_tip(number):
             return False
@@ -1210,6 +1389,16 @@ def apply_reverse_game(
         if not _in_prefer_zone(number):
             return False
         days = _days(number)
+        if cold_triple_on:
+            if days is None:
+                return False
+            if HOT_TIP_LOCK_MIN_DAYS <= int(days) <= HOT_TIP_LOCK_MAX_DAYS:
+                return True
+            return (
+                HOT_TIP_LOCK_FALLBACK_MIN_DAYS
+                <= int(days)
+                <= HOT_TIP_LOCK_FALLBACK_MAX_DAYS
+            )
         if prefer_zone == PREFER_HOT:
             return tags[number] in (
                 TAG_ULTRA_HOT,
@@ -1470,7 +1659,70 @@ def apply_reverse_game(
         if not progressed:
             break
 
-    keep = set(allowed_prev_fill)
+    hot_tip_lock: list[int] = []
+    shatter_cold_number: int | None = None
+    if cold_triple_on:
+        hot_tip_lock = _pick_hot_active_tips(
+            hot_groups=hot_groups,
+            blocked=blocked,
+            days_since_last=days_since_last,
+            need=tip_n,
+            exclude={int(latest)},
+        )
+        for number in hot_tip_lock:
+            tags[int(number)] = classify_number_tag(
+                int(number),
+                days_since_last=days_since_last.get(int(number)),
+                in_band=False,
+                hot_zodiac_group=wang_group if wang_on else micro_group,
+            )
+        used_lock = set(selected)
+        for number in hot_tip_lock:
+            selected = _force_into_tip(
+                selected,
+                number=int(number),
+                tip_n=tip_n,
+                mid_n=mid_n,
+                def_n=def_n,
+                used=used_lock,
+            )
+            used_lock = set(selected)
+        shatter_cold_number = _pick_shatter_cold(
+            blocked=blocked,
+            days_since_last=days_since_last,
+            exclude=set(selected[:tip_n]) | {int(latest)},
+        )
+        if shatter_cold_number is not None:
+            selected = _force_into_defense(
+                selected,
+                number=int(shatter_cold_number),
+                tip_n=tip_n,
+                mid_n=mid_n,
+                def_n=def_n,
+                used=set(selected),
+            )
+            allowed_prev_fill.add(int(shatter_cold_number))
+        kept_tip: list[int] = []
+        demoted_cold: list[int] = []
+        for number in selected[:tip_n]:
+            days = _days(number)
+            if number in hot_tip_lock or (
+                days is not None and int(days) <= COLD_BREAK_MIN_DAYS
+            ):
+                kept_tip.append(number)
+            else:
+                demoted_cold.append(number)
+        rest = [n for n in selected[tip_n:] if n not in kept_tip]
+        rest = demoted_cold + rest
+        for number in list(rest):
+            if len(kept_tip) >= tip_n:
+                break
+            if _tip_ok(number):
+                rest.remove(number)
+                kept_tip.append(number)
+        selected = (kept_tip + rest)[: tip_n + mid_n + def_n]
+
+    keep = set(allowed_prev_fill) | set(hot_tip_lock)
     selected = repair_ambush_ticket(
         selected[:target_n] if len(selected) > target_n else selected,
         tags=tags,
@@ -1486,6 +1738,27 @@ def apply_reverse_game(
         mid_n=mid_n,
         def_n=def_n,
     )
+    if cold_triple_on and hot_tip_lock:
+        used_lock = set(selected)
+        for number in hot_tip_lock:
+            selected = _force_into_tip(
+                selected,
+                number=int(number),
+                tip_n=tip_n,
+                mid_n=mid_n,
+                def_n=def_n,
+                used=used_lock,
+            )
+            used_lock = set(selected)
+        if shatter_cold_number is not None:
+            selected = _force_into_defense(
+                selected,
+                number=int(shatter_cold_number),
+                tip_n=tip_n,
+                mid_n=mid_n,
+                def_n=def_n,
+                used=set(selected),
+            )
 
     tip_numbers = selected[:tip_n]
     mid_numbers = selected[tip_n : tip_n + mid_n]
@@ -1565,7 +1838,14 @@ def apply_reverse_game(
     )
     guard_label = GUARD_KIND_LABELS.get(prev_guard_kind, prev_guard_kind)
 
-    if macro_reverse:
+    if cold_triple_on:
+        knife = (
+            f"极寒连三变盘（连续 {cold_streak} 期开出遗漏>80）→ 强制顺热回补，"
+            "10元锁定最新肖里 10–20 天活跃号，极寒号不再作主攻"
+        )
+        if shatter_cold_number is not None:
+            knife += f"；极品极寒 {int(shatter_cold_number):02d} 仅3元"
+    elif macro_reverse:
         knife = (
             f"大盘{MACRO_LABELS[macro['zone']]}已连 {macro['streak']} 期 → "
             f"防变盘改押「{prefer_label}」"
@@ -1647,6 +1927,10 @@ def apply_reverse_game(
         "prev_guard_kind": prev_guard_kind,
         "prev_guard_label": guard_label,
         "cold_break": bool(cold_break_on),
+        "cold_streak": int(cold_streak),
+        "cold_triple": bool(cold_triple_on),
+        "hot_tip_lock": list(hot_tip_lock),
+        "shatter_cold_number": shatter_cold_number,
         "latest_pre_omit_days": latest_pre_omit_days,
         "cold_relay_number": cold_relay_number,
         "cold_relay_amount": relay_amount,

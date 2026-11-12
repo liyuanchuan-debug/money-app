@@ -416,6 +416,14 @@ export interface RecommendResult {
     prev_guard_label?: string | null
     /** 上期原号开出前是否极寒破局（遗漏>80） */
     cold_break?: boolean
+    /** 从最新期往前连续极寒开出期数 */
+    cold_streak?: number
+    /** 连续 3 期极寒 → 强制顺热变盘 */
+    cold_triple?: boolean
+    /** 连三变盘时锁定的 10 元活跃号 */
+    hot_tip_lock?: number[]
+    /** 遗漏>120 降到 3 元的极品极寒 */
+    shatter_cold_number?: number | null
     latest_pre_omit_days?: number | null
     /** 同肖次级极寒（80-100），进 5 元中坚或 3 元防守 */
     cold_relay_number?: number | null

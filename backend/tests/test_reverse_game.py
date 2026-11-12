@@ -21,6 +21,7 @@ from services.reverse_game import (
     apply_reverse_game,
     classify_number_tag,
     compute_latest_pre_omit_days,
+    consecutive_cold_break_streak,
     consecutive_zodiac_streak,
     detect_wang_zodiac,
     is_cold_break,
@@ -388,3 +389,164 @@ def test_ambush_structure_caps_zodiac_same_and_dead_slots():
     assert out["summary"]["zodiac_count"] <= 6
     assert out["summary"]["same_zodiac_peak"] <= 2
     assert out["summary"]["dead_slot_count"] <= 2
+
+
+def test_consecutive_cold_break_streak_counts_from_latest():
+    tip = date(2026, 11, 10)
+    # 无日期时：独号只把最新期当极寒，不把整段独号连成三
+    assert consecutive_cold_break_streak([31, 32, 18, 12, 5, 8, 20]) == 1
+    history = [31, 32, 18, 12, 5, 8, 20, 31, 32, 18]
+    dates = [
+        tip,
+        tip - timedelta(days=1),
+        tip - timedelta(days=2),
+        tip - timedelta(days=3),
+        tip - timedelta(days=4),
+        tip - timedelta(days=5),
+        tip - timedelta(days=6),
+        tip - timedelta(days=90),
+        tip - timedelta(days=91),
+        tip - timedelta(days=92),
+    ]
+    assert consecutive_cold_break_streak(history, dates) == 3
+    history_two = [31, 32, 12, 5, 8, 20, 31, 32, 12]
+    dates_two = [
+        tip,
+        tip - timedelta(days=1),
+        tip - timedelta(days=2),
+        tip - timedelta(days=3),
+        tip - timedelta(days=4),
+        tip - timedelta(days=5),
+        tip - timedelta(days=90),
+        tip - timedelta(days=91),
+        tip - timedelta(days=10),
+    ]
+    assert consecutive_cold_break_streak(history_two, dates_two) == 2
+
+
+def test_cold_triple_force_hot_lock_and_shatter_defense():
+    """连续 3 期极寒 → 强制顺热；10 元锁最新肖 10–20 天；>120 只进 3 元。"""
+    latest = 31
+    tip = date(2026, 11, 10)
+    history = [31, 32, 18, 12, 5, 8, 20, 31, 32, 18]
+    dates = [
+        tip,
+        tip - timedelta(days=1),
+        tip - timedelta(days=2),
+        tip - timedelta(days=3),
+        tip - timedelta(days=4),
+        tip - timedelta(days=5),
+        tip - timedelta(days=6),
+        tip - timedelta(days=90),
+        tip - timedelta(days=91),
+        tip - timedelta(days=92),
+    ]
+    days = {n: 50 for n in range(1, 50)}
+    days[31] = 0
+    days[43] = 15
+    days[44] = 12
+    days[42] = 16
+    days[24] = 14
+    days[41] = 11
+    days[49] = 130
+    days[1] = 200
+    days[2] = 180
+    days[3] = None
+    picks = [
+        {
+            "number": n,
+            "diff": abs(n - latest),
+            "wave_type": "small",
+            "amount": 3,
+            "role": "defense",
+        }
+        for n in (1, 2, 3, 9, 10, 11, 13, 14, 15)
+    ]
+    out = apply_reverse_game(
+        picks,
+        enabled=True,
+        mode=MODE_LADDER,
+        latest=latest,
+        previous=32,
+        history_numbers=history,
+        days_since_last=days,
+            in_band_numbers=[7, 19],
+        small_max=10,
+        normal_max=30,
+        history_dates=dates,
+    )
+    summary = out["summary"]
+    assert consecutive_cold_break_streak(history, dates) == 3
+    assert summary["cold_streak"] == 3
+    assert summary["cold_triple"] is True
+    assert summary["prefer_zone"] == PREFER_HOT
+    assert summary["direction"] == DIRECTION_REVERSE
+    tip_nums = [int(p["number"]) for p in out["picks"] if int(p["amount"]) == 10]
+    live_hot = {zodiac_group(n) for n in (31, 32, 18, 12, 5, 8)}
+    for number in tip_nums:
+        omit = days.get(number)
+        assert omit is not None
+        assert int(omit) <= 80
+        assert 10 <= int(omit) <= 40
+        assert zodiac_group(number) in live_hot
+    lock = [int(n) for n in (summary.get("hot_tip_lock") or [])]
+    assert lock
+    for number in lock:
+        omit = days[number]
+        assert 10 <= int(omit) <= 20
+        assert zodiac_group(number) in live_hot
+        assert number in tip_nums
+    shatter = summary.get("shatter_cold_number")
+    assert shatter is not None
+    assert days.get(int(shatter)) is None or int(days[int(shatter)]) > 120
+    def_nums = [int(p["number"]) for p in out["picks"] if int(p["amount"]) == 3]
+    assert int(shatter) in def_nums
+
+
+def test_two_cold_breaks_still_prefer_cold_not_triple():
+    latest = 31
+    tip = date(2026, 11, 10)
+    history = [31, 32, 12, 5, 8, 20, 31, 32, 12]
+    dates = [
+        tip,
+        tip - timedelta(days=1),
+        tip - timedelta(days=2),
+        tip - timedelta(days=3),
+        tip - timedelta(days=4),
+        tip - timedelta(days=5),
+        tip - timedelta(days=90),
+        tip - timedelta(days=91),
+        tip - timedelta(days=10),
+    ]
+    days = {n: 50 for n in range(1, 50)}
+    days[31] = 0
+    days[48] = 90
+    days[24] = 25
+    days[36] = 32
+    picks = [
+        {
+            "number": n,
+            "diff": abs(n - latest),
+            "wave_type": "small",
+            "amount": 3,
+            "role": "defense",
+        }
+        for n in (1, 2, 3, 9, 10, 11, 13, 14, 15)
+    ]
+    out = apply_reverse_game(
+        picks,
+        enabled=True,
+        mode=MODE_LADDER,
+        latest=latest,
+        previous=32,
+        history_numbers=history,
+        days_since_last=days,
+        in_band_numbers=[48, 24, 36],
+        small_max=10,
+        normal_max=30,
+        history_dates=dates,
+    )
+    assert consecutive_cold_break_streak(history, dates) == 2
+    assert out["summary"]["cold_triple"] is False
+    assert out["summary"]["cold_break"] is True
+    assert out["summary"]["prefer_zone"] == PREFER_COLD

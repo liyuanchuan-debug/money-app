@@ -1689,11 +1689,18 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   {{ pad(result.reverse_game.repeat_guard_number) }}·仅3元
                 </StatChip>
                 <StatChip
-                  v-if="result.reverse_game.cold_break"
+                  v-if="result.reverse_game.cold_triple"
+                  tone="amber"
+                  size="sm"
+                >
+                  极寒连三变盘·顺热
+                </StatChip>
+                <StatChip
+                  v-else-if="result.reverse_game.cold_break"
                   tone="bloom"
                   size="sm"
                 >
-                  破极寒·禁10-40温号
+                  破极寒·禁20-40温号独占主攻
                 </StatChip>
                 <StatChip
                   v-else
@@ -1710,13 +1717,20 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 <template v-else>
                   本期主攻偏「最新 N 肖」强势/温号。
                 </template>
-                <template v-if="result.reverse_game.direction === 'reverse'">
+                <template v-if="result.reverse_game.cold_triple">
+                  极寒已连开三期（事不过三）：本期强制变盘顺热回补，10 元锁定最新肖里 10–20 天活跃号，极寒号不再作主攻；
+                  遗漏超过 120 天的极品极寒只进 3 元防守。
+                </template>
+                <template v-else-if="result.reverse_game.direction === 'reverse'">
                   大盘已满三，按防变盘反向押注。
                 </template>
                 <template v-else>
                   大盘未满三，继续顺应原盘。
                 </template>
-                <template v-if="result.reverse_game.cold_break">
+                <template v-if="result.reverse_game.cold_triple && result.reverse_game.shatter_cold_number != null">
+                  极品极寒 {{ pad(result.reverse_game.shatter_cold_number) }} 已放入 3 元。
+                </template>
+                <template v-else-if="result.reverse_game.cold_break">
                   上期刚开极寒号：本期强制顺冷。严禁把同肖 20–40 天常规温号当作唯一主攻；
                   <template v-if="result.reverse_game.cold_relay_number != null">
                     同肖 80–100 天次级极寒 {{ pad(result.reverse_game.cold_relay_number) }}
