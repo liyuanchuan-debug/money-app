@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import type { DrawItem } from '~/composables/useApi'
 import {
   CHIP_MODE_OPTIONS,
@@ -1232,6 +1232,19 @@ const roleTones: Record<string, 'aqua' | 'neutral' | 'nebula'> = {
   defense: 'nebula',
 }
 
+/** AI 阵型：按 role 分组 */
+const primaryPicks = computed(() => (result.value?.picks ?? []).filter(p => p.role === 'primary'))
+const secondaryPicks = computed(() => (result.value?.picks ?? []).filter(p => p.role === 'secondary'))
+const defensePicks = computed(() => (result.value?.picks ?? []).filter(p => p.role === 'defense'))
+
+/** 盘面判定 → 色标 tone */
+function marketTone(judgment: string): 'emerald' | 'amber' | 'bloom' {
+  const t = (judgment || '').toLowerCase()
+  if (t.includes('变盘') || t.includes('透支')) return 'bloom'
+  if (t.includes('极寒')) return 'amber'
+  return 'emerald' // 顺热期
+}
+
 /** 取值表与设置页共用同一份（composables/useApi.ts） */
 const chipModes = CHIP_MODE_OPTIONS
 const trendWindowOptions = TREND_WINDOW_OPTIONS
@@ -1256,7 +1269,7 @@ async function writeClipboard(text: string, source: 'ticket') {
 }
 
 async function copy() {
-  const text = displayCopyText.value
+  const text = result.value?.copy_text || displayCopyText.value
   if (!text) return
   await writeClipboard(text, 'ticket')
 }
@@ -1382,6 +1395,85 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                     （当前未避开，同肖号可入选）
                   </span>
                 </div>
+
+                <!-- 最新 6 肖（AI 输入数据） -->
+                <div
+                  v-if="result.zodiac_6_recent?.length"
+                  class="flex flex-wrap items-center gap-1.5"
+                >
+                  <span class="text-xs text-slate-500">最新 6 肖</span>
+                  <div class="flex flex-wrap gap-1">
+                    <StatChip
+                      v-for="item in result.zodiac_6_recent"
+                      :key="item.code"
+                      tone="nebula"
+                      size="xs"
+                    >
+                      {{ item.animal }}
+                    </StatChip>
+                  </div>
+                </div>
+
+                <!-- 极寒号（AI 输入数据） -->
+                <div
+                  v-if="result.extreme_cold?.length"
+                  class="flex flex-wrap items-center gap-1.5"
+                >
+                  <span class="text-xs text-slate-500">极寒号</span>
+                  <div class="flex flex-wrap gap-1">
+                    <StatChip
+                      v-for="item in result.extreme_cold.slice(0, 8)"
+                      :key="item.number"
+                      tone="amber"
+                      size="xs"
+                    >
+                      {{ pad(item.number) }} · {{ item.days }}天
+                    </StatChip>
+                    <span
+                      v-if="result.extreme_cold.length > 8"
+                      class="text-[11px] text-slate-500"
+                    >
+                      +{{ result.extreme_cold.length - 8 }}
+                    </span>
+                  </div>
+                </div>
+
+                <!-- 最近重号 / 最近重肖 / X 后曾开 -->
+                <div
+                  v-if="latestRepeatGaps.numberPair || latestNumberNextDraws.anchor != null"
+                  class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-500"
+                >
+                  <span v-if="latestRepeatGaps.numberPair" class="inline-flex items-center gap-1.5">
+                    <span>最近重号</span>
+                    <StatChip tone="bloom" size="xs">{{ pad(latestRepeatGaps.numberPair.number) }}</StatChip>
+                    <span class="num rounded-md border border-bloom-400/35 bg-bloom-400/10 px-1.5 py-0.5 text-[10px] text-bloom-200/90">{{ periodsAgoLabel(latestRepeatGaps.numberAgo) }}</span>
+                  </span>
+                  <span v-if="latestRepeatGaps.zodiacPair" class="inline-flex items-center gap-1.5">
+                    <span>最近重肖</span>
+                    <StatChip tone="amber" size="xs">{{ pad(latestRepeatGaps.zodiacPair.newer) }}</StatChip>
+                    <span class="text-[10px] text-slate-500">/</span>
+                    <StatChip tone="amber" size="xs">{{ pad(latestRepeatGaps.zodiacPair.older) }}</StatChip>
+                    <span class="num rounded-md border border-amber-400/35 bg-amber-400/10 px-1.5 py-0.5 text-[10px] text-amber-200/90">{{ periodsAgoLabel(latestRepeatGaps.zodiacAgo) }}</span>
+                  </span>
+                  <template v-if="latestNumberNextDraws.anchor != null">
+                    <span v-if="latestRepeatGaps.numberPair || latestRepeatGaps.zodiacPair" class="mx-1 text-slate-600">·</span>
+                    <span class="text-[11px] text-slate-500">
+                      <span class="num text-slate-300">{{ pad(latestNumberNextDraws.anchor) }}</span>
+                      后曾开 <template v-if="latestNumberNextDraws.successors.length">· {{ latestNumberNextDraws.successors.length }} 次</template>
+                    </span>
+                    <span v-if="latestNumberNextDraws.successors.length" class="inline-flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <span
+                        v-for="(item, i) in latestNumberNextDraws.successors"
+                        :key="`${item.fromPeriod}-${item.toPeriod}-${item.number}-${i}`"
+                        class="inline-flex items-center gap-1"
+                      >
+                        <StatChip tone="aqua" size="xs">{{ pad(item.number) }}</StatChip>
+                        <span class="num text-[10px] text-slate-500">{{ item.periodsAgo === 0 ? '最新' : `${item.periodsAgo}期前` }}</span>
+                      </span>
+                    </span>
+                    <span v-else class="text-[11px] text-amber-200/90">本池此前未开过该号</span>
+                  </template>
+                </div>
               </div>
 
               <div class="shrink-0">
@@ -1436,524 +1528,159 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
           </div>
         </MotionReveal>
 
-        <!-- 筹码模式：临时预览，不写默认值 -->
-        <MotionReveal :index="3">
-          <GlassPanel padding="lg" rounded="3xl" class="space-y-3">
-            <div class="flex flex-wrap items-center justify-between gap-2">
-              <h2 id="chip-mode-label" class="text-lg font-medium text-white">筹码模式</h2>
-              <StatChip tone="neutral" size="sm">临时预览 · 不写入默认值</StatChip>
-            </div>
-
-            <div
-              role="radiogroup"
-              aria-labelledby="chip-mode-label"
-              class="flex flex-wrap gap-2"
-            >
-              <GlassButton
-                v-for="option in chipModes"
-                :key="option.value"
-                role="radio"
-                :aria-checked="mode === option.value"
-                :variant="mode === option.value ? 'primary' : 'glass'"
-                class="min-h-[44px] px-4 text-base"
-                @click="mode = option.value"
-              >
-                {{ option.label }}
-              </GlassButton>
-            </div>
-
-            <p class="text-xs leading-relaxed text-slate-500">
-              本页默认走「档位」：默认 9 个码（2-3-4），注数可改；金额按档相加，不先锁一笔总预算。
-              <template v-if="stakeTop === 10">2 个 10 元、3 个 5 元、4 个 3 元。</template>
-              <template v-else>一档尖刀 {{ stakeTop }} 元（1～2 注）、二档 10 元（≤3）、五元档（≤5），其余 3 元。</template>
-              切到均注 / 侧重 / 单挑 / 随机分配后，才按最大投注金额拆分。
-              要改默认请到
-              <NuxtLink
-                to="/settings"
-                class="text-aqua-200 underline underline-offset-2 active:text-aqua-100"
-              >
-                设置页
-              </NuxtLink>
-              保存。
-            </p>
-
-            <!-- 临场注数：增减 / 输入，走 recommend bet_count（不落库） -->
-            <div class="space-y-2">
-              <div class="flex flex-wrap items-center justify-between gap-2">
-                <label id="bet-count-label" class="text-sm font-medium text-slate-200">
-                  注数
-                </label>
-                <StatChip tone="neutral" size="sm">临时预览 · 不写入默认值</StatChip>
-              </div>
-              <div
-                class="flex flex-wrap items-center gap-2"
-                role="group"
-                aria-labelledby="bet-count-label"
-              >
-                <GlassButton
-                  variant="glass"
-                  class="min-h-[44px] min-w-[44px] px-0 text-lg"
-                  :disabled="pending || betCount <= BET_COUNT_MIN || mode === 'single'"
-                  aria-label="减少注数"
-                  @click="nudgeBetCount(-1)"
+        <!-- 财富密码（AI 阵型 · 紧凑投注票据） -->
+        <MotionReveal :index="5" class="space-y-1">
+          <GlassPanel padding="md" rounded="3xl" class="overflow-hidden">
+            <!-- 标题行 -->
+            <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <h2 class="text-base font-medium text-white">财富密码</h2>
+              <div class="flex flex-wrap items-center gap-1.5">
+                <StatChip
+                  v-if="result.market_judgment"
+                  :tone="marketTone(result.market_judgment)"
+                  size="xs"
+                  dot
                 >
-                  −
-                </GlassButton>
-                <input
-                  id="bet-count"
-                  :value="betCount"
-                  type="number"
-                  :min="BET_COUNT_MIN"
-                  :max="BET_COUNT_MAX"
-                  inputmode="numeric"
-                  class="num h-11 w-20 rounded-xl border border-white/15 bg-white/5 px-3 text-center text-base text-slate-100 outline-none focus:border-aqua-400/50"
-                  :disabled="pending || mode === 'single'"
-                  aria-labelledby="bet-count-label"
-                  @change="onBetCountInput"
-                >
-                <GlassButton
-                  variant="glass"
-                  class="min-h-[44px] min-w-[44px] px-0 text-lg"
-                  :disabled="pending || betCount >= BET_COUNT_MAX || mode === 'single'"
-                  aria-label="增加注数"
-                  @click="nudgeBetCount(1)"
-                >
-                  +
-                </GlassButton>
-                <StatChip tone="aqua" size="sm">
-                  {{ mode === 'single' ? '单挑恒为 1 注' : `当前 ${betCount} 注` }}
+                  {{ result.market_judgment }}
+                </StatChip>
+                <StatChip tone="neutral" size="xs">
+                  ¥{{ result.staked_total }} · {{ result.picks.length }}注
                 </StatChip>
               </div>
-              <div v-if="mode === 'ladder'" class="flex flex-wrap gap-2" role="group" aria-label="尖刀金额">
-                <GlassButton
-                  v-for="top in stakeTopOptions"
-                  :key="top"
-                  type="button"
-                  class="min-h-[44px] px-4 text-base"
-                  :variant="stakeTop === top ? 'primary' : 'glass'"
-                  :aria-pressed="stakeTop === top"
-                  @click="stakeTop = top"
-                >
-                  尖刀 {{ top }} 元
-                </GlassButton>
-              </div>
-              <p class="text-xs leading-relaxed text-slate-500">
-                <template v-if="mode === 'ladder'">
-                  <template v-if="stakeTop === 10">2 个 10 元、3 个 5 元，其余 3 元。</template>
-                  <template v-else>一档 {{ stakeTop }} 元（1～2）、二档 10 元（≤3）、五元档（≤5），其余 3 元。</template>
-                  改注数按档位容量重摊，不从固定总预算里拆。
-                </template>
-                <template v-else>
-                  改注数会立刻按当前最大投注金额与金额最小单位重新出码、重摊金额（最大投注与单位倍数约束不变）。
-                  单挑模式注数固定为 1；默认注数仍在设置页保存。
-                </template>
-              </p>
             </div>
-
-            <div class="flex flex-wrap items-center gap-2">
-              <StatChip tone="aqua" size="sm">模式：{{ result.mode_label }}</StatChip>
-              <StatChip tone="nebula" size="sm">
-                {{ result.mode === 'ladder' ? '档位合计' : '最大投注金额' }} {{ result.total_amount }} 元
-              </StatChip>
-              <StatChip tone="neutral" size="sm">金额最小单位 {{ result.amount_unit }} 元</StatChip>
-              <StatChip tone="neutral" size="sm">
-                每注最低 {{ MIN_BET_AMOUNT }} 元 · 上限 {{ TOTAL_AMOUNT_MAX }} 元 · 最多 {{ BET_COUNT_MAX }} 注
-              </StatChip>
-              <StatChip v-if="avoidColdActive" tone="amber" size="sm">
-                避冷加权后实投 {{ stakedTotal }} 元（省下 {{ result.avoid_cold?.reduced_total ?? 0 }} 元未再分配）
-              </StatChip>
-              <StatChip tone="neutral" size="sm">
-                实际 {{ result.picks.length }} 注
-              </StatChip>
-              <StatChip v-if="amountsEqual" tone="neutral" size="sm">
-                各注 {{ result.picks[0]?.amount ?? result.bet_unit }} 元（最小单位 {{ result.amount_unit }} 元的倍数）
-              </StatChip>
-              <StatChip v-else-if="result.mode === 'ladder'" tone="amber" size="sm">
-                {{ stakeTop === 10 ? '10×2 · 5×3 · 其余3' : '尖刀≤2 · 10元≤3 · 5元≤5 · 其余3元' }}
-              </StatChip>
-              <StatChip v-else tone="amber" size="sm">各注金额不等（均为最小单位倍数）</StatChip>
-            </div>
-
-            <!-- 避冷加权（冷号排后 + 金额封顶）：如实说明，绝不宣称提高命中率或收益 -->
-            <p
-              v-if="result.avoid_cold?.enabled"
-              class="text-xs leading-relaxed text-slate-500"
-            >
-              避冷加权已开启（阈值 {{ result.avoid_cold.days }} 天，
-              保本金额 {{ result.avoid_cold.cap_amount }} 元）：距上次出现超过阈值的号码已排到候选队列末尾
-              （非冷号优先），
-              <template v-if="avoidColdActive">
-                本次 {{ result.avoid_cold.penalized_picks }} 注因间隔过久被压低金额，合计少投
-                {{ result.avoid_cold.reduced_total }} 元（不补给其它注）。
-              </template>
-              <template v-else>本次没有距上次出现超过阈值的注，金额未受影响。</template>
-              这是样本内偏好，不是概率，也不承诺提高命中率或收益。
+            <p v-if="result.logic_brief" class="mb-1.5 text-[11px] leading-relaxed text-slate-400">
+              {{ result.logic_brief }}
             </p>
             <p
-              v-else-if="result.avoid_cold"
-              class="text-xs leading-relaxed text-slate-500"
+              v-if="result.ai_violations?.length"
+              class="mb-1.5 text-[10px] leading-relaxed text-amber-300/80"
             >
-              避冷加权已关闭：距上次出现多久都不影响选号与金额（可在设置页开启）。
+              AI 第 {{ result.ai_attempts }} 次生成通过校验 · 拦截：{{ result.ai_violations.join('；') }}
             </p>
 
-            <!-- 重号 / 同肖 / 冷号：仅徽章；软降权系数已停用 -->
-            <p v-if="softSummary" class="text-xs leading-relaxed text-slate-500">
-              号码标签（不改排序或金额）：冷号口径为近
-              {{ softSummary.stale_periods }} 期未出现。
-              <template
-                v-if="softSummary.repeat_number_picks.length
-                  || softSummary.repeat_zodiac_picks.length
-                  || softSummary.stale_picks.length"
-              >
-                本次：重号 {{ softSummary.repeat_number_picks.length }} 注、
-                同肖 {{ softSummary.repeat_zodiac_picks.length }} 注、
-                冷号 {{ softSummary.stale_picks.length }} 注。
-              </template>
-              <template v-else>本次无重号 / 同肖 / 冷号标签。</template>
+            <!-- 零注兜底 -->
+            <p v-if="noTicket" class="mb-2 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-200">
+              <strong>本次不出票</strong>：{{ noTicketReason }}
             </p>
 
-            <!-- 逆向博弈定盘：顺热/顺冷、是否满三 —— 徽章一眼可见 -->
+            <!-- 三档票据 -->
             <div
-              v-if="result.reverse_game?.enabled"
-              class="space-y-2"
+              v-if="!noTicket"
+              class="overflow-hidden rounded-2xl border border-white/10 bg-white/[0.02]"
             >
-              <div class="flex flex-wrap items-center gap-2">
-                <StatChip tone="aqua" size="sm" dot>逆向定盘</StatChip>
-                <StatChip
-                  :tone="result.reverse_game.prefer_zone === 'cold' ? 'nebula' : 'bloom'"
-                  size="sm"
-                >
-                  {{
-                    result.reverse_game.prefer_zone === 'cold'
-                      ? '顺冷'
-                      : result.reverse_game.prefer_zone === 'hot'
-                        ? '顺热'
-                        : (result.reverse_game.prefer_label || '定盘中')
-                  }}
-                </StatChip>
-                <StatChip
-                  :tone="result.reverse_game.direction === 'reverse' ? 'amber' : 'emerald'"
-                  size="sm"
-                >
-                  <template v-if="result.reverse_game.direction === 'reverse'">
-                    已满三·防变盘
-                  </template>
-                  <template v-else>
-                    未满三·顺应
-                  </template>
-                </StatChip>
-                <StatChip
-                  v-if="result.reverse_game.macro_streak != null"
-                  tone="neutral"
-                  size="sm"
-                >
-                  {{ result.reverse_game.macro_zone === 'hot' ? '热盘' : result.reverse_game.macro_zone === 'cold' ? '冷盘' : '大盘' }}
-                  连 {{ result.reverse_game.macro_streak }} 期
-                </StatChip>
-                <StatChip
-                  v-if="result.reverse_game.zodiac_streak != null && result.reverse_game.zodiac_streak >= 3"
-                  tone="amber"
-                  size="sm"
-                >
-                  单肖连 {{ result.reverse_game.zodiac_streak }}·禁主攻
-                </StatChip>
-                <StatChip tone="aqua" size="sm">
-                  换批 {{ result.pick_seed ?? result.reverse_game.pick_batch ?? pickRerollCount }}
-                </StatChip>
-                <StatChip
-                  v-if="result.reverse_game.zodiac_count != null"
-                  tone="neutral"
-                  size="sm"
-                >
-                  生肖 {{ result.reverse_game.zodiac_count }}/{{ result.reverse_game.zodiac_cap ?? 6 }}
-                  ·同肖≤{{ result.reverse_game.same_zodiac_max ?? 2 }}
-                  ·极寒/预字 {{ result.reverse_game.dead_slot_count ?? 0 }}/{{ result.reverse_game.dead_slot_max ?? 2 }}
-                </StatChip>
-                <StatChip
-                  v-if="result.reverse_game.cold_relay_number != null"
-                  tone="amber"
-                  size="sm"
-                >
-                  同肖极寒接力 {{ pad(result.reverse_game.cold_relay_number) }}·{{ result.reverse_game.cold_relay_amount ?? 5 }}元
-                </StatChip>
-                <StatChip
-                  v-if="result.reverse_game.repeat_guard_number != null"
-                  :tone="result.reverse_game.prev_guard_kind === 'repeat_zodiac' ? 'nebula' : 'neutral'"
-                  size="sm"
-                >
-                  {{
-                    result.reverse_game.prev_guard_kind === 'repeat_zodiac'
-                      ? '防重肖'
-                      : '防重号'
-                  }}
-                  {{ pad(result.reverse_game.repeat_guard_number) }}·仅3元
-                </StatChip>
-                <StatChip
-                  v-if="result.reverse_game.cold_triple"
-                  tone="amber"
-                  size="sm"
-                >
-                  极寒连三变盘·顺热
-                </StatChip>
-                <StatChip
-                  v-else-if="result.reverse_game.cold_break"
-                  tone="bloom"
-                  size="sm"
-                >
-                  破极寒·禁20-40温号独占主攻
-                </StatChip>
-                <StatChip
-                  v-else
-                  tone="bloom"
-                  size="sm"
-                >
-                  上期肖名额≤1·禁10/5
-                </StatChip>
-              </div>
-              <p class="text-xs leading-relaxed text-slate-500">
-                <template v-if="result.reverse_game.prefer_zone === 'cold'">
-                  本期主攻偏「非最新 N 肖」温冷号。
-                </template>
-                <template v-else>
-                  本期主攻偏「最新 N 肖」强势/温号。
-                </template>
-                <template v-if="result.reverse_game.cold_triple">
-                  极寒已连开三期（事不过三）：本期强制变盘顺热回补，10 元锁定最新肖里 10–20 天活跃号，极寒号不再作主攻；
-                  遗漏超过 120 天的极品极寒只进 3 元防守。
-                </template>
-                <template v-else-if="result.reverse_game.direction === 'reverse'">
-                  大盘已满三，按防变盘反向押注。
-                </template>
-                <template v-else>
-                  大盘未满三，继续顺应原盘。
-                </template>
-                <template v-if="result.reverse_game.cold_triple && result.reverse_game.shatter_cold_number != null">
-                  极品极寒 {{ pad(result.reverse_game.shatter_cold_number) }} 已放入 3 元。
-                </template>
-                <template v-else-if="result.reverse_game.cold_break">
-                  上期刚开极寒号：本期强制顺冷。严禁把同肖 20–40 天常规温号当作唯一主攻；
-                  <template v-if="result.reverse_game.cold_relay_number != null">
-                    同肖 80–100 天次级极寒 {{ pad(result.reverse_game.cold_relay_number) }}
-                    进 {{ result.reverse_game.cold_relay_amount ?? 5 }} 元（中坚或防守），防庄家同肖换极寒杀温号。
-                  </template>
-                  上期原号最多进 3 元防重号。
-                </template>
-                <template v-else>
-                  防重号与防重肖有且仅 1 个：要么原号要么同肖合适遗漏号，只进 3 元，禁 10/5。
-                </template>
-                埋伏结构：全票最多 6 个生肖、同肖最多 2 个号；极寒/预字合计最多 2 个，只进 3 元防守。
-                样本内档位重排，不承诺命中率。
-              </p>
-            </div>
-
-            <!-- 各注金额一览（随机分配下通常不等，如实列出） -->
-            <div class="space-y-1.5">
-              <p class="text-xs text-slate-500">
-                各注金额（共 {{ amounts.length }} 注，合计 {{ stakedTotal }} 元）：
-              </p>
-              <div class="flex flex-wrap gap-2">
-                <span
-                  v-for="pick in result.picks"
-                  :key="pick.number"
-                  class="rounded-lg bg-white/5 px-2.5 py-1 text-sm text-slate-200"
-                >
-                  <span class="num">{{ pad(pick.number) }}</span>
-                  <span
-                    v-if="pickZodiac(pick)"
-                    class="ml-1 text-xs text-nebula-200"
-                  >{{ pickZodiac(pick) }}</span>
-                  <span class="mx-1 text-slate-500">→</span>
-                  <span class="num">{{ pick.amount }} 元</span>
-                </span>
-              </div>
-            </div>
-
-            <!-- 重新随机：只有随机分配模式可用；对应后端 amount_seed（显式重掷） -->
-            <div
-              v-if="mode === 'random'"
-              class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
-            >
-              <p class="text-xs leading-relaxed text-slate-500">
-                同一期不重掷时结果稳定（可复现）；点一下即换一份金额分配，最大投注与最小单位约束不变。
-              </p>
-              <GlassButton
-                variant="glass"
-                size="lg"
-                class="min-h-[44px] w-full shrink-0 sm:w-auto"
-                :loading="pending"
-                :disabled="pending"
-                @click="reroll"
-              >
-                重新随机
-              </GlassButton>
-            </div>
-          </GlassPanel>
-        </MotionReveal>
-
-        <!-- 财富密码 -->
-        <section class="space-y-3">
-          <MotionReveal :index="5" class="space-y-1">
-            <h2 class="text-lg font-medium text-white">财富密码</h2>
-            <p class="text-xs text-slate-500">
-              按 {{ result.mode_label }} 模式生成 {{ result.picks.length }} 注候选号码；口径：{{ scope }}。
-              生肖是「号码 → 生肖」的固定映射（随农历年轮转），不是命中概率，也不代表这注更有可能开出。
-            </p>
-          </MotionReveal>
-
-          <!-- 零注：预算连 1 个注码单位都覆盖不了 → 说明本次不出票，不静默给空列表 -->
-          <MotionReveal v-if="noTicket" :index="5">
-            <p
-              class="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-200"
-              role="status"
-            >
-              <strong class="font-semibold">本次不出票</strong>：{{ noTicketReason }}
-            </p>
-          </MotionReveal>
-
-          <div v-if="!noTicket" class="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-            <MotionReveal
-              v-for="(pick, index) in result.picks"
-              :key="pick.number"
-              :index="index"
-              :stagger="40"
-            >
-              <GlassCard
-                as="article"
-                padding="sm"
-                :selected="pick.role === 'primary'"
-                class="flex h-full flex-col gap-2"
-              >
-                <div class="flex items-center gap-2">
-                  <SpecialBall
-                    :number="pick.number"
-                    size="sm"
-                    :tone="pick.role === 'primary' ? 'aqua' : 'nebula'"
-                    :glow="pick.role === 'primary'"
-                  />
+              <!-- 1档 · 20元 主攻 -->
+              <div v-if="primaryPicks.length" class="relative px-3.5 py-3">
+                <span class="absolute inset-y-0 left-0 w-[3px] bg-gradient-to-b from-amber-300 via-amber-400/60 to-transparent" />
+                <div class="mb-2.5 flex items-center gap-2">
+                  <span class="rounded-md bg-amber-400/15 px-2 py-0.5 text-[10px] font-semibold tracking-wide text-amber-300 ring-1 ring-amber-400/25">
+                    1档 · 主攻
+                  </span>
+                  <span class="num text-[13px] font-bold text-amber-300">¥{{ primaryPicks[0].amount }}</span>
+                  <span class="text-[10px] text-slate-500">× 1 注</span>
+                </div>
+                <div class="flex items-center gap-3">
+                  <SpecialBall :number="primaryPicks[0].number" size="lg" tone="aqua" glow />
                   <div class="min-w-0 flex-1">
-                    <div class="flex items-center justify-between gap-2">
-                      <StatChip :tone="roleTones[pick.role] ?? 'neutral'" size="xs" dot>
-                        {{ pick.role_label }}
-                      </StatChip>
-                      <span class="num text-xs font-medium text-slate-200">{{ pick.amount }} 元</span>
+                    <div class="mb-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px]">
+                      <span class="font-medium text-slate-200">{{ pickZodiac(primaryPicks[0]) || '—' }}</span>
+                      <span class="text-slate-600">|</span>
+                      <span class="text-slate-400">差值 {{ primaryPicks[0].diff }}</span>
+                      <span class="text-slate-600">|</span>
+                      <span class="text-slate-400">{{ primaryPicks[0].wave_label }}</span>
                     </div>
-                    <p class="mt-1 text-[11px] text-slate-400">
-                      生肖 {{ pickZodiac(pick) || '—' }}
+                    <p v-if="primaryPicks[0].reason" class="text-[11px] leading-relaxed text-slate-400">
+                      {{ primaryPicks[0].reason }}
                     </p>
                   </div>
                 </div>
+              </div>
 
-                <div
-                  v-if="pickSoftReasons(pick).length || pick.in_lattice_band || pick.is_price_pivot || pick.reverse_tag_label"
-                  class="flex flex-wrap items-center gap-1"
-                >
-                  <StatChip
-                    v-for="reason in pickSoftReasons(pick)"
-                    :key="`${pick.number}-${reason}`"
-                    :tone="SOFT_REASON_TONES[reason] ?? 'neutral'"
-                    size="xs"
-                    dot
-                  >
-                    {{ SOFT_REASON_LABELS[reason] }}
-                  </StatChip>
-                  <StatChip v-if="pick.in_lattice_band" tone="aqua" size="xs" outline>
-                    预测带内
-                  </StatChip>
-                  <StatChip v-if="pick.is_pivot_support" tone="emerald" size="xs" outline>
-                    支撑
-                  </StatChip>
-                  <StatChip v-if="pick.is_pivot_resistance" tone="bloom" size="xs" outline>
-                    压力
-                  </StatChip>
-                  <StatChip v-if="pick.reverse_tag_label" tone="neutral" size="xs" outline>
-                    {{ pick.reverse_tag_label }}
-                  </StatChip>
+              <!-- 2档 · 10元 中坚 -->
+              <div v-if="secondaryPicks.length" class="relative border-t border-white/[0.06] px-3.5 py-3">
+                <span class="absolute inset-y-0 left-0 w-[3px] bg-gradient-to-b from-sky-300 via-sky-400/60 to-transparent" />
+                <div class="mb-2.5 flex items-center gap-2">
+                  <span class="rounded-md bg-sky-400/15 px-2 py-0.5 text-[10px] font-semibold tracking-wide text-sky-300 ring-1 ring-sky-400/25">
+                    2档 · 中坚
+                  </span>
+                  <span class="num text-[13px] font-bold text-sky-300">¥{{ secondaryPicks[0].amount }}</span>
+                  <span class="text-[10px] text-slate-500">× {{ secondaryPicks.length }} 注</span>
                 </div>
-
-                <dl class="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11px] leading-5">
-                  <div class="flex items-center justify-between gap-1">
-                    <dt class="text-slate-500">差值</dt>
-                    <dd><AnimatedNumber :value="pick.diff" :pad="0" text-class="text-slate-200" /></dd>
-                  </div>
-                  <div class="flex items-center justify-between gap-1">
-                    <dt class="text-slate-500">波动</dt>
-                    <dd class="text-slate-200">{{ pick.wave_label }}</dd>
-                  </div>
-                  <div class="flex items-center justify-between gap-1">
-                    <dt class="text-slate-500">近窗</dt>
-                    <dd class="num text-slate-200">{{ pick.trend_count ?? 0 }} 次</dd>
-                  </div>
-                  <div class="flex items-center justify-between gap-1">
-                    <dt class="text-slate-500">距上次</dt>
-                    <dd :class="pick.avoid_cold_penalized ? 'text-amber-300' : 'text-slate-200'">
-                      {{ avoidColdDaysText(pick.days_since_last) }}
-                    </dd>
-                  </div>
-                  <div class="flex items-center justify-between gap-1">
-                    <dt class="text-slate-500">重号</dt>
-                    <dd :class="pick.is_repeat_number ? 'text-bloom-300' : 'text-emerald-300'">
-                      {{ pick.is_repeat_number ? '是' : '否' }}
-                    </dd>
-                  </div>
-                  <div class="flex items-center justify-between gap-1">
-                    <dt class="text-slate-500">重肖</dt>
-                    <dd :class="pick.is_repeat_zodiac ? 'text-bloom-300' : 'text-emerald-300'">
-                      {{ pick.is_repeat_zodiac ? '是' : '否' }}
-                    </dd>
-                  </div>
-                  <div v-if="pick.is_stale" class="flex items-center justify-between gap-1">
-                    <dt class="text-slate-500">冷号</dt>
-                    <dd class="text-slate-200">{{ periodsSinceLastText(pick.periods_since_last) }}</dd>
-                  </div>
-                  <div v-if="pick.avoid_cold_penalized" class="col-span-2 flex items-center justify-between gap-1">
-                    <dt class="text-slate-500">避冷加权</dt>
-                    <dd class="text-amber-200">{{ avoidColdWeightText(pick.avoid_cold_weight) }}</dd>
-                  </div>
-                </dl>
-
-                <div
-                  v-if="result.trend_distributions"
-                  class="border-t border-white/5 pt-1.5"
-                >
-                  <p class="mb-1 text-[10px] text-slate-500">
-                    走势参考 · {{ pick.wave_label }}
-                  </p>
-                  <p
-                    v-if="!pickTrendRefs(pick).length"
-                    class="text-[11px] text-slate-500"
-                  >
-                    本档同角色暂无可列号码
-                  </p>
+                <div class="grid gap-1.5 sm:grid-cols-2">
                   <div
-                    v-else
-                    class="flex flex-wrap gap-1"
-                    role="list"
-                    :aria-label="`${pick.role_label}走势参考`"
+                    v-for="pick in secondaryPicks"
+                    :key="pick.number"
+                    class="flex items-center gap-2 rounded-xl bg-white/[0.03] px-2 py-1.5 ring-1 ring-white/[0.05]"
                   >
-                    <span
-                      v-for="item in pickTrendRefs(pick).slice(0, 8)"
-                      :key="`${pick.role}-${pick.wave_type}-${item.number}`"
-                      role="listitem"
-                      class="num inline-flex min-h-[22px] items-center rounded-full px-1.5 text-[10px] tabular-nums"
-                      :class="item.number === pick.number
-                        ? 'bg-aqua-400/25 text-aqua-50 ring-1 ring-aqua-300/60'
-                        : 'bg-white/[0.06] text-slate-300 ring-1 ring-white/10'"
-                      :title="`${pad(item.number)} · ${trendCountLabel(item)}`"
-                    >
-                      {{ pad(item.number) }}
-                    </span>
-                    <span
-                      v-if="pickTrendRefs(pick).length > 8"
-                      class="text-[10px] leading-[22px] text-slate-500"
-                    >
-                      +{{ pickTrendRefs(pick).length - 8 }}
-                    </span>
+                    <SpecialBall :number="pick.number" size="sm" tone="nebula" :glow="false" />
+                    <div class="min-w-0 flex-1">
+                      <div class="text-[11px] font-medium text-slate-200">{{ pickZodiac(pick) || '—' }}</div>
+                      <div
+                        v-if="pick.reason"
+                        class="text-[10px] leading-snug text-slate-500 line-clamp-2"
+                        :title="pick.reason"
+                      >
+                        {{ pick.reason }}
+                      </div>
+                    </div>
                   </div>
                 </div>
-              </GlassCard>
-            </MotionReveal>
-          </div>
-        </section>
+              </div>
+
+              <!-- 3档 · 5元 防守 -->
+              <div v-if="defensePicks.length" class="relative border-t border-white/[0.06] px-3.5 py-3">
+                <span class="absolute inset-y-0 left-0 w-[3px] bg-gradient-to-b from-emerald-300 via-emerald-400/60 to-transparent" />
+                <div class="mb-2.5 flex items-center gap-2">
+                  <span class="rounded-md bg-emerald-400/15 px-2 py-0.5 text-[10px] font-semibold tracking-wide text-emerald-300 ring-1 ring-emerald-400/25">
+                    3档 · 防守
+                  </span>
+                  <span class="num text-[13px] font-bold text-emerald-300">¥{{ defensePicks[0].amount }}</span>
+                  <span class="text-[10px] text-slate-500">× {{ defensePicks.length }} 注</span>
+                </div>
+                <div class="grid gap-1.5 sm:grid-cols-3">
+                  <div
+                    v-for="pick in defensePicks"
+                    :key="pick.number"
+                    class="flex items-center gap-2 rounded-xl bg-white/[0.03] px-2 py-1.5 ring-1 ring-white/[0.05]"
+                  >
+                    <SpecialBall :number="pick.number" size="xs" tone="nebula" :glow="false" />
+                    <div class="min-w-0 flex-1">
+                      <div class="text-[11px] font-medium text-slate-200">{{ pickZodiac(pick) || '—' }}</div>
+                      <div
+                        v-if="pick.reason"
+                        class="text-[10px] leading-snug text-slate-500 line-clamp-2"
+                        :title="pick.reason"
+                      >
+                        {{ pick.reason }}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 投注串（合并到底部，直接用后端 copy_text） -->
+            <div
+              v-if="!noTicket && result.copy_text"
+              class="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-white/5 pt-2"
+            >
+              <code
+                class="min-w-0 flex-1 truncate font-mono text-[11px] text-slate-300"
+                :title="result.copy_text"
+              >
+                {{ result.copy_text }}
+              </code>
+              <GlassButton size="sm" variant="primary" @click="copy" class="shrink-0">
+                {{ copied && copiedSource === 'ticket' ? '已复制 ✓' : '复制' }}
+              </GlassButton>
+            </div>
+            <p v-if="copyError && copiedSource === 'ticket'" class="mt-1 text-[10px] text-bloom-300">
+              {{ copyError }}
+            </p>
+            <p v-else-if="copied && copiedSource === 'ticket'" class="mt-1 text-[10px] text-emerald-300">
+              已复制到剪贴板
+            </p>
+          </GlassPanel>
+        </MotionReveal>
 
         <MotionReveal v-if="lattice?.enabled && latticeBand && waveTrendChart.pointCount" :index="6" class="min-w-0">
           <GlassPanel padding="lg" rounded="3xl" class="min-w-0 space-y-3 overflow-hidden">
@@ -2019,132 +1746,6 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   >
                     更早
                   </button>
-                </div>
-                <div
-                  v-if="latestSixZodiacs.length || latestNumberNextDraws.anchor != null"
-                  class="flex flex-wrap items-center justify-end gap-x-1.5 gap-y-1"
-                >
-                  <template v-if="latestSixZodiacs.length">
-                    <span class="text-[11px] text-slate-500">最新 6 肖</span>
-                    <StatChip
-                      v-for="(item, index) in latestSixZodiacs"
-                      :key="`${item.code || item.label}-${item.number}-${item.period}`"
-                      :tone="index === 0 ? 'nebula' : 'neutral'"
-                      size="xs"
-                      :title="`第 ${item.period ?? '—'} 期特码 ${pad(item.number)} → ${item.label}（${item.periodsAgo === 0 ? '最新' : `${item.periodsAgo}期前`}；同肖更早开出不重复计入）`"
-                    >
-                      {{ item.label }}
-                      <span class="num ml-1 opacity-80">{{ pad(item.number) }}</span>
-                    </StatChip>
-                    <span
-                      class="mx-0.5 text-[11px] text-slate-600"
-                      aria-hidden="true"
-                    >·</span>
-                    <span
-                      class="inline-flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-slate-500"
-                      role="status"
-                    >
-                      <span
-                        class="inline-flex items-center gap-1.5"
-                        :title="latestRepeatGaps.numberPair
-                          ? `最近相邻重号：第 ${latestRepeatGaps.numberPair.period ?? '—'} 期连开 ${pad(latestRepeatGaps.numberPair.number)}${latestRepeatGaps.numberPair.label ? `（${latestRepeatGaps.numberPair.label}）` : ''}（${periodsAgoLabel(latestRepeatGaps.numberAgo!)}）`
-                          : '本池已加载样本内没有相邻两期特码相同'"
-                      >
-                        <span>最近重号</span>
-                        <template v-if="latestRepeatGaps.numberPair && latestRepeatGaps.numberAgo != null">
-                          <StatChip tone="bloom" size="xs">
-                            {{ pad(latestRepeatGaps.numberPair.number) }}
-                          </StatChip>
-                          <StatChip
-                            v-if="latestRepeatGaps.numberPair.label"
-                            tone="nebula"
-                            size="xs"
-                          >
-                            {{ latestRepeatGaps.numberPair.label }}
-                          </StatChip>
-                          <span
-                            class="num rounded-md border border-bloom-400/35 bg-bloom-400/10 px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-bloom-200/90"
-                          >
-                            {{ periodsAgoLabel(latestRepeatGaps.numberAgo) }}
-                          </span>
-                        </template>
-                        <span v-else class="text-slate-600">本池无</span>
-                      </span>
-                      <span
-                        class="inline-flex items-center gap-1.5"
-                        :title="latestRepeatGaps.zodiacPair
-                          ? `最近相邻重肖：第 ${latestRepeatGaps.zodiacPair.period ?? '—'} 期 ${pad(latestRepeatGaps.zodiacPair.newer)} 与上一期 ${pad(latestRepeatGaps.zodiacPair.older)} 同肖「${latestRepeatGaps.zodiacPair.label || '同组'}」（${periodsAgoLabel(latestRepeatGaps.zodiacAgo!)}）；按 (号-1)%12 同组判定`
-                          : '本池已加载样本内没有相邻两期不同号但同肖'"
-                      >
-                        <span>最近重肖</span>
-                        <template v-if="latestRepeatGaps.zodiacPair && latestRepeatGaps.zodiacAgo != null">
-                          <StatChip tone="amber" size="xs">
-                            {{ pad(latestRepeatGaps.zodiacPair.newer) }}
-                          </StatChip>
-                          <span class="text-[10px] text-slate-500">/</span>
-                          <StatChip tone="amber" size="xs">
-                            {{ pad(latestRepeatGaps.zodiacPair.older) }}
-                          </StatChip>
-                          <StatChip
-                            v-if="latestRepeatGaps.zodiacPair.label"
-                            tone="nebula"
-                            size="xs"
-                          >
-                            {{ latestRepeatGaps.zodiacPair.label }}
-                          </StatChip>
-                          <span
-                            class="num rounded-md border border-amber-400/35 bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-amber-200/90"
-                          >
-                            {{ periodsAgoLabel(latestRepeatGaps.zodiacAgo) }}
-                          </span>
-                        </template>
-                        <span v-else class="text-slate-600">本池无</span>
-                      </span>
-                    </span>
-                  </template>
-                  <template v-if="latestNumberNextDraws.anchor != null">
-                    <span
-                      v-if="latestSixZodiacs.length"
-                      class="mx-0.5 text-[11px] text-slate-600"
-                      aria-hidden="true"
-                    >·</span>
-                    <span class="text-[11px] text-slate-500">
-                      <span class="num text-slate-300">{{ pad(latestNumberNextDraws.anchor) }}</span>
-                      后曾开
-                      <template v-if="latestNumberNextDraws.successors.length">
-                        · {{ latestNumberNextDraws.successors.length }} 次
-                      </template>
-                    </span>
-                    <span
-                      v-if="latestNumberNextDraws.successors.length"
-                      class="inline-flex flex-wrap items-center justify-end gap-x-3 gap-y-1.5"
-                    >
-                      <span
-                        v-for="(item, index) in latestNumberNextDraws.successors"
-                        :key="`${item.fromPeriod}-${item.toPeriod}-${item.number}-${index}`"
-                        class="inline-flex items-center gap-1.5"
-                        :title="item.fromPeriod != null && item.toPeriod != null
-                          ? `第 ${item.fromPeriod} 期开 ${pad(latestNumberNextDraws.anchor!)} 后，第 ${item.toPeriod} 期开 ${pad(item.number)}（${item.periodsAgo === 0 ? '即最新一期' : `${item.periodsAgo} 期前`}）`
-                          : `下一期曾开 ${pad(item.number)}（${item.periodsAgo === 0 ? '即最新一期' : `${item.periodsAgo} 期前`}）`"
-                      >
-                        <StatChip tone="aqua" size="xs">
-                          {{ pad(item.number) }}
-                        </StatChip>
-                        <span
-                          class="num rounded-md border border-slate-500/35 bg-slate-500/10 px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-slate-400"
-                        >
-                          {{ item.periodsAgo === 0 ? '最新' : `${item.periodsAgo}期前` }}
-                        </span>
-                      </span>
-                    </span>
-                    <span
-                      v-else
-                      class="text-[11px] text-amber-200/90"
-                      role="status"
-                    >
-                      本池此前未开过该号，无下一期样本
-                    </span>
-                  </template>
                 </div>
               </div>
             </div>
@@ -2408,63 +2009,6 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                 </div>
               </div>
             </div>
-          </GlassPanel>
-        </MotionReveal>
-
-        <!-- 复制投注串：随热力格勾选重排号码与档位金额 -->
-        <MotionReveal :index="9">
-          <GlassPanel padding="lg" rounded="3xl" class="space-y-3">
-            <div class="flex flex-wrap items-center justify-between gap-2">
-              <div class="space-y-1">
-                <h2 class="text-lg font-medium text-white">投注串</h2>
-                <p class="text-xs leading-relaxed text-slate-500">
-                  按上方热力格勾选重排；档位：
-                  <template v-if="stakeTop === 10">2 个 10 元、3 个 5 元，其余 3 元</template>
-                  <template v-else>尖刀 {{ stakeTop }}（1～2）→10 元（≤3）→5 元（≤5）→其余 3 元</template>
-                  ；红色（带外预测）一律 3 元。已选 {{ latticeSelectedCount }} 注
-                  <template v-if="selectionTicketTotal"> · 合计 {{ selectionTicketTotal }} 元</template>。
-                </p>
-              </div>
-              <StatChip tone="neutral" size="sm">复制到剪贴板</StatChip>
-            </div>
-
-            <div class="relative">
-              <GlassButton
-                variant="primary"
-                size="lg"
-                block
-                class="min-h-[48px]"
-                :disabled="!displayCopyText"
-                @click="copy"
-              >
-                {{ copied && copiedSource === 'ticket' ? '已复制 ✓' : '一键复制投注串' }}
-              </GlassButton>
-              <PulseRing :trigger="copyHit.key" tone="aqua" :rings="2" />
-            </div>
-
-            <p
-              v-if="displayCopyText"
-              class="whitespace-pre-line break-all text-left font-mono text-sm text-slate-300"
-            >
-              {{ displayCopyText }}
-            </p>
-            <p v-else class="text-left text-sm text-slate-500">
-              请先在「01–49 出现热度」勾选号码
-            </p>
-            <p
-              v-if="copyError && copiedSource === 'ticket'"
-              class="text-center text-xs text-bloom-300"
-              role="alert"
-            >
-              {{ copyError }}
-            </p>
-            <p
-              v-else-if="copied && copiedSource === 'ticket'"
-              class="text-center text-xs text-emerald-300"
-              role="status"
-            >
-              已复制到剪贴板
-            </p>
           </GlassPanel>
         </MotionReveal>
 

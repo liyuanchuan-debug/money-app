@@ -16,7 +16,7 @@ const props = withDefaults(
     /** 号码（1-49），null / undefined 显示占位符 */
     number?: number | string | null
     /** 尺寸档位 */
-    size?: 'sm' | 'md' | 'lg' | 'xl'
+    size?: 'xs' | 'sm' | 'md' | 'lg' | 'xl'
     /** 滚动 / 生成中状态 */
     rolling?: boolean
     /** 色调（影响外发光颜色） */
@@ -40,6 +40,7 @@ const props = withDefaults(
 )
 
 const SIZE: Record<string, string> = {
+  xs: 'h-8 w-8 text-xs',
   sm: 'h-9 w-9 text-sm',
   md: 'h-12 w-12 text-lg',
   lg: 'h-16 w-16 text-2xl',

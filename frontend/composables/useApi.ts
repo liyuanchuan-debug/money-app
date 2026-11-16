@@ -166,6 +166,8 @@ export interface Pick {
   role: 'primary' | 'secondary' | 'defense'
   role_label: string
   amount: number
+  /** AI 给这一注的推荐理由（可选） */
+  reason?: string
   is_repeat_zodiac: boolean
   /** 上期出过的号（重号）：不避开、只降权，命中时前端标「重号」 */
   is_repeat_number?: boolean
@@ -266,6 +268,23 @@ export interface RecommendResult {
   reason_message?: string | null
   /** 换批序号：0=首屏默认样本；点生成后累加 */
   pick_seed?: number
+  /** AI 盘面判定（顺热期/极寒期/能量透支变盘期） */
+  market_judgment?: string
+  /** AI 逆向逻辑简述（一句话说明主攻为什么选这个） */
+  logic_brief?: string
+  /** AI 生成实际尝试次数（含铁律校验重试） */
+  ai_attempts?: number
+  /** AI 生成过程中被铁律校验拦截的违规记录（如有） */
+  ai_violations?: string[]
+  /** 最新 6 肖（最近 6 期开奖去重后的生肖种群，AI 输入数据） */
+  zodiac_6_recent?: Array<{
+    animal: string
+    code: string
+    numbers: number[]
+    trigger_number?: number
+  }>
+  /** 极寒号（>80天未出现的号码 + 遗漏天数，AI 输入数据） */
+  extreme_cold?: Array<{ number: number; days: number }>
   latest: number
   latest_zodiac: number[]
   /**

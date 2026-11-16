@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 from collections.abc import AsyncGenerator
@@ -31,15 +32,28 @@ async def init_pool() -> asyncpg.Pool | None:
         raise RuntimeError("数据库连接池不可用（退避中，稍后自动重试）")
 
     try:
-        _pool = await asyncpg.create_pool(
-            dsn=url,
-            min_size=1,
-            max_size=5,
-            # Supabase 的 Supavisor 在 transaction 模式（:6543）下不保证连接复用，
-            # asyncpg 默认的 prepared statement 缓存会在并发时撞上「已存在」错误；
-            # 关掉缓存即可，这个设置同时兼容 session 模式（:5432）。
-            statement_cache_size=0,
-        )
+        # Supabase pooler 的域名解析偶发失败（getaddrinfo failed），
+        # 启动时重试几次即可连上，避免直接退化为内存存储。
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                _pool = await asyncpg.create_pool(
+                    dsn=url,
+                    min_size=1,
+                    max_size=5,
+                    # Supabase 的 Supavisor 在 transaction 模式（:6543）下不保证连接复用，
+                    # asyncpg 默认的 prepared statement 缓存会在并发时撞上「已存在」错误；
+                    # 关掉缓存即可，这个设置同时兼容 session 模式（:5432）。
+                    statement_cache_size=0,
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                _pool = None
+                if attempt < 2:
+                    await asyncio.sleep(1.5)
+        if _pool is None:
+            raise last_exc  # type: ignore[misc]
     except Exception:
         _pool_failed_at = now
         _pool = None

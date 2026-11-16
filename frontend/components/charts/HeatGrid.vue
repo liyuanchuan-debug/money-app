@@ -371,31 +371,7 @@ const gridLabel = computed(
             :stroke="cellStroke(cell)"
             :stroke-width="cellStrokeWidth(cell)"
           />
-          <!-- 本期预测：右上角「预」角标（与最新一期 aqua 整圈高亮可同时存在） -->
-          <g v-if="cell.isMarked">
-            <rect
-              :x="cell.x + cellSize - typeScale.badgeW"
-              :y="cell.y"
-              :width="typeScale.badgeW"
-              :height="typeScale.badgeH"
-              rx="4"
-              fill="rgba(52, 211, 153, 0.94)"
-              stroke="rgba(6, 18, 28, 0.38)"
-              stroke-width="0.85"
-            />
-            <text
-              :x="cell.x + cellSize - typeScale.badgeW / 2"
-              :y="cell.y + typeScale.badgeH / 2"
-              text-anchor="middle"
-              dominant-baseline="middle"
-              :font-family="FONT_STACK"
-              font-weight="700"
-              :font-size="typeScale.badgeFont"
-              fill="rgba(6, 18, 28, 0.92)"
-            >
-              预
-            </text>
-          </g>
+
           <!-- 顶部内高光：琉璃格 -->
           <rect
             :x="cell.x + 2"
