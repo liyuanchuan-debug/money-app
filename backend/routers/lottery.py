@@ -584,6 +584,12 @@ async def post_recommend(
         "距5天最近优先（连庄特权）" if lianzhuang else "距25天最近优先"
     )
 
+    # --- 深水号统计（补丁2：同肖深水防雷） ---
+    deep_water = {n: d for n, d in missing_days.items() if d > 50}
+    deep_mid = [n for n, d in deep_water.items() if d <= 80]  # 50-80 天非极寒深水
+    streak_stats["深水号个数（遗漏>50天）"] = len(deep_water)
+    streak_stats["深水号清单（50-80天）"] = sorted(deep_mid)
+
     # --- 调 DeepSeek（含铁律硬校验 + 违规重试） ---
     try:
         ai_result = await call_deepseek(
@@ -786,7 +792,10 @@ async def post_recommend(
             _z_members.setdefault(_zq, []).append(_q["number"])
 
     def _sibling_desc(num: int, z: str) -> str:
-        """若同档位里有同肖的另一注，返回双保险说明；否则空串。"""
+        """若同档位里有同肖的另一注，返回双保险说明；否则空串。
+
+        深水防雷：当前号遗漏>50天时标注深水位，否则普通温位。
+        """
         others = [x for x in _z_members.get(z, []) if x != num]
         if not others or not z:
             return ""
@@ -794,6 +803,9 @@ async def post_recommend(
         _ref_role = {"primary": "主攻", "secondary": "次选", "defense": "防守"}.get(
             _role_by_num.get(ref, ""), "另一注"
         )
+        _my_days = missing_days.get(num, 0)
+        if _my_days > 50:
+            return f"深水双保险·与{_ref_role}{ref:02d}同属{z}（本注深水防雷）"
         return f"同肖双保险·与{_ref_role}{ref:02d}同属{z}"
 
     for _i, _p in enumerate(picks_out[1:], start=1):
@@ -819,7 +831,13 @@ async def post_recommend(
                 f"防回马枪·上期开{int(latest):02d}({_z})，从{_z}窝取号防同肖回马（遗漏{_days}天）"
             )
         elif _side:
-            _p["reason"] = f"{_side}（遗漏{_days}天·{_gap_txt}），该生肖连爆可中双份"
+            if "深水双保险" in _side:
+                _p["reason"] = (
+                    f"{_side}（遗漏{_days}天，>50天深水区），"
+                    f"庄家避开温号挖深水时仍可中双份"
+                )
+            else:
+                _p["reason"] = f"{_side}（遗漏{_days}天·{_gap_txt}），该生肖连爆可中双份"
         elif _role == "secondary":
             _p["reason"] = f"{_z6_txt}浅温号·遗漏{_days}天（{_gap_txt}），为主攻打掩护"
         else:

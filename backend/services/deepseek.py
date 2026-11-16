@@ -61,6 +61,7 @@ Step 5：按 "★ 唯一解排序基准" 排序（默认距 25 天最近优先�
 3. 【同肖去重】：任何生肖在三档中出现的总次数，绝对不能超过 2 个。
 4. 【极寒排雷】：遗漏超过 80 天的极寒号，绝对不准进入 1档（20元）和 2档（10元），只能放 3档（5元）防守。
 5. 【防回马枪】：6 注里必须至少有 1 注与"上期开奖生肖"同肖（但绝不能是上期原号本身）。缺了直接判违规退回重做。
+6. 【同肖深水防雷】：同一生肖选 2 注时，第 1 注按距 25 天基准取温号，第 2 注必须从该生肖遗漏>50 天的深水号里挑；绝对禁止两注都落在 20-40 天浅温区（防庄家避开温号挖深水）。若主攻生肖存在深水号（遗漏 50-70 天），第 2 注必须优先启用它。
 
 # 二、核心定盘法则（按优先级判断当前盘面，必须严格按后端提供的布尔触发条件判断，不要再自己推导或编造任何数字！！！）
 # 绝对禁止在"逆向逻辑简述"中编造任何具体数字（如"连开10期""5次命中"等），只能引用后端已提供的布尔结果和生肖序列事实。
@@ -241,6 +242,22 @@ def _build_user_prompt(
         lines.append("  " + ", ".join(f"{n}:{d}" for n, d in pairs))
     else:
         lines.append("  （无数据）")
+
+    # 深水号清单（同肖深水防雷专用，补丁2）
+    lines.append("")
+    lines.append("=== 深水号清单（遗漏>50天，同肖深水防雷专用） ===")
+    if missing_days:
+        deep_pairs = sorted((n, d) for n, d in missing_days.items() if d > 50)
+        if deep_pairs:
+            lines.append("  " + ", ".join(f"{n}:{d}" for n, d in deep_pairs))
+        else:
+            lines.append("  （本期无深水号）")
+    else:
+        lines.append("  （无数据）")
+    lines.append(
+        "  规则【同肖深水防雷】：同一生肖选 2 注时，第 2 注必须从该生肖深水号（遗漏>50天）里挑，"
+        "绝对禁止两注都在 20-40 天浅温区。主攻生肖若有深水号（50-70天），第 2 注优先启用。"
+    )
 
     lines.append("")
     lines.append("=== 号码池（全部 49 个可用号，不用管预字） ===")
@@ -717,6 +734,80 @@ def _parse_and_validate(
                     f"缺少防回马枪号：6 注中至少有 1 注必须是上期生肖「{last_zodiac}」"
                     f"的同肖号（不能是上期原号 {latest_number}）"
                 )
+
+    # 6.2 同肖深水防雷（补丁1）：同肖 2 注时，第 2 注必须遗漏>50 天
+    # 自动修复优先：从该生肖深水号（>50天）替换；无深水号才拆双肖；
+    # 若 fix 号是防回马枪唯一来源则保留（回马枪优先于深水）。
+    if zodiac_map:
+        last_zodiac_dw = zodiac_map.get(int(latest_number), "")
+        for _ in range(3):  # 最多修 3 轮（替换可能引入新双肖）
+            zc_dw = Counter(zodiac_map.get(n, "") for n in all_nums if zodiac_map.get(n))
+            dup_zodiacs = [z for z, c in zc_dw.items() if c >= 2]
+            fixed_any = False
+            for dz in dup_zodiacs:
+                members = sorted(
+                    [n for n in all_nums if zodiac_map.get(n) == dz],
+                    key=lambda n: (abs(missing_days.get(n, 999) - sort_base), n),
+                )
+                if len(members) < 2:
+                    continue
+                keep_n, fix_n = members[0], members[1]
+                if missing_days.get(fix_n, 0) > 50:
+                    continue  # 已合规（一温一深）
+                # fix 号是回马枪唯一来源 → 保留，回马枪优先
+                if dz == last_zodiac_dw and not any(
+                    zodiac_map.get(x, "") == last_zodiac_dw
+                    for x in all_nums
+                    if x != fix_n
+                ):
+                    continue
+                slot_of_fix = (
+                    "primary"
+                    if fix_n == final_primary
+                    else "secondary" if fix_n in final_secondary else "defense"
+                )
+                # 深水候选：同生肖、>50天、未占用、非上期原号、通过该档位铁律
+                deep_cands = [
+                    n for n in sorted_pool
+                    if zodiac_map.get(n, "") == dz
+                    and n not in all_nums
+                    and n != latest_number
+                    and missing_days.get(n, 0) > 50
+                    and not _check_violations(n, slot_of_fix)
+                ]
+                # 优先 50-80 天（非极寒，任何档可放）；极寒>80 只能进 3 档
+                deep_mid = [n for n in deep_cands if missing_days.get(n, 0) <= 80]
+                chosen: int | None = None
+                for cand in (deep_mid or deep_cands):
+                    if cand in extreme_cold_numbers and slot_of_fix != "defense":
+                        continue
+                    chosen = cand
+                    break
+                if chosen is None:
+                    # 该生肖无深水号 → 拆双肖：换成其他生肖合法号（优先计数=0 的生肖）
+                    alt_cands = [
+                        n for n in sorted_pool
+                        if zodiac_map.get(n, "") != dz
+                        and n not in all_nums
+                        and n != latest_number
+                        and not _check_violations(n, slot_of_fix)
+                    ]
+                    zero_first = [
+                        n for n in alt_cands if zc_dw.get(zodiac_map.get(n, ""), 0) == 0
+                    ]
+                    alt = zero_first or alt_cands
+                    chosen = alt[0] if alt else None
+                if chosen is not None and chosen != fix_n:
+                    if slot_of_fix == "primary":
+                        final_primary = chosen
+                    elif slot_of_fix == "secondary":
+                        final_secondary[final_secondary.index(fix_n)] = chosen
+                    else:
+                        final_defense[final_defense.index(fix_n)] = chosen
+                    all_nums = [final_primary, *final_secondary, *final_defense]
+                    fixed_any = True
+            if not fixed_any:
+                break
 
     if len(set(all_nums)) != 6:
         raise ValueError(f"号码重复：{all_nums}")
