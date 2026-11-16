@@ -62,6 +62,9 @@ Step 5：按 "★ 唯一解排序基准" 排序（默认距 25 天最近优先�
 4. 【极寒排雷】：遗漏超过 80 天的极寒号，绝对不准进入 1档（20元）和 2档（10元），只能放 3档（5元）防守。
 5. 【防回马枪】：6 注里必须至少有 1 注与"上期开奖生肖"同肖（但绝不能是上期原号本身）。缺了直接判违规退回重做。
 6. 【同肖深水防雷】：同一生肖选 2 注时，第 1 注按距 25 天基准取温号，第 2 注必须从该生肖遗漏>50 天的深水号里挑；绝对禁止两注都落在 20-40 天浅温区（防庄家避开温号挖深水）。若主攻生肖存在深水号（遗漏 50-70 天），第 2 注必须优先启用它。
+7. 【极寒防守】：若连续两期开出的号（按其开出时的遗漏算）都不在 20-50 天温区，3 档必须塞入 1 个当前最冷的极寒号（遗漏>80天），防庄家极寒作妖。
+8. 【极热防守】：若处于顺热期，3 档必须塞入 1 个遗漏 1-7 天的明牌极热号（不能是上期原号），防热号继续连庄。
+9. 【放弃中庸】：若近 3 期开出的号遗漏全部处于极端（>80天 或 <8天），严禁继续以"距25天最近"作为唯一排序标准；1 档主攻必须抓两极号——遗漏 10-15 天，或 60 天以上。
 
 # 二、核心定盘法则（按优先级判断当前盘面，必须严格按后端提供的布尔触发条件判断，不要再自己推导或编造任何数字！！！）
 # 绝对禁止在"逆向逻辑简述"中编造任何具体数字（如"连开10期""5次命中"等），只能引用后端已提供的布尔结果和生肖序列事实。
@@ -157,6 +160,16 @@ def _build_user_prompt(
         lines.append(f"    - 6肖外是否有生肖连开≥2期：{streak_stats.get('6肖外是否有生肖连开≥2期', '?')}")
         lines.append(f"  ★ 主攻阵营要求（1档必须遵守）：{streak_stats.get('主攻阵营要求', '?')}")
         lines.append(f"  ★ 唯一解排序基准：{streak_stats.get('唯一解排序基准', '?')}")
+        lines.append(
+            f"  【极寒防守】是否触发：{streak_stats.get('极寒防守是否触发', '?')}"
+            f"（连续未出温号期数：{streak_stats.get('连续未出温号期数', '?')}，"
+            f"最冷极寒号：{streak_stats.get('最冷极寒号', '?')}）"
+        )
+        lines.append(
+            f"  【极热防守】是否触发：{streak_stats.get('极热防守是否触发', '?')}"
+            f"（极热防守号：{streak_stats.get('极热防守号', '?')}）"
+        )
+        lines.append(f"  【放弃中庸】是否触发：{streak_stats.get('放弃中庸是否触发', '?')}")
         lines.append(f"  近5期最新6肖命中数：{streak_stats.get('近5期最新6肖命中数', '?')}")
     else:
         lines.append("  （无数据）")
@@ -289,6 +302,9 @@ async def call_deepseek(
     primary_camp: str | None = None,  # 主攻阵营（变盘时与大盘相反），None=跟大盘
     sort_base: int = 25,  # 唯一解排序基准（连庄特权期=5，其余=25）
     primary_zodiac_required: str | None = None,  # 连庄特权：主攻必须同该生肖
+    cold_defense_num: int | None = None,  # 极寒防守：3档强制塞入的最冷极寒号
+    hot_defense_num: int | None = None,  # 极热防守：3档强制塞入的极热号(1-7天)
+    polar_mode: bool = False,  # 放弃中庸：主攻只抓两极号(10-15天 / 60天以上)
 ) -> dict[str, Any]:
     """调用 DeepSeek API，返回通过铁律校验的 picks 列表。
 
@@ -437,6 +453,9 @@ async def call_deepseek(
                     primary_camp=primary_camp,
                     sort_base=sort_base,
                     primary_zodiac_required=primary_zodiac_required,
+                    cold_defense_num=cold_defense_num,
+                    hot_defense_num=hot_defense_num,
+                    polar_mode=polar_mode,
                 )
                 return {
                     "picks": picks,
@@ -476,6 +495,9 @@ def _parse_and_validate(
     primary_camp: str | None = None,  # 主攻阵营（变盘时与大盘相反），None=跟大盘
     sort_base: int = 25,  # 唯一解排序基准（连庄特权期=5，其余=25）
     primary_zodiac_required: str | None = None,  # 连庄特权：主攻必须同该生肖
+    cold_defense_num: int | None = None,  # 极寒防守：3档强制塞入的最冷极寒号
+    hot_defense_num: int | None = None,  # 极热防守：3档强制塞入的极热号(1-7天)
+    polar_mode: bool = False,  # 放弃中庸：主攻只抓两极号(10-15天 / 60天以上)
 ) -> list[dict]:
     """解析 AI 输出 → 代码硬排序 → 档位分配 → 铁律校验。
 
@@ -545,8 +567,15 @@ def _parse_and_validate(
     # --- 3. 唯一解排序（两种场景都需要，用于修正违规 / fallback 候选池）---
     # 排序基准：顺热特权时主攻优先 |d-5|，其余优先 |d-25|
     # 但代码侧统一用 |d-25| 做主排序，顺热特权的"选上期生肖"由 AI 负责
-    def _sort_key(n: int) -> tuple[int, int]:
+    def _sort_key(n: int) -> tuple:
         d = missing_days.get(n, 999)
+        if polar_mode:
+            # 放弃中庸：两极优先（10-15天 在前，其次 60天以上），中间区靠后兜底
+            if 10 <= d <= 15:
+                return (0, abs(d - 12), n)
+            if d >= 60:
+                return (1, -d, n)
+            return (2, abs(d - 25), n)
         return (abs(d - sort_base), n)
 
     # 候选池来源：AI 完整输出时用全部 49 号做修正池；否则用 AI 候选池
@@ -595,7 +624,7 @@ def _parse_and_validate(
     # 主攻阵营：变盘时（杀热切冷/杀冷切热）与大盘相反，2/3 档始终跟大盘
     primary_camp_eff = primary_camp if primary_camp in ("heat", "cold") else camp_direction
 
-    def _check_violations(n: int, slot: str) -> list[str]:
+    def _check_violations(n: int, slot: str, ignore_camp: bool = False) -> list[str]:
         v: list[str] = []
         if slot in ("primary", "secondary") and n in extreme_cold_numbers:
             v.append("极寒号禁1/2档")
@@ -605,7 +634,7 @@ def _parse_and_validate(
             if n in recent_cold_break:
                 v.append("刚破冷号禁主攻")
         # 阵营绝对过滤：1 档按主攻阵营（可能变盘反向），2/3 档按大盘阵营
-        if z6_set:
+        if z6_set and not ignore_camp:
             n_zodiac = zodiac_map.get(n, "")
             in_z6 = n_zodiac in z6_set
             camp_eff = primary_camp_eff if slot == "primary" else camp_direction
@@ -618,6 +647,11 @@ def _parse_and_validate(
         if slot == "primary" and primary_zodiac_required:
             if zodiac_map.get(n, "") != primary_zodiac_required:
                 v.append(f"连庄特权：主攻必须与上期生肖「{primary_zodiac_required}」同肖，{n} 不符")
+        # 放弃中庸：主攻只抓两极号（10-15天 或 60天以上）
+        if slot == "primary" and polar_mode:
+            _d = missing_days.get(n, 999)
+            if not (10 <= _d <= 15 or _d >= 60):
+                v.append(f"放弃中庸：主攻必须是两极号（10-15天/60天以上），{n}遗漏{_d}天不符")
         return v
 
     # 连庄特权降级：若该生肖没有任何合法号，放弃"必须同肖"限制，避免分配失败
@@ -630,6 +664,15 @@ def _parse_and_validate(
         )
         if not _has_ok:
             primary_zodiac_required = None
+
+    # 放弃中庸降级：若没有合法两极号能进主攻（极寒>80 禁1档），关闭两极模式
+    if polar_mode:
+        _polar_ok = any(
+            n != latest_number and not _check_violations(n, "primary")
+            for n in range(1, 50)
+        )
+        if not _polar_ok:
+            polar_mode = False
 
     def _zodiac_ok(nums: list[int], new_n: int) -> bool:
         if not zodiac_map:
@@ -809,6 +852,45 @@ def _parse_and_validate(
             if not fixed_any:
                 break
 
+    # 6.3 两极极端防守：极寒防守 / 极热防守 强制塞入 3 档
+    # 优先级：防回马枪 > 极寒防守 > 极热防守 > 深水防雷
+    _forced: set[int] = set()  # 已塞入的强制位，后续强制不得挤掉
+
+    def _force_defense(n: int | None) -> bool:
+        """把 n 强制塞进 3 档；找不到可替换位则放弃。"""
+        if n is None or n in all_nums or n == latest_number:
+            return False
+        # 极寒防守属极端对冲位，豁免阵营限制（否则顺热期永远塞不进去）
+        if _check_violations(n, "defense", ignore_camp=(n == cold_defense_num)):
+            return False
+        last_z = zodiac_map.get(int(latest_number), "") if zodiac_map else ""
+        for idx in range(len(final_defense) - 1, -1, -1):
+            if final_defense[idx] in _forced:
+                continue  # 保护已塞入的强制位
+            trial = [
+                final_primary,
+                *final_secondary,
+                *(final_defense[:idx] + [n] + final_defense[idx + 1:]),
+            ]
+            if len(set(trial)) != 6:
+                continue
+            if zodiac_map:
+                _cnt = Counter(zodiac_map.get(x, "") for x in trial if zodiac_map.get(x))
+                if any(c > 2 for c in _cnt.values()):
+                    continue
+                if last_z and not any(zodiac_map.get(x, "") == last_z for x in trial):
+                    continue
+            final_defense[idx] = n
+            all_nums[:] = trial
+            _forced.add(n)
+            return True
+        return False
+
+    if cold_defense_num is not None:
+        _force_defense(cold_defense_num)
+    if hot_defense_num is not None:
+        _force_defense(hot_defense_num)
+
     if len(set(all_nums)) != 6:
         raise ValueError(f"号码重复：{all_nums}")
     if zodiac_map:
@@ -823,8 +905,11 @@ def _parse_and_validate(
     if final_primary in recent_cold_break:
         raise ValueError(f"刚破冷号 {final_primary} 溜进主攻")
     # 阵营最终校验：1 档按主攻阵营（变盘时反向），2/3 档按大盘阵营
+    # 强制防守位（极寒防守）豁免阵营 —— 它是极端对冲位，不受大盘方向约束
     if z6_set and zodiac_map:
         for idx, num in enumerate(all_nums):
+            if num in _forced:
+                continue
             nz = zodiac_map.get(num, "")
             in_z6 = nz in z6_set
             camp_eff = primary_camp_eff if idx == 0 else camp_direction

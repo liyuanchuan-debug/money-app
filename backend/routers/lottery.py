@@ -408,7 +408,9 @@ async def post_recommend(
     extreme_cold_numbers = {int(item["number"]) for item in extreme_cold}
 
     # 刚破冷号集合：最近 3 期内开出、且距上次开出 >80 天的号（极易回冷，禁主攻）
+    # 同时算出每期"开出时的遗漏天数"，供两极防守判定用
     recent_cold_break: set[int] = set()
+    recent_gap_days: list[int | None] = []  # 近6期开出时遗漏天数（新→旧），None=从未开出
     if draws:
         ordered: list[tuple[int, date_cls]] = []
         for d in draws:
@@ -419,14 +421,20 @@ async def post_recommend(
                 (int(d["special_number"]),
                  dd if isinstance(dd, date_cls) else date_cls.fromisoformat(str(dd)))
             )
+        # 旧→新遍历，才能拿到"该期开出时距上一次开出"的真实间隔
+        gaps: dict[int, int | None] = {}
         last_seen_before: dict[int, date_cls] = {}
-        for i, (num, dt) in enumerate(ordered):
-            if i < 3:
-                prior = last_seen_before.get(num)
-                if prior is not None and (dt - prior).days > COLD_THRESHOLD_DAYS:
-                    recent_cold_break.add(num)
-            if num not in last_seen_before:
-                last_seen_before[num] = dt
+        for i in range(len(ordered) - 1, -1, -1):
+            num, dt = ordered[i]
+            prior = last_seen_before.get(num)
+            gaps[i] = (dt - prior).days if prior is not None else None
+            last_seen_before[num] = dt
+        for i in range(min(3, len(ordered))):
+            num, _dt = ordered[i]
+            g = gaps.get(i)
+            if g is not None and g > COLD_THRESHOLD_DAYS:
+                recent_cold_break.add(num)
+        recent_gap_days = [gaps.get(i) for i in range(min(6, len(ordered)))]
 
     # --- 盘面统计指标（后端算好传给 AI，避免 AI 自己推导出错）---
     # 核心改进：直接算好定盘法则的布尔触发条件，AI 只需要读"是/否"
@@ -590,6 +598,60 @@ async def post_recommend(
     streak_stats["深水号个数（遗漏>50天）"] = len(deep_water)
     streak_stats["深水号清单（50-80天）"] = sorted(deep_mid)
 
+    # --- 两极极端防守统计（极寒防守 / 极热防守 / 放弃中庸） ---
+    def _is_warm_gap(g: int | None) -> bool:
+        """开出时遗漏在 20-50 天视为温号。None=从未开出，按非温号算。"""
+        return g is not None and 20 <= g <= 50
+
+    warm_miss_streak = 0
+    for g in recent_gap_days:
+        if _is_warm_gap(g):
+            break
+        warm_miss_streak += 1
+    cold_defense_hit = warm_miss_streak >= 2  # 连续两期未出温号
+    cold_defense_num = (
+        max(extreme_cold_numbers, key=lambda n: missing_days.get(n, 0))
+        if (cold_defense_hit and extreme_cold_numbers)
+        else None
+    )
+
+    # 极热防守：顺热期塞 1 个遗漏 1-7 天、属 6 肖阵营的号（排除上期原号）
+    hot_defense_num: int | None = None
+    if camp_direction == "heat":
+        _hot_cands = [
+            n for n in range(1, 50)
+            if n != int(latest)
+            and 1 <= missing_days.get(n, 999) <= 7
+            and (not z6_set or zodiac_map.get(n, "") in z6_set)
+        ]
+        _hot_cands.sort(key=lambda n: (abs(missing_days.get(n, 0) - 4), n))
+        hot_defense_num = _hot_cands[0] if _hot_cands else None
+
+    # 放弃中庸：近 3 期开出时的遗漏全部处于极端（>80 或 <8）
+    def _is_extreme_gap(g: int | None) -> bool:
+        return g is None or g > COLD_THRESHOLD_DAYS or g < 8
+
+    polar_mode = (
+        len(recent_gap_days) >= 3
+        and all(_is_extreme_gap(g) for g in recent_gap_days[:3])
+    )
+    if polar_mode:
+        # 两极池必须实际可用（10-15 天，或 60-80 天非极寒），否则降级
+        _polar_available = any(
+            (10 <= missing_days.get(n, 0) <= 15)
+            or (60 <= missing_days.get(n, 0) <= COLD_THRESHOLD_DAYS)
+            for n in range(1, 50)
+            if n != int(latest)
+        )
+        polar_mode = _polar_available
+
+    streak_stats["连续未出温号期数"] = warm_miss_streak
+    streak_stats["极寒防守是否触发"] = "是" if cold_defense_hit else "否"
+    streak_stats["最冷极寒号"] = cold_defense_num
+    streak_stats["极热防守是否触发"] = "是" if hot_defense_num is not None else "否"
+    streak_stats["极热防守号"] = hot_defense_num
+    streak_stats["放弃中庸是否触发"] = "是" if polar_mode else "否"
+
     # --- 调 DeepSeek（含铁律硬校验 + 违规重试） ---
     try:
         ai_result = await call_deepseek(
@@ -611,6 +673,9 @@ async def post_recommend(
             primary_camp=primary_camp,
             sort_base=sort_base,
             primary_zodiac_required=primary_zodiac_required,
+            cold_defense_num=cold_defense_num,
+            hot_defense_num=hot_defense_num,
+            polar_mode=polar_mode,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -748,7 +813,12 @@ async def post_recommend(
     _pg = f"遗漏{primary_days}天·{_gap_desc(primary_days)}"
     _base_txt = "距5天基准" if lianzhuang else "距25天基准"
     _reversed = primary_camp is not None and primary_camp != camp_direction
-    if lianzhuang:
+    if polar_mode:
+        _p_reason = (
+            f"放弃中庸·近3期全走极端，主攻抓两极号（{_pg}），"
+            f"不按距25天中庸排序，主攻成立"
+        )
+    elif lianzhuang:
         _p_reason = (
             f"顺热连庄特权·上期生肖{last_zodiac_name}·主攻取近期极热同肖（遗漏{primary_days}天），"
             f"唯一解按{_base_txt}排序，主攻成立"
@@ -820,7 +890,16 @@ async def post_recommend(
         _z6_txt = "最新6肖" if _in_z6 else "非6肖"
         _gap_txt = _gap_desc(_days)
 
-        if _is_cold:
+        if _n == cold_defense_num:
+            _p["reason"] = (
+                f"极寒防守·连续{warm_miss_streak}期未出温号，"
+                f"塞最冷极寒号（遗漏{_days}天）防庄家极寒作妖"
+            )
+        elif _n == hot_defense_num:
+            _p["reason"] = (
+                f"极热防守·顺热期塞遗漏{_days}天明牌极热号，防热号继续连庄"
+            )
+        elif _is_cold:
             _p["reason"] = (
                 f"极寒兜底·遗漏{_days}天（超80天），只配5元防爆冷"
                 if _role == "defense"
