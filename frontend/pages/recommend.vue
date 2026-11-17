@@ -1551,6 +1551,23 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
             <p v-if="result.logic_brief" class="mb-1.5 text-[11px] leading-relaxed text-slate-400">
               {{ result.logic_brief }}
             </p>
+
+            <!-- 同肖优选对比（后端代码生成，非 AI 编造） -->
+            <div
+              v-if="result.same_zodiac_comparison?.length"
+              class="mb-2 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2"
+            >
+              <p class="mb-1 text-[10px] font-semibold tracking-wide text-slate-400">同肖优选对比</p>
+              <ul class="space-y-0.5">
+                <li
+                  v-for="(line, i) in result.same_zodiac_comparison"
+                  :key="i"
+                  class="text-[10px] leading-relaxed text-slate-400"
+                >
+                  · {{ line }}
+                </li>
+              </ul>
+            </div>
             <p
               v-if="result.ai_violations?.length"
               class="mb-1.5 text-[10px] leading-relaxed text-amber-300/80"

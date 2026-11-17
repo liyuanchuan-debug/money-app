@@ -272,6 +272,8 @@ export interface RecommendResult {
   market_judgment?: string
   /** AI 逆向逻辑简述（一句话说明主攻为什么选这个） */
   logic_brief?: string
+  /** 同肖优选对比（同肖出现 2 注时，后端逐条解释落选/入选原因） */
+  same_zodiac_comparison?: string[]
   /** AI 生成实际尝试次数（含铁律校验重试） */
   ai_attempts?: number
   /** AI 生成过程中被铁律校验拦截的违规记录（如有） */

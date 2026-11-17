@@ -922,6 +922,52 @@ async def post_recommend(
         else:
             _p["reason"] = f"{_z6_txt}中温号·遗漏{_days}天，防守补位"
 
+    # --- 同肖优选对比（同肖双选强制解释，代码生成，防 AI 瞎编）---
+    same_zodiac_comparison: list[str] = []
+    for _z, _sel in _z_members.items():
+        if len(_sel) < 2:
+            continue
+        _sel_sorted = sorted(
+            _sel, key=lambda n: (abs(missing_days.get(n, 999) - 25), n)
+        )
+        _a, _b = _sel_sorted[0], _sel_sorted[1]
+        _all_z = sorted(n for n in range(1, 50) if zodiac_map.get(n) == _z)
+        _rejects: list[str] = []
+        for _x in _all_z:
+            if _x in _sel_sorted:
+                continue
+            _xd = missing_days.get(_x, 999)
+            if _x == int(latest):
+                _rejects.append(f"{_x:02d}(上期原号排除)")
+            elif _xd > 80:
+                _rejects.append(f"{_x:02d}(遗漏{_xd}天属极寒死号禁入)")
+            elif abs(_xd - 25) > abs(missing_days.get(_a, 999) - 25):
+                _rejects.append(f"{_x:02d}(遗漏{_xd}天距25天基准太远)")
+            else:
+                _rejects.append(f"{_x:02d}(遗漏{_xd}天同肖已足额)")
+        _da = missing_days.get(_a, 0)
+        _db = missing_days.get(_b, 0)
+        _ra = {"primary": "主攻", "secondary": "次选", "defense": "防守"}.get(
+            _role_by_num.get(_a, ""), "主力"
+        )
+        if _b == cold_defense_num:
+            _why_b = f"{_b:02d}遗漏{_db}天作极寒防守"
+        elif _b == hot_defense_num:
+            _why_b = f"{_b:02d}遗漏{_db}天作极热防守"
+        elif _db > 80:
+            _why_b = f"{_b:02d}遗漏{_db}天属极寒深水号，作同肖极寒兜底"
+        elif _db > 50:
+            _why_b = f"{_b:02d}遗漏{_db}天作同肖深水防雷"
+        elif _z == last_zodiac_cn:
+            _why_b = f"{_b:02d}遗漏{_db}天与上期同肖做防回马枪（舍弃上期原号{int(latest):02d}）"
+        else:
+            _why_b = f"{_b:02d}遗漏{_db}天作同肖双保险"
+        same_zodiac_comparison.append(
+            f"生肖[{_z}]选出了{_a:02d}和{_b:02d}："
+            + (("舍弃" + "、".join(_rejects) + "，") if _rejects else "")
+            + f"因{_a:02d}遗漏{_da}天最贴近25天基准任{_ra}；{_why_b}。"
+        )
+
     total_amount = sum(p["amount"] for p in picks_out)
 
     # --- 本地引擎算点阵 / 走势分布等纯统计展示字段 ---
@@ -997,6 +1043,7 @@ async def post_recommend(
         "settings": settings,
         "market_judgment": market_judgment,
         "logic_brief": logic_brief,
+        "same_zodiac_comparison": same_zodiac_comparison,
         "ai_attempts": ai_attempts,
         "ai_violations": ai_violations,
         # 本地引擎纯统计字段（点阵 / 走势分布 / 波动分解）
