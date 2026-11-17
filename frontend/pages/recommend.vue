@@ -1555,14 +1555,14 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
             <!-- 同肖优选对比（后端代码生成，非 AI 编造） -->
             <div
               v-if="result.same_zodiac_comparison?.length"
-              class="mb-2 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2"
+              class="mb-2 rounded-xl border border-white/10 bg-white/[0.03] px-3.5 py-2.5"
             >
-              <p class="mb-1 text-[10px] font-semibold tracking-wide text-slate-400">同肖优选对比</p>
-              <ul class="space-y-0.5">
+              <p class="mb-1.5 text-xs font-semibold tracking-wide text-slate-300">同肖优选对比</p>
+              <ul class="space-y-1">
                 <li
                   v-for="(line, i) in result.same_zodiac_comparison"
                   :key="i"
-                  class="text-[10px] leading-relaxed text-slate-400"
+                  class="text-xs leading-relaxed text-slate-400"
                 >
                   · {{ line }}
                 </li>
@@ -1586,7 +1586,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               class="overflow-hidden rounded-2xl border border-white/10 bg-white/[0.02]"
             >
               <!-- 1档 · 20元 主攻 -->
-              <div v-if="primaryPicks.length" class="relative px-3.5 py-3">
+              <div v-if="primaryPicks.length" class="relative bg-gradient-to-r from-amber-400/[0.22] via-amber-400/[0.08] to-transparent px-3.5 py-3">
                 <span class="absolute inset-y-0 left-0 w-[3px] bg-gradient-to-b from-amber-300 via-amber-400/60 to-transparent" />
                 <div class="mb-2.5 flex items-center gap-2">
                   <span class="rounded-md bg-amber-400/15 px-2 py-0.5 text-[10px] font-semibold tracking-wide text-amber-300 ring-1 ring-amber-400/25">
@@ -1613,7 +1613,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               </div>
 
               <!-- 2档 · 10元 中坚 -->
-              <div v-if="secondaryPicks.length" class="relative border-t border-white/[0.06] px-3.5 py-3">
+              <div v-if="secondaryPicks.length" class="relative border-t border-white/[0.06] bg-gradient-to-r from-sky-400/[0.18] via-sky-400/[0.06] to-transparent px-3.5 py-3">
                 <span class="absolute inset-y-0 left-0 w-[3px] bg-gradient-to-b from-sky-300 via-sky-400/60 to-transparent" />
                 <div class="mb-2.5 flex items-center gap-2">
                   <span class="rounded-md bg-sky-400/15 px-2 py-0.5 text-[10px] font-semibold tracking-wide text-sky-300 ring-1 ring-sky-400/25">
@@ -1626,7 +1626,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   <div
                     v-for="pick in secondaryPicks"
                     :key="pick.number"
-                    class="flex items-center gap-2 rounded-xl bg-white/[0.03] px-2 py-1.5 ring-1 ring-white/[0.05]"
+                    class="flex items-center gap-2 rounded-xl bg-white/[0.06] px-2 py-1.5 ring-1 ring-white/10"
                   >
                     <SpecialBall :number="pick.number" size="sm" tone="nebula" :glow="false" />
                     <div class="min-w-0 flex-1">
@@ -1644,7 +1644,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               </div>
 
               <!-- 3档 · 5元 防守 -->
-              <div v-if="defensePicks.length" class="relative border-t border-white/[0.06] px-3.5 py-3">
+              <div v-if="defensePicks.length" class="relative border-t border-white/[0.06] bg-gradient-to-r from-emerald-400/[0.16] via-emerald-400/[0.05] to-transparent px-3.5 py-3">
                 <span class="absolute inset-y-0 left-0 w-[3px] bg-gradient-to-b from-emerald-300 via-emerald-400/60 to-transparent" />
                 <div class="mb-2.5 flex items-center gap-2">
                   <span class="rounded-md bg-emerald-400/15 px-2 py-0.5 text-[10px] font-semibold tracking-wide text-emerald-300 ring-1 ring-emerald-400/25">
@@ -1657,7 +1657,7 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
                   <div
                     v-for="pick in defensePicks"
                     :key="pick.number"
-                    class="flex items-center gap-2 rounded-xl bg-white/[0.03] px-2 py-1.5 ring-1 ring-white/[0.05]"
+                    class="flex items-center gap-2 rounded-xl bg-white/[0.06] px-2 py-1.5 ring-1 ring-white/10"
                   >
                     <SpecialBall :number="pick.number" size="xs" tone="nebula" :glow="false" />
                     <div class="min-w-0 flex-1">
