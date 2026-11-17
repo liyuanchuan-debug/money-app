@@ -44,7 +44,11 @@ def _build_system_prompt() -> str:
 # 核心执行流程（必须在内心按顺序严格执行，不得跳步）
 Step 1：判定当前是顺冷还是顺热？锁定基本盘（直接读 user prompt 里后端标注的阵营方向，不要自己推导）。
 Step 2：检查上期开奖生肖（如 05 虎）。强制从该生肖挑 1 个防回马枪号（1~3 档任意档均可，但绝不能是上期原号本身）。
-Step 3：从基本盘中挑选遗漏在【20-50天】的候选号，剔除与防回马枪冲突的号。
+Step 3：按【主攻号选择优先级】挑 1 档，再挑 2/3 档，剔除与防回马枪冲突的号：
+   a. 顺热期且触发极热优先 → 主攻优先选遗漏 1-7 天的极热号；
+   b. 变盘/熔断期且允许极寒进主攻 → 主攻优先选遗漏 >80 天的极品极寒号；
+   c. 否则优先深水号（遗漏 60-80 天）；
+   d. 最后才考虑遗漏 20-40 天的常规温号。绝对禁止把 20-30 天浅温号当唯一主攻。
 Step 4：对候选号进行生肖去重，单一生肖绝不能超过 2 个（即禁止同生肖买重）。
 Step 5：按 "★ 唯一解排序基准" 排序（默认距 25 天最近优先；顺热连庄特权期改为距 5 天最近优先），依次填入 1档、2档、3档。
 
@@ -60,11 +64,13 @@ Step 5：按 "★ 唯一解排序基准" 排序（默认距 25 天最近优先�
 2. 【强制资金阵型】：必须输出 1档（20元×1个）、2档（10元×2个）、3档（5元×3个），共6个号码。6 个号码必须互不相同。
 3. 【同肖去重】：任何生肖在三档中出现的总次数，绝对不能超过 2 个。
 4. 【极寒排雷】：遗漏超过 80 天的极寒号，绝对不准进入 1档（20元）和 2档（10元），只能放 3档（5元）防守。
+   例外：若 user prompt 标注「允许极寒进主攻=是」（变盘/熔断期），1 档可以选极品极寒号，2 档仍禁止。
 5. 【防回马枪】：6 注里必须至少有 1 注与"上期开奖生肖"同肖（但绝不能是上期原号本身）。缺了直接判违规退回重做。
 6. 【同肖深水防雷】：同一生肖选 2 注时，第 1 注按距 25 天基准取温号，第 2 注必须从该生肖遗漏>50 天的深水号里挑；绝对禁止两注都落在 20-40 天浅温区（防庄家避开温号挖深水）。若主攻生肖存在深水号（遗漏 50-70 天），第 2 注必须优先启用它。
 7. 【极寒防守】：若连续两期开出的号（按其开出时的遗漏算）都不在 20-50 天温区，3 档必须塞入 1 个当前最冷的极寒号（遗漏>80天），防庄家极寒作妖。
 8. 【极热防守】：若处于顺热期，3 档必须塞入 1 个遗漏 1-7 天的明牌极热号（不能是上期原号），防热号继续连庄。
 9. 【放弃中庸】：若近 3 期开出的号遗漏全部处于极端（>80天 或 <8天），严禁继续以"距25天最近"作为唯一排序标准；1 档主攻必须抓两极号——遗漏 10-15 天，或 60 天以上。
+10. 【温号熔断（死命令）】：若 user prompt 标注「温号熔断是否触发=是」（近 5 期开出的号全都不在 20-40 天温区），说明庄家正在杀温号。接下来 1-2 期，1 档（20元）主攻绝对禁止使用遗漏 20-40 天的号码！必须强制去抓遗漏【1-10天】的极热号，或【>70天】的极寒/深水号。违反将被代码直接拦截并退回重做。
 
 # 二、核心定盘法则（按优先级判断当前盘面，必须严格按后端提供的布尔触发条件判断，不要再自己推导或编造任何数字！！！）
 # 绝对禁止在"逆向逻辑简述"中编造任何具体数字（如"连开10期""5次命中"等），只能引用后端已提供的布尔结果和生肖序列事实。
@@ -181,6 +187,12 @@ def _build_user_prompt(
             f"（极热防守号：{streak_stats.get('极热防守号', '?')}）"
         )
         lines.append(f"  【放弃中庸】是否触发：{streak_stats.get('放弃中庸是否触发', '?')}")
+        lines.append(
+            f"  【温号熔断】是否触发：{streak_stats.get('温号熔断是否触发', '?')}"
+            f"（近5期开出的号是否全不在20-40天温区）"
+        )
+        lines.append(f"  ★ 允许极寒进主攻：{streak_stats.get('允许极寒进主攻', '?')}（是=1档可选遗漏>80天极寒号）")
+        lines.append(f"  ★ 顺热极热优先：{streak_stats.get('顺热极热优先', '?')}（是=主攻优先 1-7 天极热号）")
         lines.append(f"  近5期最新6肖命中数：{streak_stats.get('近5期最新6肖命中数', '?')}")
     else:
         lines.append("  （无数据）")
@@ -316,6 +328,9 @@ async def call_deepseek(
     cold_defense_num: int | None = None,  # 极寒防守：3档强制塞入的最冷极寒号
     hot_defense_num: int | None = None,  # 极热防守：3档强制塞入的极热号(1-7天)
     polar_mode: bool = False,  # 放弃中庸：主攻只抓两极号(10-15天 / 60天以上)
+    warm_fuse: bool = False,  # 温号熔断：近5期全不在20-40天，主攻禁20-40
+    allow_extreme_primary: bool = False,  # 变盘/熔断期允许极寒号进主攻
+    hot_first: bool = False,  # 顺热期：主攻优先极热号(1-7天)
 ) -> dict[str, Any]:
     """调用 DeepSeek API，返回通过铁律校验的 picks 列表。
 
@@ -467,6 +482,9 @@ async def call_deepseek(
                     cold_defense_num=cold_defense_num,
                     hot_defense_num=hot_defense_num,
                     polar_mode=polar_mode,
+                    warm_fuse=warm_fuse,
+                    allow_extreme_primary=allow_extreme_primary,
+                    hot_first=hot_first,
                 )
                 return {
                     "picks": picks,
@@ -509,6 +527,9 @@ def _parse_and_validate(
     cold_defense_num: int | None = None,  # 极寒防守：3档强制塞入的最冷极寒号
     hot_defense_num: int | None = None,  # 极热防守：3档强制塞入的极热号(1-7天)
     polar_mode: bool = False,  # 放弃中庸：主攻只抓两极号(10-15天 / 60天以上)
+    warm_fuse: bool = False,  # 温号熔断：近5期全不在20-40天，主攻禁20-40
+    allow_extreme_primary: bool = False,  # 变盘/熔断期允许极寒号进主攻
+    hot_first: bool = False,  # 顺热期：主攻优先极热号(1-7天)
 ) -> list[dict]:
     """解析 AI 输出 → 代码硬排序 → 档位分配 → 铁律校验。
 
@@ -589,6 +610,26 @@ def _parse_and_validate(
             return (2, abs(d - 25), n)
         return (abs(d - sort_base), n)
 
+    def _primary_sort_key(n: int) -> tuple:
+        """主攻号优先级：顺热极热 → 变盘/熔断两极 → 深水 → 常规温号。"""
+        d = missing_days.get(n, 999)
+        # 1. 顺热期：极热连庄优先（1-7 天）
+        if hot_first and 1 <= d <= 7:
+            return (0, abs(d - 4), n)
+        # 2. 变盘 / 熔断期：两极优先（1-10 天极热，其次 >70 天极寒/深水）
+        if polar_mode or warm_fuse or allow_extreme_primary:
+            if 1 <= d <= 10:
+                return (1, abs(d - 5), n)
+            if d > 70:
+                return (2, -d, n)
+            if d >= 60:
+                return (3, -d, n)
+            return (4, abs(d - 25), n)
+        # 3. 常规：深水（60 天以上）优先于 20-40 天浅温号
+        if d >= 60:
+            return (1, -d, n)
+        return (2, abs(d - 25), n)
+
     # 候选池来源：AI 完整输出时用全部 49 号做修正池；否则用 AI 候选池
     if ai_complete:
         all_selected = [primary_num, *secondary_nums, *defense_nums]
@@ -630,15 +671,20 @@ def _parse_and_validate(
         all_selected = []  # 从头分配
 
     sorted_pool = sorted(pool_for_fallback, key=_sort_key)
+    sorted_primary_pool = sorted(pool_for_fallback, key=_primary_sort_key)
 
     # --- 4. 铁律校验 AI 输出 ---
     # 主攻阵营：变盘时（杀热切冷/杀冷切热）与大盘相反，2/3 档始终跟大盘
     primary_camp_eff = primary_camp if primary_camp in ("heat", "cold") else camp_direction
 
+    hot_available = False  # 顺热极热优先：是否存在合法的 1-7 天极热主攻号（下方计算）
+
     def _check_violations(n: int, slot: str, ignore_camp: bool = False) -> list[str]:
         v: list[str] = []
         if slot in ("primary", "secondary") and n in extreme_cold_numbers:
-            v.append("极寒号禁1/2档")
+            # 变盘 / 熔断期允许极寒号进主攻（防庄家用极寒杀温号）
+            if not (slot == "primary" and allow_extreme_primary):
+                v.append("极寒号禁1/2档")
         if slot == "primary":
             if previous_number is not None and n == previous_number:
                 v.append("明牌号禁主攻")
@@ -663,7 +709,29 @@ def _parse_and_validate(
             _d = missing_days.get(n, 999)
             if not (10 <= _d <= 15 or _d >= 60):
                 v.append(f"放弃中庸：主攻必须是两极号（10-15天/60天以上），{n}遗漏{_d}天不符")
+        # 温号熔断：近5期全不在20-40温区，主攻禁止20-40天号，必须极热(1-10天)或极寒(>70天)
+        if slot == "primary" and warm_fuse:
+            _d = missing_days.get(n, 999)
+            if not (1 <= _d <= 10 or _d > 70):
+                v.append(
+                    f"温号熔断：近5期未出20-40天温号，主攻禁止温号，必须选极热(1-10天)或极寒(>70天)，"
+                    f"{n}遗漏{_d}天不符"
+                )
+        # 顺热极热优先：存在合法极热号时，主攻必须选 1-7 天极热号
+        if slot == "primary" and hot_first and hot_available:
+            _d = missing_days.get(n, 999)
+            if not (1 <= _d <= 7):
+                v.append(f"顺热极热优先：1档必须选遗漏 1-7 天的极热号，{n}遗漏{_d}天不符")
         return v
+
+    # 顺热极热优先：若存在合法的 1-7 天极热主攻号，硬性要求主攻必须是极热号
+    if hot_first:
+        hot_available = any(
+            n != latest_number
+            and 1 <= missing_days.get(n, 999) <= 7
+            and not _check_violations(n, "primary")
+            for n in range(1, 50)
+        )
 
     # 连庄特权降级：若该生肖没有任何合法号，放弃"必须同肖"限制，避免分配失败
     if primary_zodiac_required and zodiac_map and z6_set:
@@ -684,6 +752,15 @@ def _parse_and_validate(
         )
         if not _polar_ok:
             polar_mode = False
+
+    # 温号熔断降级：若全池没有 1-10 天或 >70 天的合法主攻号，关闭熔断避免无解
+    if warm_fuse:
+        _fuse_ok = any(
+            n != latest_number and not _check_violations(n, "primary")
+            for n in range(1, 50)
+        )
+        if not _fuse_ok:
+            warm_fuse = False
 
     def _zodiac_ok(nums: list[int], new_n: int) -> bool:
         if not zodiac_map:
@@ -706,6 +783,7 @@ def _parse_and_validate(
 
     used: set[int] = set()
     pool_idx = 0
+    primary_idx = 0
 
     for slot_idx, slot_type in enumerate(slot_types):
         # 优先取 AI 输出的候选
@@ -722,11 +800,13 @@ def _parse_and_validate(
                 candidate = ai_n
                 break
 
-        # AI 候选不行 → 从排序池取
+        # AI 候选不行 → 从排序池取（主攻用独立的极热/极寒优先池）
         if candidate is None:
-            while pool_idx < len(sorted_pool):
-                n = sorted_pool[pool_idx]
-                pool_idx += 1
+            src = sorted_primary_pool if slot_type == "primary" else sorted_pool
+            idx = primary_idx if slot_type == "primary" else pool_idx
+            while idx < len(src):
+                n = src[idx]
+                idx += 1
                 if n in used or n == latest_number:
                     continue
                 v = _check_violations(n, slot_type)
@@ -736,6 +816,10 @@ def _parse_and_validate(
                     continue
                 candidate = n
                 break
+            if slot_type == "primary":
+                primary_idx = idx
+            else:
+                pool_idx = idx
 
         if candidate is None:
             raise ValueError(f"代码侧档位分配失败：{slot_type} 无法填充")
@@ -909,7 +993,7 @@ def _parse_and_validate(
         bad = {z: c for z, c in counts.items() if c > 2}
         if bad:
             raise ValueError(f"生肖超2：{bad}")
-    if final_primary in extreme_cold_numbers:
+    if final_primary in extreme_cold_numbers and not allow_extreme_primary:
         raise ValueError(f"极寒号 {final_primary} 溜进主攻")
     if previous_number is not None and final_primary == previous_number:
         raise ValueError(f"明牌号 {previous_number} 溜进主攻")

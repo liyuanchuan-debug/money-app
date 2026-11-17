@@ -645,12 +645,28 @@ async def post_recommend(
         )
         polar_mode = _polar_available
 
+    # 温号熔断：近 5 期开出时的遗漏全都不在 20-40 天温区 → 庄家正在杀温号
+    def _is_core_warm(g: int | None) -> bool:
+        return g is not None and 20 <= g <= 40
+
+    warm_fuse = (
+        len(recent_gap_days) >= 5
+        and all(not _is_core_warm(g) for g in recent_gap_days[:5])
+    )
+    # 变盘 / 熔断期允许极寒号进主攻（防庄家用极寒杀温号）
+    allow_extreme_primary = bool(polar_mode or warm_fuse or cold_defense_hit)
+    # 顺热期主攻优先极热号（1-7 天）
+    hot_first = camp_direction == "heat"
+
     streak_stats["连续未出温号期数"] = warm_miss_streak
     streak_stats["极寒防守是否触发"] = "是" if cold_defense_hit else "否"
     streak_stats["最冷极寒号"] = cold_defense_num
     streak_stats["极热防守是否触发"] = "是" if hot_defense_num is not None else "否"
     streak_stats["极热防守号"] = hot_defense_num
     streak_stats["放弃中庸是否触发"] = "是" if polar_mode else "否"
+    streak_stats["温号熔断是否触发"] = "是" if warm_fuse else "否"
+    streak_stats["允许极寒进主攻"] = "是" if allow_extreme_primary else "否"
+    streak_stats["顺热极热优先"] = "是" if hot_first else "否"
 
     # --- 调 DeepSeek（含铁律硬校验 + 违规重试） ---
     try:
@@ -676,6 +692,9 @@ async def post_recommend(
             cold_defense_num=cold_defense_num,
             hot_defense_num=hot_defense_num,
             polar_mode=polar_mode,
+            warm_fuse=warm_fuse,
+            allow_extreme_primary=allow_extreme_primary,
+            hot_first=hot_first,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -776,23 +795,41 @@ async def post_recommend(
     # 阵营方向（最高优先级）
     camp_label = "顺热期" if camp_direction == "heat" else "顺冷期"
     primary_in_z6 = bool(primary_z and primary_z in z6_set)
+    z6_desc = "最新6肖" if primary_in_z6 else "非最新6肖"
+    # 变盘反向：主攻阵营与大盘相反（杀热切冷 / 杀冷切热）
+    _reversed = primary_camp is not None and primary_camp != camp_direction
+
+    def _tier_label(days: int) -> str:
+        """按遗漏天数标注号型：极热 / 极品极寒 / 深水 / 常规温号。"""
+        if 1 <= days <= 7:
+            return "极热连庄号"
+        if days > COLD_THRESHOLD_DAYS:
+            return "极品极寒号"
+        if days >= 60:
+            return "深水炸弹号"
+        if 20 <= days <= 40:
+            return "常规温号"
+        return "过渡号"
+
+    primary_tier = _tier_label(missing_days.get(primary_num, 0))
 
     # logic_brief：阵营优先 + 定盘法则补充
     if cb == "是":
-        logic_brief = f"{camp_label}·极寒连三变盘，主攻切回温号{primary_num}（{primary_z}）"
+        logic_brief = f"{camp_label}·极寒连三变盘，主攻切回{primary_tier}{primary_num}（{primary_z}）"
     elif pb == "是":
-        logic_brief = f"{camp_label}·极寒破冰回补，主攻选上期极寒号同肖温号{primary_num}（{primary_z}）"
+        logic_brief = f"{camp_label}·极寒破冰回补，主攻选上期极寒号同肖{primary_tier}{primary_num}（{primary_z}）"
     elif kb == "是":
-        if camp_direction == "heat":
-            # 顺热期 + energy 杀热切冷 → 阵营优先不许跳非6肖，只能在6肖内选
-            logic_brief = f"{camp_label}·盘面过热（{kb_reason}），阵营铁律优先，主攻在最新6肖内选温号{primary_num}（{primary_z}）"
-        else:
-            logic_brief = f"{camp_label}·6肖有生肖连坐（{kb_reason}），主攻选非6肖温号{primary_num}（{primary_z}）"
+        _lb_tag = "反向切" if _reversed else "守在"
+        logic_brief = f"{camp_label}·盘面过热（{kb_reason}），主攻{_lb_tag}{z6_desc}{primary_tier}{primary_num}（{primary_z}）"
+    elif warm_fuse:
+        logic_brief = f"{camp_label}·温号熔断，主攻强制避开通杀温区，抓{primary_tier}{primary_num}（{primary_z}）"
+    elif hot_first and 1 <= missing_days.get(primary_num, 0) <= 7:
+        logic_brief = f"{camp_label}·顺热极热优先，主攻抓{primary_tier}{primary_num}（{primary_z}）"
     else:
         if camp_direction == "heat":
-            logic_brief = f"{camp_label}·主攻顺应最新6肖活跃温号{primary_num}（{primary_z}）"
+            logic_brief = f"{camp_label}·主攻顺应最新6肖{primary_tier}{primary_num}（{primary_z}）"
         else:
-            logic_brief = f"{camp_label}·主攻选非最新6肖温号{primary_num}（{primary_z}）"
+            logic_brief = f"{camp_label}·主攻选非最新6肖{primary_tier}{primary_num}（{primary_z}）"
 
     # --- 代码硬生成每个 pick 的 reason（彻底覆盖 AI 编造的数字）---
     # 先把 AI 原始理由留存为 ai_reason，供复盘对照
@@ -809,10 +846,8 @@ async def post_recommend(
         return "正好踩中25天基准" if gap == 0 else f"距25天基准{gap}天"
 
     # 主攻 reason：完整逆向博弈逻辑（数字全部来自真实数据，AI 原值另存 ai_reason）
-    z6_desc = "最新6肖" if primary_in_z6 else "非最新6肖"
     _pg = f"遗漏{primary_days}天·{_gap_desc(primary_days)}"
     _base_txt = "距5天基准" if lianzhuang else "距25天基准"
-    _reversed = primary_camp is not None and primary_camp != camp_direction
     if polar_mode:
         _p_reason = (
             f"放弃中庸·近3期全走极端，主攻抓两极号（{_pg}），"
@@ -825,28 +860,33 @@ async def post_recommend(
         )
     elif cb_hit:
         _p_reason = (
-            f"极寒连三变盘（极寒号连开{cold_hits_n}期）·切回{z6_desc}温号（{_pg}），"
+            f"极寒连三变盘（极寒号连开{cold_hits_n}期）·切回{z6_desc}{primary_tier}（{_pg}），"
             f"三档中{_base_txt}最近，主攻成立"
         )
     elif pb_hit:
         _p_reason = (
-            f"极寒破冰回补·{z6_desc}同肖温号（{_pg}），三档中{_base_txt}最近，主攻成立"
+            f"极寒破冰回补·{z6_desc}同肖{primary_tier}（{_pg}），三档中{_base_txt}最近，主攻成立"
         )
     elif kb_hit:
         _tag = "主攻反向切" if _reversed else "主攻守在"
         _p_reason = (
-            f"{camp_label}·能量透支杀热切冷（{kb_reason_txt}）·{_tag}{z6_desc}温号（{_pg}），"
+            f"{camp_label}·能量透支杀热切冷（{kb_reason_txt}）·{_tag}{z6_desc}{primary_tier}（{_pg}），"
             f"三档中{_base_txt}最近，主攻成立"
         )
     elif kc_hit:
         _tag = "主攻反向切" if _reversed else "主攻守在"
         _p_reason = (
-            f"{camp_label}·能量透支杀冷切热（{kc_reason_txt}）·{_tag}{z6_desc}温号（{_pg}），"
+            f"{camp_label}·能量透支杀冷切热（{kc_reason_txt}）·{_tag}{z6_desc}{primary_tier}（{_pg}），"
             f"三档中{_base_txt}最近，主攻成立"
+        )
+    elif warm_fuse:
+        _p_reason = (
+            f"{camp_label}·温号熔断（近5期全不在20-40天温区）·主攻强制避开通杀温区，"
+            f"抓{z6_desc}{primary_tier}（{_pg}），主攻成立"
         )
     else:
         _p_reason = (
-            f"{camp_label}·{z6_desc}活跃温号（{_pg}），三档中{_base_txt}最近，主攻成立"
+            f"{camp_label}·{z6_desc}{primary_tier}（{_pg}），三档中{_base_txt}最近，主攻成立"
         )
     picks_out[0]["reason"] = _p_reason
 
