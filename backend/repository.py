@@ -560,6 +560,14 @@ def plan_quick_draw(
                     f"期号 {explicit_period} 已被 {_as_date(period_row['draw_date'])} "
                     f"占用；日期 {resolved_date} 已被第 {existing_period} 期占用"
                 )
+            if requested_date is not None:
+                # 用户显式指定的日期已被别的期号占用：必须报错，绝不静默改期
+                # （旧行为会把日期顺延到下一个空闲日，用户以为存进了当天）
+                raise ValueError(
+                    f"日期 {resolved_date} 已被第 {existing_period} 期占用："
+                    f"若要新增第 {explicit_period} 期，请把日期留空由系统顺延，"
+                    f"或用纠正模式修改第 {existing_period} 期"
+                )
             # 新期号撞上已有日期：顺延日期后 INSERT，保留旧期（含其特码）
             target = None
             resolved_period = explicit_period

@@ -837,7 +837,9 @@ async def post_recommend(
     if cb == "是":
         logic_brief = f"{camp_label}·极寒连三变盘，主攻切回{primary_tier}{primary_num}（{primary_z}）"
     elif pb == "是":
-        logic_brief = f"{camp_label}·极寒破冰回补，主攻选上期极寒号同肖{primary_tier}{primary_num}（{primary_z}）"
+        _pb_same = bool(last_zodiac_name and primary_z == last_zodiac_name)
+        _pb_scope = f"上期极寒号同肖（{last_zodiac_name}）" if _pb_same else "非上期同肖的两极号"
+        logic_brief = f"{camp_label}·极寒破冰回补，主攻选{_pb_scope}{primary_tier}{primary_num}（{primary_z}）"
     elif kb == "是":
         _lb_tag = "反向切" if _reversed else "守在"
         logic_brief = f"{camp_label}·盘面过热（{kb_reason}），主攻{_lb_tag}{z6_desc}{primary_tier}{primary_num}（{primary_z}）"
@@ -883,8 +885,10 @@ async def post_recommend(
             f"{_lock_txt}"
         )
     elif pb_hit:
+        _pb_same = bool(last_zodiac_name and primary_z_str == last_zodiac_name)
+        _pb_scope = f"上期生肖{last_zodiac_name}同肖" if _pb_same else "两极区间内"
         _p_reason = (
-            f"极寒破冰回补·{z6_desc}同肖{primary_tier}（{_pg}），{_lock_txt}"
+            f"极寒破冰回补·{z6_desc}{_pb_scope}{primary_tier}（{_pg}），{_lock_txt}"
         )
     elif kb_hit:
         _tag = "主攻反向切" if _reversed else "主攻守在"
