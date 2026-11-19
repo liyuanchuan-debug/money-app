@@ -62,7 +62,7 @@ const activeWaveTab = ref<'small' | 'normal' | 'big'>('small')
 const trendDistExpanded = ref(false)
 const copied = ref(false)
 /** 最近一次复制来源，用于对应按钮显示「已复制」 */
-const copiedSource = ref<'ticket' | ''>('')
+const copiedSource = ref<'ticket' | 'ai' | ''>('')
 const copyError = ref('')
 const generateHit = useHitPulse()
 const copyHit = useHitPulse()
@@ -1249,7 +1249,7 @@ function marketTone(judgment: string): 'emerald' | 'amber' | 'bloom' {
 const chipModes = CHIP_MODE_OPTIONS
 const trendWindowOptions = TREND_WINDOW_OPTIONS
 
-async function writeClipboard(text: string, source: 'ticket') {
+async function writeClipboard(text: string, source: 'ticket' | 'ai') {
   if (!text) return
   try {
     await navigator.clipboard.writeText(text)
@@ -1272,6 +1272,17 @@ async function copy() {
   const text = result.value?.copy_text || displayCopyText.value
   if (!text) return
   await writeClipboard(text, 'ticket')
+}
+
+/** 一键复制完整提示词（系统规则 + 本期数据），供手动粘贴给 AI 复核 */
+async function copyAiContext() {
+  const text = result.value?.ai_context
+  if (!text) {
+    copyError.value = '当前结果没有可复制的 AI 数据，请重新生成财富密码'
+    copiedSource.value = 'ai'
+    return
+  }
+  await writeClipboard(text, 'ai')
 }
 
 useHead({ title: '波浪买入法 · 四叶沙盘' })
@@ -1686,15 +1697,31 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
               >
                 {{ result.copy_text }}
               </code>
-              <GlassButton size="sm" variant="primary" @click="copy" class="shrink-0">
-                {{ copied && copiedSource === 'ticket' ? '已复制 ✓' : '复制' }}
-              </GlassButton>
+              <div class="flex shrink-0 items-center gap-2">
+                <GlassButton size="sm" variant="primary" @click="copy">
+                  {{ copied && copiedSource === 'ticket' ? '已复制 ✓' : '复制' }}
+                </GlassButton>
+                <GlassButton
+                  v-if="result.ai_context"
+                  size="sm"
+                  variant="ghost"
+                  @click="copyAiContext"
+                >
+                  {{ copied && copiedSource === 'ai' ? '已复制 ✓' : '复制AI数据' }}
+                </GlassButton>
+              </div>
             </div>
             <p v-if="copyError && copiedSource === 'ticket'" class="mt-1 text-[10px] text-bloom-300">
               {{ copyError }}
             </p>
             <p v-else-if="copied && copiedSource === 'ticket'" class="mt-1 text-[10px] text-emerald-300">
               已复制到剪贴板
+            </p>
+            <p v-if="copyError && copiedSource === 'ai'" class="mt-1 text-[10px] text-bloom-300">
+              {{ copyError }}
+            </p>
+            <p v-else-if="copied && copiedSource === 'ai'" class="mt-1 text-[10px] text-emerald-300">
+              已复制完整提示词（规则 + 本期数据），可直接粘贴给 AI
             </p>
           </GlassPanel>
         </MotionReveal>

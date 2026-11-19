@@ -653,10 +653,12 @@ async def post_recommend(
         len(recent_gap_days) >= 5
         and all(not _is_core_warm(g) for g in recent_gap_days[:5])
     )
-    # 变盘 / 熔断期允许极寒号进主攻（防庄家用极寒杀温号）
-    allow_extreme_primary = bool(polar_mode or warm_fuse or cold_defense_hit)
+    # 两极锁定：1 档允许极品极寒号（>80 天）直接主攻，与 1-7 天极热号并列
+    allow_extreme_primary = True
     # 顺热期主攻优先极热号（1-7 天）
     hot_first = camp_direction == "heat"
+    # 方案一：变盘 / 能量透支期关闭防回马枪，避免为凑同肖硬塞不合档位的号
+    horse_guard = not (kb_hit or kc_hit)
 
     streak_stats["连续未出温号期数"] = warm_miss_streak
     streak_stats["极寒防守是否触发"] = "是" if cold_defense_hit else "否"
@@ -667,6 +669,7 @@ async def post_recommend(
     streak_stats["温号熔断是否触发"] = "是" if warm_fuse else "否"
     streak_stats["允许极寒进主攻"] = "是" if allow_extreme_primary else "否"
     streak_stats["顺热极热优先"] = "是" if hot_first else "否"
+    streak_stats["防回马枪是否启用"] = "是" if horse_guard else "否"
 
     # --- 调 DeepSeek（含铁律硬校验 + 违规重试） ---
     try:
@@ -695,6 +698,7 @@ async def post_recommend(
             warm_fuse=warm_fuse,
             allow_extreme_primary=allow_extreme_primary,
             hot_first=hot_first,
+            horse_guard=horse_guard,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -800,16 +804,32 @@ async def post_recommend(
     _reversed = primary_camp is not None and primary_camp != camp_direction
 
     def _tier_label(days: int) -> str:
-        """按遗漏天数标注号型：极热 / 极品极寒 / 深水 / 常规温号。"""
+        """按遗漏天数标注号型（两极锁定口径）。"""
         if 1 <= days <= 7:
-            return "极热连庄号"
-        if days > COLD_THRESHOLD_DAYS:
-            return "极品极寒号"
-        if days >= 60:
-            return "深水炸弹号"
+            return "极热号"
+        if 8 <= days <= 15:
+            return "浅极热号"
         if 20 <= days <= 40:
-            return "常规温号"
+            return "温号"
+        if 60 <= days <= COLD_THRESHOLD_DAYS:
+            return "深水号"
+        if days > COLD_THRESHOLD_DAYS:
+            return "极寒号"
         return "过渡号"
+
+    def _band_rank(days: int) -> int:
+        """两极锁定区间的优先级（越小越优先），用于同肖双选排序。"""
+        if 1 <= days <= 7:
+            return 0
+        if 8 <= days <= 15:
+            return 1
+        if 60 <= days <= COLD_THRESHOLD_DAYS:
+            return 2
+        if days > COLD_THRESHOLD_DAYS:
+            return 3
+        if 20 <= days <= 40:
+            return 5
+        return 4
 
     primary_tier = _tier_label(missing_days.get(primary_num, 0))
 
@@ -840,44 +860,43 @@ async def post_recommend(
     primary_is_cold = primary_num in extreme_cold_numbers
     last_zodiac_cn = zodiac_map.get(int(latest), "") if zodiac_map else ""
 
-    def _gap_desc(days: int) -> str:
-        """距 25 天黄金基准的差值，用于解释唯一解排序依据。"""
-        gap = abs(days - 25)
-        return "正好踩中25天基准" if gap == 0 else f"距25天基准{gap}天"
-
     # 主攻 reason：完整逆向博弈逻辑（数字全部来自真实数据，AI 原值另存 ai_reason）
-    _pg = f"遗漏{primary_days}天·{_gap_desc(primary_days)}"
-    _base_txt = "距5天基准" if lianzhuang else "距25天基准"
+    _pg = f"遗漏{primary_days}天·{primary_tier}"
+    _lock_txt = "两极锁定下主攻成立"
+    # 连庄特权只有主攻确实落在上期生肖时才成立（该生肖无合规极热号时会降级）
+    _lianzhuang_ok = bool(
+        lianzhuang and last_zodiac_name and primary_z_str == last_zodiac_name
+    )
     if polar_mode:
         _p_reason = (
-            f"放弃中庸·近3期全走极端，主攻抓两极号（{_pg}），"
+            f"放弃中庸·近3期全走极端，主攻抓极热/极寒两极号（{_pg}），"
             f"不按距25天中庸排序，主攻成立"
         )
-    elif lianzhuang:
+    elif _lianzhuang_ok:
         _p_reason = (
             f"顺热连庄特权·上期生肖{last_zodiac_name}·主攻取近期极热同肖（遗漏{primary_days}天），"
-            f"唯一解按{_base_txt}排序，主攻成立"
+            f"唯一解按距5天基准排序，主攻成立"
         )
     elif cb_hit:
         _p_reason = (
             f"极寒连三变盘（极寒号连开{cold_hits_n}期）·切回{z6_desc}{primary_tier}（{_pg}），"
-            f"三档中{_base_txt}最近，主攻成立"
+            f"{_lock_txt}"
         )
     elif pb_hit:
         _p_reason = (
-            f"极寒破冰回补·{z6_desc}同肖{primary_tier}（{_pg}），三档中{_base_txt}最近，主攻成立"
+            f"极寒破冰回补·{z6_desc}同肖{primary_tier}（{_pg}），{_lock_txt}"
         )
     elif kb_hit:
         _tag = "主攻反向切" if _reversed else "主攻守在"
         _p_reason = (
             f"{camp_label}·能量透支杀热切冷（{kb_reason_txt}）·{_tag}{z6_desc}{primary_tier}（{_pg}），"
-            f"三档中{_base_txt}最近，主攻成立"
+            f"{_lock_txt}"
         )
     elif kc_hit:
         _tag = "主攻反向切" if _reversed else "主攻守在"
         _p_reason = (
             f"{camp_label}·能量透支杀冷切热（{kc_reason_txt}）·{_tag}{z6_desc}{primary_tier}（{_pg}），"
-            f"三档中{_base_txt}最近，主攻成立"
+            f"{_lock_txt}"
         )
     elif warm_fuse:
         _p_reason = (
@@ -886,7 +905,7 @@ async def post_recommend(
         )
     else:
         _p_reason = (
-            f"{camp_label}·{z6_desc}{primary_tier}（{_pg}），三档中{_base_txt}最近，主攻成立"
+            f"{camp_label}·{z6_desc}{primary_tier}（{_pg}），{_lock_txt}"
         )
     picks_out[0]["reason"] = _p_reason
 
@@ -925,10 +944,10 @@ async def post_recommend(
         _days = missing_days.get(_n, 0)
         _is_cold = _n in extreme_cold_numbers
         _in_z6 = bool(_z and _z in z6_set)
-        _is_horse = bool(_z and last_zodiac_cn and _z == last_zodiac_cn)
+        _is_horse = bool(horse_guard and _z and last_zodiac_cn and _z == last_zodiac_cn)
         _side = _sibling_desc(_n, _z)
         _z6_txt = "最新6肖" if _in_z6 else "非6肖"
-        _gap_txt = _gap_desc(_days)
+        _tier_txt = _tier_label(_days)
 
         if _n == cold_defense_num:
             _p["reason"] = (
@@ -956,11 +975,11 @@ async def post_recommend(
                     f"庄家避开温号挖深水时仍可中双份"
                 )
             else:
-                _p["reason"] = f"{_side}（遗漏{_days}天·{_gap_txt}），该生肖连爆可中双份"
+                _p["reason"] = f"{_side}（遗漏{_days}天·{_tier_txt}），该生肖连爆可中双份"
         elif _role == "secondary":
-            _p["reason"] = f"{_z6_txt}浅温号·遗漏{_days}天（{_gap_txt}），为主攻打掩护"
+            _p["reason"] = f"{_z6_txt}{_tier_txt}·遗漏{_days}天，两极锁定下为主攻打掩护"
         else:
-            _p["reason"] = f"{_z6_txt}中温号·遗漏{_days}天，防守补位"
+            _p["reason"] = f"{_z6_txt}{_tier_txt}·遗漏{_days}天，防守补位"
 
     # --- 同肖优选对比（同肖双选强制解释，代码生成，防 AI 瞎编）---
     same_zodiac_comparison: list[str] = []
@@ -968,7 +987,7 @@ async def post_recommend(
         if len(_sel) < 2:
             continue
         _sel_sorted = sorted(
-            _sel, key=lambda n: (abs(missing_days.get(n, 999) - 25), n)
+            _sel, key=lambda n: (_band_rank(missing_days.get(n, 999)), missing_days.get(n, 999), n)
         )
         _a, _b = _sel_sorted[0], _sel_sorted[1]
         _all_z = sorted(n for n in range(1, 50) if zodiac_map.get(n) == _z)
@@ -981,8 +1000,8 @@ async def post_recommend(
                 _rejects.append(f"{_x:02d}(上期原号排除)")
             elif _xd > 80:
                 _rejects.append(f"{_x:02d}(遗漏{_xd}天属极寒死号禁入)")
-            elif abs(_xd - 25) > abs(missing_days.get(_a, 999) - 25):
-                _rejects.append(f"{_x:02d}(遗漏{_xd}天距25天基准太远)")
+            elif _band_rank(_xd) > _band_rank(missing_days.get(_a, 999)):
+                _rejects.append(f"{_x:02d}(遗漏{_xd}天不在两极锁定区间)")
             else:
                 _rejects.append(f"{_x:02d}(遗漏{_xd}天同肖已足额)")
         _da = missing_days.get(_a, 0)
@@ -998,14 +1017,14 @@ async def post_recommend(
             _why_b = f"{_b:02d}遗漏{_db}天属极寒深水号，作同肖极寒兜底"
         elif _db > 50:
             _why_b = f"{_b:02d}遗漏{_db}天作同肖深水防雷"
-        elif _z == last_zodiac_cn:
+        elif horse_guard and _z == last_zodiac_cn:
             _why_b = f"{_b:02d}遗漏{_db}天与上期同肖做防回马枪（舍弃上期原号{int(latest):02d}）"
         else:
             _why_b = f"{_b:02d}遗漏{_db}天作同肖双保险"
         same_zodiac_comparison.append(
             f"生肖[{_z}]选出了{_a:02d}和{_b:02d}："
             + (("舍弃" + "、".join(_rejects) + "，") if _rejects else "")
-            + f"因{_a:02d}遗漏{_da}天最贴近25天基准任{_ra}；{_why_b}。"
+            + f"因{_a:02d}遗漏{_da}天属{_tier_label(_da)}任{_ra}；{_why_b}。"
         )
 
     total_amount = sum(p["amount"] for p in picks_out)
@@ -1086,6 +1105,8 @@ async def post_recommend(
         "same_zodiac_comparison": same_zodiac_comparison,
         "ai_attempts": ai_attempts,
         "ai_violations": ai_violations,
+        # 完整提示词（系统规则 + 本期数据），供前端一键复制手动喂给 AI
+        "ai_context": ai_result.get("ai_context", ""),
         # 本地引擎纯统计字段（点阵 / 走势分布 / 波动分解）
         "lattice": local_lattice,
         "trend_distributions": local_trend_dist,

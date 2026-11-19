@@ -278,6 +278,8 @@ export interface RecommendResult {
   ai_attempts?: number
   /** AI 生成过程中被铁律校验拦截的违规记录（如有） */
   ai_violations?: string[]
+  /** 完整提示词（系统规则 + 本期数据），供一键复制手动喂给 AI 复核 */
+  ai_context?: string
   /** 最新 6 肖（最近 6 期开奖去重后的生肖种群，AI 输入数据） */
   zodiac_6_recent?: Array<{
     animal: string
