@@ -43,13 +43,13 @@ def _build_system_prompt() -> str:
 
 # 核心执行流程（必须在内心按顺序严格执行，不得跳步）
 Step 1：判定当前是顺冷还是顺热？锁定基本盘（直接读 user prompt 里后端标注的阵营方向，不要自己推导）。
-Step 2：检查上期开奖生肖（如 05 虎）。若 user prompt 标注「防回马枪=启用」，从该生肖挑 1 个号（1~3 档任意档，但绝不能是上期原号本身）；若标注「防回马枪=关闭」（变盘/能量透支期），跳过本步，禁止为凑同肖硬塞档位区间外的号。
+Step 2：检查上期开奖生肖（如 05 虎）。若 user prompt 标注「屏蔽上期生肖=是」（能量透支/变盘期），本期 6 注全部禁止上期生肖；若标注「防回马枪=启用」，则必须从该生肖挑 1 个号（1~3 档任意档，但不能是上期原号本身）。
 Step 3：按【两极锁定】挑号（绝对禁止中段温号）：
    a. 1档主攻：只能选遗漏 1-7 天的极热号；若 user prompt 标注「允许极寒进主攻=是」，也可选遗漏 >80 天的极品极寒号；
-   b. 2/3 档：只能选遗漏 8-15 天的浅极热号，或 60-80 天的深水号；
+   b. 2/3 档：只能选遗漏 8-15 天、45-55 天（中深水盲区）或 60-80 天的号；其中 45-55 天盲区号必须至少选 1 个（庄家爱在 50 天附近杀人）；
    c. 遗漏 20-40 天的温号绝对禁止进入任何档位（庄家正在杀温号）。
 Step 4：对候选号进行生肖去重，单一生肖绝不能超过 2 个（即禁止同生肖买重）。
-Step 5：按 "★ 唯一解排序基准" 排序（1档取遗漏最接近 4 天的极热号；2/3 档先取 8-15 天、次取 60-80 天），依次填入 1档、2档、3档。
+Step 5：按 "★ 唯一解排序基准" 排序（1档取遗漏最接近 4 天的极热号；2/3 档先取 8-15 天、其后 45-55 天盲区、再取 60-80 天），依次填入 1档、2档、3档。
 
 # 一、绝对强制铁律（最高优先级，违背则判错；系统会做代码级校验，违规将被退回重做）
 0. 【阵营绝对过滤 - 最高优先级】：先判定大盘方向，2/3 档强制只能从对应阵营选号；1 档以 user prompt 里的「★ 主攻阵营要求」为准。
@@ -64,13 +64,14 @@ Step 5：按 "★ 唯一解排序基准" 排序（1档取遗漏最接近 4 天�
 3. 【同肖去重】：任何生肖在三档中出现的总次数，绝对不能超过 2 个。
 4. 【极寒排雷】：遗漏超过 80 天的极寒号，绝对不准进入 1档（20元）和 2档（10元），只能放 3档（5元）防守。
    例外：若 user prompt 标注「允许极寒进主攻=是」（变盘/熔断期），1 档可以选极品极寒号，2 档仍禁止。
-5. 【防回马枪（可按盘面关闭）】：启用时，6 注里必须至少有 1 注与"上期开奖生肖"同肖（但绝不能是上期原号本身）。若 user prompt 标注「防回马枪=关闭」（变盘/能量透支期），本铁律不强制，且禁止为凑同肖塞入档位区间外的号。
-6. 【同肖深水防雷】：同一生肖选 2 注时，第 2 注必须落在 60-80 天深水区；若该生肖没有 60-80 天深水号，就不要再选同肖双注。绝对禁止两注都落在 8-15 天浅极热区。
+5. 【禁买上期生肖（能量透支死命令）】：若 user prompt 标注「屏蔽上期生肖=是」（触发能量透支杀热切冷 / 杀冷切热），本期 6 注全部禁止买入上期开奖生肖，连"同肖暗箭"也不行。未触发时按「防回马枪=启用」处理：6 注里必须至少有 1 注与"上期开奖生肖"同肖（但绝不能是上期原号本身）。
+6. 【同肖深水防雷】：同一生肖选 2 注时，第 2 注必须落在 45-80 天的深水/盲区区间；若该生肖没有这类号，就不要再选同肖双注。绝对禁止两注都落在 8-15 天浅极热区。
 7. 【极寒防守】：若连续两期开出的号（按其开出时的遗漏算）都不在 20-50 天温区，3 档必须塞入 1 个当前最冷的极寒号（遗漏>80天），防庄家极寒作妖（该号豁免档位区间）。
 8. 【极热防守】：若处于顺热期，3 档必须塞入 1 个遗漏 1-7 天的明牌极热号（不能是上期原号），防热号继续连庄（该号豁免档位区间）。
 9. 【放弃中庸】：若近 3 期开出的号遗漏全部处于极端（>80天 或 <8天），严禁继续以"距25天最近"作为唯一排序标准；1 档主攻抓遗漏 1-7 天极热号，或（仅允许时）>80 天极品极寒号。
 10. 【温号熔断（死命令）】：若 user prompt 标注「温号熔断是否触发=是」（近 5 期开出的号全都不在 20-40 天温区），说明庄家正在杀温号。接下来 1-2 期，1 档（20元）主攻绝对禁止使用遗漏 20-40 天的号码！必须强制去抓遗漏【1-7天】的极热号，或【>80天】的极寒号（需标注允许极寒进主攻）。违反将被代码直接拦截并退回重做。
-11. 【两极锁定（死命令）】：1 档主攻只能选遗漏 1-7 天，或 >80 天（须标注允许极寒进主攻）；2/3 档只能选遗漏 8-15 天，或 60-80 天。遗漏 20-40 天的温号绝对禁止进入任何档位。违反将被代码直接拦截并退回重做。
+11. 【两极锁定（死命令）】：1 档主攻只能选遗漏 1-7 天，或 >80 天（须标注允许极寒进主攻）；2/3 档只能选遗漏 8-15 天、45-55 天或 60-80 天。遗漏 20-40 天的温号绝对禁止进入任何档位。违反将被代码直接拦截并退回重做。
+12. 【盲区洗盘（死命令）】：2/3 档（共 5 注）里必须至少 1 注落在遗漏 45-55 天的中深水盲区。庄家近期专挑 50 天附近杀人，不买盲区等于放空。违反将被代码直接补位。
 
 # 二、核心定盘法则（按优先级判断当前盘面，必须严格按后端提供的布尔触发条件判断，不要再自己推导或编造任何数字！！！）
 # 绝对禁止在"逆向逻辑简述"中编造任何具体数字（如"连开10期""5次命中"等），只能引用后端已提供的布尔结果和生肖序列事实。
@@ -194,8 +195,10 @@ def _build_user_prompt(
         )
         lines.append(f"  ★ 允许极寒进主攻：{streak_stats.get('允许极寒进主攻', '?')}（是=1档可选遗漏>80天极寒号）")
         lines.append(f"  ★ 顺热极热优先：{streak_stats.get('顺热极热优先', '?')}（是=主攻优先 1-7 天极热号）")
-        lines.append("  ★ 两极锁定：是（1档只许 1-7 天或 >80 天；2/3 档只许 8-15 天或 60-80 天；20-40 天温号全档禁止）")
+        lines.append("  ★ 两极锁定：是（1档只许 1-7 天或 >80 天；2/3 档只许 8-15 天、45-55 天或 60-80 天；20-40 天温号全档禁止）")
         lines.append(f"  ★ 防回马枪是否启用：{streak_stats.get('防回马枪是否启用', '是')}（否=变盘/能量透支期，不要硬凑上期同肖）")
+        lines.append(f"  ★ 屏蔽上期生肖：{streak_stats.get('屏蔽上期生肖', '否')}（是=6 注全部禁止上期生肖）")
+        lines.append("  ★ 盲区洗盘：是（2/3 档必须至少 1 注落在遗漏 45-55 天）")
         lines.append(f"  近5期最新6肖命中数：{streak_stats.get('近5期最新6肖命中数', '?')}")
     else:
         lines.append("  （无数据）")
@@ -247,10 +250,16 @@ def _build_user_prompt(
                 f"（但不能是上期原号 {latest_number}）。"
             )
         else:
-            lines.append(
-                f"  ⚠️ 防回马枪已关闭（变盘/能量透支期）：不要为了凑「{last_zodiac}」同肖"
-                f"而塞入档位区间外的号码。"
-            )
+            if (streak_stats or {}).get("屏蔽上期生肖") == "是":
+                lines.append(
+                    f"  ⚠️ 能量透支期·禁买上期生肖：6 注全部禁止「{last_zodiac}」的号码"
+                    f"（上期原号 {latest_number} 更不能买）。"
+                )
+            else:
+                lines.append(
+                    f"  ⚠️ 防回马枪已关闭（变盘/能量透支期）：不要为了凑「{last_zodiac}」同肖"
+                    f"而塞入档位区间外的号码。"
+                )
 
     # 近3期开奖号码（最新在前）：最新一期、上期、上上期 —— 各期只出现一次
     recent_3 = [latest_number, *previous_numbers[:2]]
@@ -315,6 +324,55 @@ def _build_user_prompt(
     return "\n".join(lines)
 
 
+def _build_ai_context(
+    target_period: str | int | None,
+    latest_number: int,
+    latest_gap: int | None,
+    zodiac_map: dict[int, str],
+    previous_numbers: list[int],
+    z6_set: set[str] | None,
+    extreme_cold: list[dict[str, Any]],
+    missing_days: dict[int, int],
+) -> str:
+    """「复制 AI 数据」用的精简模板：只给数据，不带规则说明。"""
+
+    def ztag(n: int) -> str:
+        return zodiac_map.get(int(n), "?")
+
+    lines: list[str] = []
+    period_txt = f"第{target_period}期" if target_period else "第XXX期"
+    lines.append(f"【目标预测期数】：{period_txt}")
+
+    gap = latest_gap if latest_gap is not None else missing_days.get(latest_number, "?")
+    lines.append(
+        f"【上期开奖】：号码{latest_number:02d}，生肖{ztag(latest_number)}，"
+        f"开出时遗漏{gap}天"
+    )
+
+    recent_3 = [latest_number, *previous_numbers[:2]]
+    lines.append(
+        "【近3期开奖】：" + "，".join(f"{n:02d}({ztag(n)})" for n in recent_3)
+    )
+
+    if z6_set:
+        lines.append("【最新6肖】：" + "、".join(sorted(z6_set)))
+    else:
+        lines.append("【最新6肖】：无")
+
+    if extreme_cold:
+        cold_txt = "，".join(
+            f"{int(item['number']):02d}(遗漏{int(item.get('days') or item.get('missing_days') or 0)}天)"
+            for item in extreme_cold
+        )
+        lines.append(f"【当前极寒号（>80天）】：{cold_txt}")
+    else:
+        lines.append("【当前极寒号（>80天）】：无")
+
+    lines.append("【全量49码遗漏天数】：")
+    lines.append(", ".join(f"{n}:{missing_days.get(n, '?')}" for n in range(1, 50)))
+    return "\n".join(lines)
+
+
 async def call_deepseek(
     latest_number: int,
     previous_numbers: list[int],
@@ -341,8 +399,12 @@ async def call_deepseek(
     warm_fuse: bool = False,  # 温号熔断：近5期全不在20-40天，主攻禁20-40
     allow_extreme_primary: bool = False,  # 变盘/熔断期允许极寒号进主攻
     hot_first: bool = False,  # 顺热期：主攻优先极热号(1-7天)
-    bipolar_lock: bool = True,  # 两极锁定：1档只许1-7/>80，2/3档只许8-15/60-80
+    bipolar_lock: bool = True,  # 两极锁定：1档只许1-7/>80，2/3档只许8-15/45-55/60-80
     horse_guard: bool = True,  # 防回马枪：变盘/能量透支期关闭，避免硬塞同肖温号
+    ban_last_zodiac: bool = False,  # 能量透支期：完全禁止买入上期生肖
+    blind_spot: bool = True,  # 2/3 档必须至少 1 注落在 45-55 天盲区
+    target_period: str | int | None = None,  # 目标预测期数（仅用于「复制 AI 数据」模板）
+    latest_gap: int | None = None,  # 上期开出时的遗漏天数（同上）
 ) -> dict[str, Any]:
     """调用 DeepSeek API，返回通过铁律校验的 picks 列表。
 
@@ -404,12 +466,16 @@ async def call_deepseek(
         "Content-Type": "application/json",
     }
 
-    # 供前端「复制 AI 数据」使用：完整可复现的提示词（规则 + 本期数据）
-    ai_context = (
-        "=== 【系统规则】===\n"
-        f"{messages[0]['content']}\n\n"
-        "=== 【本期数据】===\n"
-        f"{messages[1]['content']}"
+    # 供前端「复制 AI 数据」使用：精简数据模板（只给数据，不带系统规则）
+    ai_context = _build_ai_context(
+        target_period=target_period,
+        latest_number=latest_number,
+        latest_gap=latest_gap,
+        zodiac_map=zodiac_map,
+        previous_numbers=previous_numbers,
+        z6_set=z6_set,
+        extreme_cold=extreme_cold,
+        missing_days=dict(missing_days or {}),
     )
 
     violations: list[str] = []
@@ -507,6 +573,8 @@ async def call_deepseek(
                     hot_first=hot_first,
                     bipolar_lock=bipolar_lock,
                     horse_guard=horse_guard,
+                    ban_last_zodiac=ban_last_zodiac,
+                    blind_spot=blind_spot,
                 )
                 return {
                     "picks": picks,
@@ -553,8 +621,10 @@ def _parse_and_validate(
     warm_fuse: bool = False,  # 温号熔断：近5期全不在20-40天，主攻禁20-40
     allow_extreme_primary: bool = False,  # 变盘/熔断期允许极寒号进主攻
     hot_first: bool = False,  # 顺热期：主攻优先极热号(1-7天)
-    bipolar_lock: bool = True,  # 两极锁定：1档只许1-7/>80，2/3档只许8-15/60-80
+    bipolar_lock: bool = True,  # 两极锁定：1档只许1-7/>80，2/3档只许8-15/45-55/60-80
     horse_guard: bool = True,  # 防回马枪：变盘/能量透支期关闭
+    ban_last_zodiac: bool = False,  # 能量透支期：完全禁止买入上期生肖
+    blind_spot: bool = True,  # 2/3 档必须至少 1 注落在 45-55 天盲区
 ) -> list[dict]:
     """解析 AI 输出 → 代码硬排序 → 档位分配 → 铁律校验。
 
@@ -629,17 +699,18 @@ def _parse_and_validate(
     def _sort_key(n: int) -> tuple:
         d = missing_days.get(n, 999)
         if bipolar_lock or bipolar_relaxed:
-            # 两极锁定：2/3 档只认 8-15 天浅极热 与 60-80 天深水；
-            # >80 天极寒只作 3 档兜底，1-7 天极热留给极热防守位。
+            # 与 `_check_violations` 的档位区间保持一致
             if 8 <= d <= 15:
                 return (0, abs(d - 12), n)
+            if 45 <= d <= 55:
+                return (1, abs(d - 50), n)
             if 60 <= d <= 80:
-                return (1, -d, n)
-            if d > 80:
                 return (2, -d, n)
+            if d > 80:
+                return (3, -d, n)
             if 1 <= d <= 7:
-                return (3, abs(d - 4), n)
-            return (4, abs(d - 25), n)
+                return (4, abs(d - 4), n)
+            return (5, abs(d - 25), n)
         if polar_mode:
             # 放弃中庸：两极优先（10-15天 在前，其次 60天以上），中间区靠后兜底
             if 10 <= d <= 15:
@@ -771,13 +842,18 @@ def _parse_and_validate(
                     v.append(
                         f"两极锁定：1档只能选遗漏1-7天或>80天，{n}遗漏{_d}天不符"
                     )
-            elif not (8 <= _d <= 15 or 60 <= _d <= 80):
+            elif not (8 <= _d <= 15 or 45 <= _d <= 55 or 60 <= _d <= 80):
                 v.append(
-                    f"两极锁定：{slot}只能选遗漏8-15天或60-80天，{n}遗漏{_d}天不符"
+                    f"两极锁定：{slot}只能选遗漏8-15天、45-55天或60-80天，{n}遗漏{_d}天不符"
                 )
         # 降级档：区间放宽，但 20-40 天温号仍然全档禁止
         elif bipolar_relaxed and 20 <= missing_days.get(n, 999) <= 40:
             v.append(f"温号禁区：20-40天温号禁止进入任何档位，{n}遗漏{missing_days.get(n)}天不符")
+        # 能量透支期：完全禁止买入上期生肖（含同肖暗箭，上期原号也一并禁）
+        if ban_last_zodiac and zodiac_map:
+            _last_z = zodiac_map.get(int(latest_number), "")
+            if _last_z and zodiac_map.get(n, "") == _last_z:
+                v.append(f"能量透支禁买上期生肖：{n}属{_last_z}，本期全档禁止")
         # 顺热极热优先：存在合法极热号时，主攻必须选 1-7 天极热号
         if slot == "primary" and hot_first and hot_available:
             _d = missing_days.get(n, 999)
@@ -862,6 +938,19 @@ def _parse_and_validate(
             logger.warning("两极锁定降级：放宽后仍无法填满 6 档，本期退回原有排序")
             bipolar_relaxed = False
 
+    # 禁买上期生肖降级：区间放宽后仍无解才关闭该限制（避免与两极锁定互相误伤）
+    if ban_last_zodiac:
+        _ban_ok = all(
+            any(
+                n != latest_number and not _check_violations(n, s)
+                for n in range(1, 50)
+            )
+            for s in ("primary", "secondary", "defense")
+        )
+        if not _ban_ok:
+            logger.warning("禁买上期生肖无解：本期降级关闭该限制")
+            ban_last_zodiac = False
+
     final_primary: int | None = None
     final_secondary: list[int] = []
     final_defense: list[int] = []
@@ -925,6 +1014,53 @@ def _parse_and_validate(
             final_defense.append(candidate)
 
     assert final_primary is not None
+
+    # 6.0 盲区洗盘号：2/3 档必须至少 1 注落在 45-55 天中深水盲区
+    if blind_spot:
+        def _in_blind(days: int) -> bool:
+            return 45 <= days <= 55
+
+        if not any(_in_blind(missing_days.get(n, 999)) for n in [*final_secondary, *final_defense]):
+            blind_pool = [
+                n for n in sorted_pool
+                if _in_blind(missing_days.get(n, 999))
+                and n not in all_nums
+                and n != latest_number
+            ]
+            placed = False
+            for bn in blind_pool:
+                for slot_name, bucket in (
+                    ("defense", final_defense),
+                    ("secondary", final_secondary),
+                ):
+                    if _check_violations(bn, slot_name):
+                        continue
+                    for idx in range(len(bucket) - 1, -1, -1):
+                        if slot_name == "defense":
+                            trial = [
+                                final_primary,
+                                *final_secondary,
+                                *(final_defense[:idx] + [bn] + final_defense[idx + 1:]),
+                            ]
+                        else:
+                            trial = [
+                                final_primary,
+                                *(final_secondary[:idx] + [bn] + final_secondary[idx + 1:]),
+                                *final_defense,
+                            ]
+                        cnt = Counter(zodiac_map.get(x, "") for x in trial if zodiac_map.get(x))
+                        if any(c > 2 for c in cnt.values()):
+                            continue
+                        bucket[idx] = bn
+                        all_nums = trial
+                        placed = True
+                        break
+                    if placed:
+                        break
+                if placed:
+                    break
+            if not placed:
+                logger.warning("盲区洗盘号跳过：45-55 天区间内没有合法号")
 
     # --- 6. 最终保底校验 ---
     all_nums = [final_primary, *final_secondary, *final_defense]

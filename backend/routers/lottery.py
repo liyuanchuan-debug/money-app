@@ -54,6 +54,9 @@ from services.pnl import apply_settlement, build_pending_round
 
 router = APIRouter(prefix="/api", tags=["lottery"])
 
+# 连黑熔断：连续未命中「超过 3 把」（即 4 把及以上）后锁定 24 小时
+LOSS_LOCK_THRESHOLD = 4
+
 
 @router.get("/lattice/replay")
 async def get_lattice_replay(
@@ -292,6 +295,41 @@ async def post_recommend(
             settings[key] = value
     if payload.bet_count is not None:
         settings["pick_count"] = payload.bet_count
+
+    # --- 连黑熔断：连续 3 把未命中 → 锁定 24 小时 ---
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    _rounds = await store.list_recommend_rounds(actor_user_id(actor), limit=12)
+    _loss_streak = 0
+    _last_loss_at = None
+    for _r in _rounds:
+        if str(_r.get("status")) != "SETTLED":
+            continue
+        if _r.get("hit") is True:
+            break
+        _loss_streak += 1
+        _ts = _r.get("settled_at")
+        if isinstance(_ts, str):
+            _ts = _dt.fromisoformat(_ts.replace("Z", "+00:00"))
+        if _ts is not None and _ts.tzinfo is None:
+            _ts = _ts.replace(tzinfo=_tz.utc)
+        if _ts is not None and (_last_loss_at is None or _ts > _last_loss_at):
+            _last_loss_at = _ts
+    if _loss_streak >= LOSS_LOCK_THRESHOLD and _last_loss_at is not None:
+        if isinstance(_last_loss_at, str):
+            _last_loss_at = _dt.fromisoformat(_last_loss_at.replace("Z", "+00:00"))
+        if _last_loss_at.tzinfo is None:
+            _last_loss_at = _last_loss_at.replace(tzinfo=_tz.utc)
+        _unlock_at = _last_loss_at + _td(hours=24)
+        if _unlock_at > _dt.now(_tz.utc):
+            raise HTTPException(
+                status_code=423,
+                detail=(
+                    f"连黑 {_loss_streak} 把触发熔断：系统已锁定 24 小时，"
+                    f"解锁时间 {_unlock_at.astimezone().strftime('%Y-%m-%d %H:%M')}。"
+                    f"等庄家换套路再上。"
+                ),
+            )
 
     # --- 组装 AI 输入数据 ---
 
@@ -659,6 +697,8 @@ async def post_recommend(
     hot_first = camp_direction == "heat"
     # 方案一：变盘 / 能量透支期关闭防回马枪，避免为凑同肖硬塞不合档位的号
     horse_guard = not (kb_hit or kc_hit)
+    # 能量透支期：完全禁买上期生肖（连同上期原号与同肖暗箭）
+    ban_last_zodiac = bool(kb_hit or kc_hit)
 
     streak_stats["连续未出温号期数"] = warm_miss_streak
     streak_stats["极寒防守是否触发"] = "是" if cold_defense_hit else "否"
@@ -670,8 +710,10 @@ async def post_recommend(
     streak_stats["允许极寒进主攻"] = "是" if allow_extreme_primary else "否"
     streak_stats["顺热极热优先"] = "是" if hot_first else "否"
     streak_stats["防回马枪是否启用"] = "是" if horse_guard else "否"
+    streak_stats["屏蔽上期生肖"] = "是" if ban_last_zodiac else "否"
 
     # --- 调 DeepSeek（含铁律硬校验 + 违规重试） ---
+    ai_target_period = await store.suggest_next_period()
     try:
         ai_result = await call_deepseek(
             latest_number=int(latest),
@@ -699,6 +741,9 @@ async def post_recommend(
             allow_extreme_primary=allow_extreme_primary,
             hot_first=hot_first,
             horse_guard=horse_guard,
+            ban_last_zodiac=ban_last_zodiac,
+            target_period=ai_target_period,
+            latest_gap=recent_gap_days[0] if recent_gap_days else None,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -811,6 +856,8 @@ async def post_recommend(
             return "浅极热号"
         if 20 <= days <= 40:
             return "温号"
+        if 45 <= days <= 55:
+            return "盲区洗盘号"
         if 60 <= days <= COLD_THRESHOLD_DAYS:
             return "深水号"
         if days > COLD_THRESHOLD_DAYS:
@@ -823,13 +870,15 @@ async def post_recommend(
             return 0
         if 8 <= days <= 15:
             return 1
-        if 60 <= days <= COLD_THRESHOLD_DAYS:
+        if 45 <= days <= 55:
             return 2
-        if days > COLD_THRESHOLD_DAYS:
+        if 60 <= days <= COLD_THRESHOLD_DAYS:
             return 3
+        if days > COLD_THRESHOLD_DAYS:
+            return 4
         if 20 <= days <= 40:
-            return 5
-        return 4
+            return 6
+        return 5
 
     primary_tier = _tier_label(missing_days.get(primary_num, 0))
 
