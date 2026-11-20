@@ -685,8 +685,8 @@ async def post_recommend(
     )
     # 主攻始终允许极品极寒（>80 天）与极热（<10 天）并列
     allow_extreme_primary = True
-    # 顺热期主攻优先极热号（1-7 天）
-    hot_first = camp_direction == "heat"
+    # 主攻优先级按新 Prompt：极品极寒（>80天）优先，极寒不可用时再取极热
+    hot_first = False
     # 防回马枪彻底废除：不再强制塞上期生肖
     horse_guard = False
     # 上期生肖默认全档禁买；仅上期开出时遗漏 >80 天（极品极寒）才允许 1 个 10-15 天暗箭
@@ -929,7 +929,7 @@ async def post_recommend(
         )
     elif pb_hit:
         _pb_same = bool(last_zodiac_name and primary_z_str == last_zodiac_name)
-        _pb_scope = f"上期生肖{last_zodiac_name}同肖" if _pb_same else "两极区间内"
+        _pb_scope = f"上期生肖{last_zodiac_name}同肖" if _pb_same else "三线区间内"
         _p_reason = (
             f"极寒破冰回补·{z6_desc}{_pb_scope}{primary_tier}（{_pg}），{_lock_txt}"
         )
@@ -1024,7 +1024,7 @@ async def post_recommend(
             else:
                 _p["reason"] = f"{_side}（遗漏{_days}天·{_tier_txt}），该生肖连爆可中双份"
         elif _role == "secondary":
-            _p["reason"] = f"{_z6_txt}{_tier_txt}·遗漏{_days}天，两极锁定下为主攻打掩护"
+            _p["reason"] = f"{_z6_txt}{_tier_txt}·遗漏{_days}天，三线并行下为主攻打掩护"
         else:
             _p["reason"] = f"{_z6_txt}{_tier_txt}·遗漏{_days}天，防守补位"
 
@@ -1048,7 +1048,7 @@ async def post_recommend(
             elif _xd > 80:
                 _rejects.append(f"{_x:02d}(遗漏{_xd}天属极寒死号禁入)")
             elif _band_rank(_xd) > _band_rank(missing_days.get(_a, 999)):
-                _rejects.append(f"{_x:02d}(遗漏{_xd}天不在两极锁定区间)")
+                _rejects.append(f"{_x:02d}(遗漏{_xd}天不在三线并行区间)")
             else:
                 _rejects.append(f"{_x:02d}(遗漏{_xd}天同肖已足额)")
         _da = missing_days.get(_a, 0)
