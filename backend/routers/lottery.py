@@ -54,8 +54,8 @@ from services.pnl import apply_settlement, build_pending_round
 
 router = APIRouter(prefix="/api", tags=["lottery"])
 
-# 连黑熔断：连续未命中「超过 3 把」（即 4 把及以上）后锁定 24 小时
-LOSS_LOCK_THRESHOLD = 4
+# 连黑提醒：连续未命中「超过 3 把」（即 4 把及以上）时提示，但不限制功能
+LOSS_ALERT_THRESHOLD = 3
 
 
 @router.get("/lattice/replay")
@@ -296,7 +296,7 @@ async def post_recommend(
     if payload.bet_count is not None:
         settings["pick_count"] = payload.bet_count
 
-    # --- 连黑熔断：连续 3 把未命中 → 锁定 24 小时 ---
+    # --- 连黑提醒：超过 3 把只告警，不限制任何功能 ---
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 
     _rounds = await store.list_recommend_rounds(actor_user_id(actor), limit=12)
@@ -315,21 +315,13 @@ async def post_recommend(
             _ts = _ts.replace(tzinfo=_tz.utc)
         if _ts is not None and (_last_loss_at is None or _ts > _last_loss_at):
             _last_loss_at = _ts
-    if _loss_streak >= LOSS_LOCK_THRESHOLD and _last_loss_at is not None:
-        if isinstance(_last_loss_at, str):
-            _last_loss_at = _dt.fromisoformat(_last_loss_at.replace("Z", "+00:00"))
-        if _last_loss_at.tzinfo is None:
-            _last_loss_at = _last_loss_at.replace(tzinfo=_tz.utc)
+    fuse_alert = None
+    if _loss_streak > LOSS_ALERT_THRESHOLD and _last_loss_at is not None:
         _unlock_at = _last_loss_at + _td(hours=24)
-        if _unlock_at > _dt.now(_tz.utc):
-            raise HTTPException(
-                status_code=423,
-                detail=(
-                    f"连黑 {_loss_streak} 把触发熔断：系统已锁定 24 小时，"
-                    f"解锁时间 {_unlock_at.astimezone().strftime('%Y-%m-%d %H:%M')}。"
-                    f"等庄家换套路再上。"
-                ),
-            )
+        fuse_alert = {
+            "streak": _loss_streak,
+            "unlock_at": _unlock_at.astimezone().strftime("%Y-%m-%d %H:%M"),
+        }
 
     # --- 组装 AI 输入数据 ---
 
@@ -691,14 +683,16 @@ async def post_recommend(
         len(recent_gap_days) >= 5
         and all(not _is_core_warm(g) for g in recent_gap_days[:5])
     )
-    # 两极锁定：1 档允许极品极寒号（>80 天）直接主攻，与 1-7 天极热号并列
+    # 主攻始终允许极品极寒（>80 天）与极热（<10 天）并列
     allow_extreme_primary = True
     # 顺热期主攻优先极热号（1-7 天）
     hot_first = camp_direction == "heat"
-    # 方案一：变盘 / 能量透支期关闭防回马枪，避免为凑同肖硬塞不合档位的号
-    horse_guard = not (kb_hit or kc_hit)
-    # 能量透支期：完全禁买上期生肖（连同上期原号与同肖暗箭）
-    ban_last_zodiac = bool(kb_hit or kc_hit)
+    # 防回马枪彻底废除：不再强制塞上期生肖
+    horse_guard = False
+    # 上期生肖默认全档禁买；仅上期开出时遗漏 >80 天（极品极寒）才允许 1 个 10-15 天暗箭
+    ban_last_zodiac = True
+    latest_gap = recent_gap_days[0] if recent_gap_days else None
+    allow_last_zodiac_weak = latest_gap is not None and latest_gap > COLD_THRESHOLD_DAYS
 
     streak_stats["连续未出温号期数"] = warm_miss_streak
     streak_stats["极寒防守是否触发"] = "是" if cold_defense_hit else "否"
@@ -709,8 +703,9 @@ async def post_recommend(
     streak_stats["温号熔断是否触发"] = "是" if warm_fuse else "否"
     streak_stats["允许极寒进主攻"] = "是" if allow_extreme_primary else "否"
     streak_stats["顺热极热优先"] = "是" if hot_first else "否"
-    streak_stats["防回马枪是否启用"] = "是" if horse_guard else "否"
+    streak_stats["防回马枪是否启用"] = "否（已废除）"
     streak_stats["屏蔽上期生肖"] = "是" if ban_last_zodiac else "否"
+    streak_stats["上期同肖暗箭例外"] = "是" if allow_last_zodiac_weak else "否"
 
     # --- 调 DeepSeek（含铁律硬校验 + 违规重试） ---
     ai_target_period = await store.suggest_next_period()
@@ -742,6 +737,7 @@ async def post_recommend(
             hot_first=hot_first,
             horse_guard=horse_guard,
             ban_last_zodiac=ban_last_zodiac,
+            allow_last_zodiac_weak=allow_last_zodiac_weak,
             target_period=ai_target_period,
             latest_gap=recent_gap_days[0] if recent_gap_days else None,
         )
@@ -849,34 +845,32 @@ async def post_recommend(
     _reversed = primary_camp is not None and primary_camp != camp_direction
 
     def _tier_label(days: int) -> str:
-        """按遗漏天数标注号型（两极锁定口径）。"""
-        if 1 <= days <= 7:
+        """按遗漏天数标注号型（三线并行口径）。"""
+        if 1 <= days <= 9:
             return "极热号"
-        if 8 <= days <= 15:
-            return "浅极热号"
-        if 20 <= days <= 40:
-            return "温号"
-        if 45 <= days <= 55:
-            return "盲区洗盘号"
-        if 60 <= days <= COLD_THRESHOLD_DAYS:
+        if 10 <= days <= 15:
+            return "浅温号"
+        if 20 <= days <= 35:
+            return "温号雷区"
+        if 36 <= days <= 60:
             return "深水号"
         if days > COLD_THRESHOLD_DAYS:
             return "极寒号"
         return "过渡号"
 
     def _band_rank(days: int) -> int:
-        """两极锁定区间的优先级（越小越优先），用于同肖双选排序。"""
-        if 1 <= days <= 7:
+        """三线并行区间的优先级（越小越优先），用于同肖双选排序。"""
+        if 1 <= days <= 9:
             return 0
-        if 8 <= days <= 15:
+        if 10 <= days <= 15:
             return 1
-        if 45 <= days <= 55:
+        if 40 <= days <= 60:
             return 2
-        if 60 <= days <= COLD_THRESHOLD_DAYS:
+        if 36 <= days < 40:
             return 3
         if days > COLD_THRESHOLD_DAYS:
             return 4
-        if 20 <= days <= 40:
+        if 20 <= days <= 35:
             return 6
         return 5
 
@@ -887,7 +881,7 @@ async def post_recommend(
         logic_brief = f"{camp_label}·极寒连三变盘，主攻切回{primary_tier}{primary_num}（{primary_z}）"
     elif pb == "是":
         _pb_same = bool(last_zodiac_name and primary_z == last_zodiac_name)
-        _pb_scope = f"上期极寒号同肖（{last_zodiac_name}）" if _pb_same else "非上期同肖的两极号"
+        _pb_scope = f"上期极寒号同肖（{last_zodiac_name}）" if _pb_same else "非上期同肖的三线区间"
         logic_brief = f"{camp_label}·极寒破冰回补，主攻选{_pb_scope}{primary_tier}{primary_num}（{primary_z}）"
     elif kb == "是":
         _lb_tag = "反向切" if _reversed else "守在"
@@ -913,7 +907,7 @@ async def post_recommend(
 
     # 主攻 reason：完整逆向博弈逻辑（数字全部来自真实数据，AI 原值另存 ai_reason）
     _pg = f"遗漏{primary_days}天·{primary_tier}"
-    _lock_txt = "两极锁定下主攻成立"
+    _lock_txt = "三线并行下主攻成立"
     # 连庄特权只有主攻确实落在上期生肖时才成立（该生肖无合规极热号时会降级）
     _lianzhuang_ok = bool(
         lianzhuang and last_zodiac_name and primary_z_str == last_zodiac_name
@@ -1158,6 +1152,8 @@ async def post_recommend(
         "same_zodiac_comparison": same_zodiac_comparison,
         "ai_attempts": ai_attempts,
         "ai_violations": ai_violations,
+        # 连黑提醒（只告警，不拦功能）：连黑超过 3 把时给出提示与建议解冻时间
+        "fuse_alert": fuse_alert,
         # 完整提示词（系统规则 + 本期数据），供前端一键复制手动喂给 AI
         "ai_context": ai_result.get("ai_context", ""),
         # 本地引擎纯统计字段（点阵 / 走势分布 / 波动分解）
