@@ -163,7 +163,13 @@ def apply_settlement(
     updated = dict(round_row)
     updated.update(result)
     updated["draw_date"] = draw_date
-    updated["settled_at"] = datetime.now(timezone.utc)
+    # 重复录入同一期时保留原结算时间，避免连黑熔断的 24 小时被反复刷新
+    was_settled = round_row.get("status") == STATUS_SETTLED
+    same_draw = str(round_row.get("draw_date")) == str(draw_date)
+    if was_settled and same_draw and round_row.get("settled_at") is not None:
+        updated["settled_at"] = round_row["settled_at"]
+    else:
+        updated["settled_at"] = datetime.now(timezone.utc)
     return updated
 
 

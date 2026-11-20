@@ -347,6 +347,20 @@ function normalizeRecommendResult(raw: unknown): RecommendResult | undefined {
 /** 模板统一读这个归一化后的对象（`result.value` 语义不变，只是数组字段一定存在） */
 const result = computed(() => normalizeRecommendResult(rawResult.value))
 
+/** 连黑熔断（HTTP 423）：解析后端文案里的连黑把数与解锁时间，用于渲染专属提示卡 */
+const lockInfo = computed(() => {
+  const err = error.value as any
+  if (!err) return null
+  const status = err?.statusCode ?? err?.status ?? err?.response?.status
+  if (status !== 423) return null
+  const detail: string = String(err?.data?.detail || err?.message || '')
+  return {
+    streak: /连黑\s*(\d+)\s*把/.exec(detail)?.[1] ?? '',
+    unlock: /解锁时间\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})/.exec(detail)?.[1] ?? '',
+    detail,
+  }
+})
+
 /** 点阵 / 热力共用：当前选中会连线的号码（默认 = 本期预测 picks） */
 const latticeSelected = ref<number[]>([])
 
@@ -1325,6 +1339,63 @@ useHead({ title: '波浪买入法 · 四叶沙盘' })
           <div v-if="pending && !result" class="flex flex-col items-center gap-3 py-3">
             <SpecialBall :number="null" size="xl" tone="aqua" rolling label="计算中" />
             <p class="text-sm text-slate-400">正在按当前筹码模式推算…</p>
+          </div>
+
+          <!-- 连黑熔断：专属提示卡（HTTP 423） -->
+          <div
+            v-else-if="lockInfo"
+            class="overflow-hidden rounded-2xl border border-rose-400/30 bg-gradient-to-br from-rose-500/[0.22] via-rose-500/[0.06] to-transparent p-4 sm:p-5"
+          >
+            <div class="flex items-start gap-3">
+              <span
+                class="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-rose-500/20 ring-1 ring-rose-400/40"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="h-5 w-5 text-rose-200"
+                >
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="M12 7.5v5.5" />
+                  <path d="M12 16.5h.01" />
+                </svg>
+              </span>
+              <div class="min-w-0 flex-1 space-y-2">
+                <div class="flex flex-wrap items-center gap-2">
+                  <p class="text-sm font-semibold text-rose-100">连黑熔断 · 系统已暂停下注</p>
+                  <span
+                    v-if="lockInfo.streak"
+                    class="rounded-full bg-rose-500/20 px-2 py-0.5 text-[11px] font-medium text-rose-200 ring-1 ring-rose-400/30"
+                  >
+                    连黑 {{ lockInfo.streak }} 把
+                  </span>
+                </div>
+                <p class="text-xs leading-relaxed text-rose-100/70">
+                  连续未命中已超过熔断阈值。这 24 小时内不再生成新号码 —— 盘感与模型正被庄家克制，强行下注只会放大亏损。
+                </p>
+                <div class="flex flex-wrap items-center gap-2 text-[11px]">
+                  <span
+                    v-if="lockInfo.unlock"
+                    class="inline-flex items-center gap-1 rounded-lg bg-white/[0.06] px-2 py-1 text-slate-200 ring-1 ring-white/10"
+                  >
+                    解锁时间
+                    <b class="num font-semibold text-white">{{ lockInfo.unlock }}</b>
+                  </span>
+                  <span
+                    class="inline-flex items-center gap-1 rounded-lg bg-white/[0.06] px-2 py-1 text-slate-300 ring-1 ring-white/10"
+                  >
+                    录入开奖不受影响
+                  </span>
+                </div>
+                <p class="text-[11px] text-rose-100/50">
+                  录入新一期后若命中，连黑立即归零并自动解锁。
+                </p>
+              </div>
+            </div>
           </div>
 
           <!-- 接口不可用：如实报错（重试就走下方那颗「生成财富密码」） -->
