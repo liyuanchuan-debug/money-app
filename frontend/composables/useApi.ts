@@ -280,6 +280,8 @@ export interface RecommendResult {
   ai_violations?: string[]
   /** 完整提示词（系统规则 + 本期数据），供一键复制手动喂给 AI 复核 */
   ai_context?: string
+  /** 连黑提醒（只告警不拦功能）：连续未命中超过 3 把时给出建议解冻时间 */
+  fuse_alert?: { streak: number; unlock_at: string } | null
   /** 最新 6 肖（最近 6 期开奖去重后的生肖种群，AI 输入数据） */
   zodiac_6_recent?: Array<{
     animal: string

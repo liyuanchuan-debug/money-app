@@ -575,8 +575,44 @@ async def post_recommend(
     # 「上期」= 最新一期开奖（预测目标的上一期），即 latest
     # 顺热期（上期生肖∈最新6肖）→ 全部注强制从最新6肖对应号码里选
     # 顺冷期（上期生肖∉最新6肖）→ 全部注强制从非最新6肖号码里选
+    # --- 大盘反转强制熔断（最高优先级）：近两期同阵营 → 强制反转 ---
+    def _hot_at(index: int) -> bool | None:
+        """该期开出时，其生肖是否落在「它之前」的6肖里。"""
+        if index >= len(draws):
+            return None
+        d = draws[index]
+        dd_raw = d.get("draw_date")
+        if dd_raw is None:
+            return None
+        dd = dd_raw if isinstance(dd_raw, date_cls) else date_cls.fromisoformat(str(dd_raw))
+        z = zodiac_of(int(d["special_number"]), dd)
+        base: set[str] = set()
+        for older in draws[index + 1:]:
+            od = older.get("draw_date")
+            if od is None:
+                continue
+            od = od if isinstance(od, date_cls) else date_cls.fromisoformat(str(od))
+            base.add(zodiac_of(int(older["special_number"]), od))
+            if len(base) >= 6:
+                break
+        return z in base
+
+    _hot_latest = _hot_at(0)
+    _hot_prev = _hot_at(1)
+    fuse_flip = ""
+    if _hot_latest is True and _hot_prev is True:
+        fuse_flip = "cold"
+        streak_stats["大盘反转熔断"] = "是（近两期都在6肖=热盘连开，强制切冷）"
+    elif _hot_latest is False and _hot_prev is False:
+        fuse_flip = "heat"
+        streak_stats["大盘反转熔断"] = "是（近两期都在6肖外=冷盘连开，强制切热）"
+    else:
+        streak_stats["大盘反转熔断"] = "否（近两期冷热交替，按上期定阵营）"
+
     camp_direction = "heat"  # 默认顺热
-    if z6_set and zodiac_map:
+    if fuse_flip:
+        camp_direction = fuse_flip
+    elif z6_set and zodiac_map:
         latest_zodiac = zodiac_map.get(int(latest), "")
         if latest_zodiac and latest_zodiac not in z6_set:
             camp_direction = "cold"  # 上期跳出6肖 → 顺冷期
@@ -591,12 +627,14 @@ async def post_recommend(
     cold_hits_n = int(streak_stats.get("极寒号连续开出期数", 0) or 0)
 
     # 顺热连庄特权（法则5）：上期已回到6肖，且上上期是刚破冰的极寒号
-    lianzhuang = (camp_direction == "heat") and bool(previous in recent_cold_break)
+    lianzhuang = (camp_direction == "heat") and not fuse_flip and bool(previous in recent_cold_break)
     last_zodiac_name = zodiac_map.get(int(latest), "") if zodiac_map else ""
 
-    # 主攻阵营：极寒类法则优先；否则按变盘方向反向；连庄即顺热
+    # 主攻阵营：大盘熔断最高优先级（熔断期主攻跟随强制阵营）；否则按变盘方向反向
     primary_camp: str | None = None
-    if cb_hit or pb_hit or lianzhuang:
+    if fuse_flip:
+        primary_camp = None
+    elif cb_hit or pb_hit or lianzhuang:
         primary_camp = None
     elif kb_hit:
         primary_camp = "cold"   # 杀热切冷：主攻切非6肖
@@ -933,16 +971,14 @@ async def post_recommend(
         _p_reason = (
             f"极寒破冰回补·{z6_desc}{_pb_scope}{primary_tier}（{_pg}），{_lock_txt}"
         )
-    elif kb_hit:
-        _tag = "主攻反向切" if _reversed else "主攻守在"
+    elif kb_hit and _reversed:
         _p_reason = (
-            f"{camp_label}·能量透支杀热切冷（{kb_reason_txt}）·{_tag}{z6_desc}{primary_tier}（{_pg}），"
+            f"{camp_label}·能量透支杀热切冷（{kb_reason_txt}）·主攻反向切{z6_desc}{primary_tier}（{_pg}），"
             f"{_lock_txt}"
         )
-    elif kc_hit:
-        _tag = "主攻反向切" if _reversed else "主攻守在"
+    elif kc_hit and _reversed:
         _p_reason = (
-            f"{camp_label}·能量透支杀冷切热（{kc_reason_txt}）·{_tag}{z6_desc}{primary_tier}（{_pg}），"
+            f"{camp_label}·能量透支杀冷切热（{kc_reason_txt}）·主攻反向切{z6_desc}{primary_tier}（{_pg}），"
             f"{_lock_txt}"
         )
     elif warm_fuse:

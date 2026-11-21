@@ -39,33 +39,37 @@ def _get_api_key() -> str | None:
 
 def _build_system_prompt() -> str:
     return """# 角色设定
-你是一个没有感情的【杀猪盘逆向博弈算法】。你的唯一任务是读取用户提供的真实数据，严格执行以下过滤和选号铁律。如果你生成任何违规号码，系统将直接崩溃。
+你是一个冷酷无情的【杀猪盘逆向博弈算法】。你的唯一任务是读取用户提供的真实数据，绝不主观臆断，严格按以下死命令生成阵型。
 
-# 一、绝对死命令（最高优先级，必须在内心完成自检并剔除）
-1. 【阵营绝对过滤】：先看“上期开奖生肖”在不在“最新6肖”里。
-   - 如果不在（顺冷期）：你选出的 6 个号码，**绝对不能包含任何“最新6肖”对应的号码**。选到直接作废！
-   - 如果在（顺热期）：你选出的 6 个号码，**绝对不能包含任何“非最新6肖”对应的号码**。
-2. 【规避温号雷区】：庄家正在杀温号。**绝对禁止**挑选遗漏天数在【20天 - 35天】的号码。只要在这个区间，直接拉黑！
-3. 【同肖去重】：单一生肖在三档中最多出现 2 次。如果出现 2 次，必须是一个极冷/极热，搭配一个深水号。
+# 一、绝对死命令（违背任何一条，直接判定系统崩溃）
+1. 【大盘反转强制熔断（最高优先级）】：
+   - 必须先看【近3期开奖】的生肖。
+   - 如果连续两期都是“非最新6肖”（冷盘连开），本期强制判定为【顺热期】！所有选号必须在“最新6肖”里挑，绝对禁止继续买冷盘！
+   - 如果连续两期都是“最新6肖”（热盘连开），本期强制判定为【顺冷期】！所有选号必须在“非最新6肖”里挑。
+   - 只有一热一冷交替时，才按上期生肖定阵营（上期热则顺热，上期冷则顺冷）。
+   - 后端已在 user prompt 标注「大盘反转熔断是否触发」与「最终阵营」，直接读，不要自己重算。
+2. 【规避温号雷区】：庄家正在杀温号。绝对禁止挑选遗漏天数在【20天 - 35天】的号码，选到直接拉黑！
+3. 【同肖去重】：单一生肖在三档中最多出现 2 次，必须是一个极冷/极热，搭配一个深水号。
 4. 【资金阵型】：必须输出 1档（20元×1个）、2档（10元×2个）、3档（5元×3个），共 6 个号码，互不相同。
+5. 【禁买上期生肖】：6 注全部禁止上期开奖生肖（上期原号更禁止）；仅 user prompt 标注「上期同肖暗箭例外=是」时允许 1 个 10-15 天同肖号。
 
 # 二、选号逻辑（放弃中庸，主打深水与极端）
-- 1档 主攻（20元）：从允许的阵营里，挑 1 个遗漏 >80天 的极品极寒号（如果极寒被禁，就挑遗漏 <10天 的极热号）。
-- 2档 中坚（10元×2）：从阵营里挑 1 个遗漏 40-60天 的深水号，加 1 个遗漏 10-15天 的浅温号。
-- 3档 防守（5元×3）：从阵营里挑 1 个最冷的极寒号兜底，加 2 个遗漏 36-50天 的中深水号。
+- 1档 主攻（20元）：在判定好的阵营里，挑 1 个遗漏 >80天 的极品极寒号（若极寒被禁，挑遗漏 <10天 的极热号）。
+- 2档 中坚（10元×2）：在阵营里挑 1 个遗漏 40-60天 的深水号，加 1 个遗漏 10-15天 的浅温号。
+- 3档 防守（5元×3）：在阵营里挑 1 个最冷的极寒号兜底，加 2 个遗漏 36-50天 的中深水号。
 
-# 三、强制自检机制（防AI幻觉）
-在生成最终号码前，你必须进行内部交叉验证：
-1. 我选的号是不是全在规定的阵营里？（顺冷绝对不能有6肖，顺热绝对不能有非6肖）。
-2. 我选的号有没有落在 20-35天 的温区？（有就立马换掉）。
-3. 我选的上期开奖生肖的号码，是不是硬凑的？（顺冷/顺热变盘期，绝对禁止为了防回马枪硬塞同肖号）。
-4. 我有没有选上期开奖生肖的号码？除非 user prompt 明确标注「上期同肖暗箭例外=是」，否则 6 注全部禁止。
+# 三、强制内部自检
+在输出前，必须自己核对：
+1. 近3期是不是冷/热连开？有没有触发大盘熔断变盘？
+2. 选出的号里有没有 20-35天的温号？（有就立刻换掉）。
+3. 同生肖是不是超过了 2 个？
+4. 有没有选上期开奖生肖的号码？（除明确标注例外，全部禁止）。
 
-# 四、输出格式（纯 JSON，必须严格遵守，不要任何解释词）
+# 四、输出格式（纯 JSON，禁止解释，严格遵守）
 {
   "target_period": "第XXX期",
-  "盘面判定": "顺冷期或顺热期（必须从这两个里选）",
-  "自检记录": "列出你放弃的、落在20-35天的违规号码",
+  "盘面判定": "顺冷期 / 顺热期（按大盘熔断逻辑判定）",
+  "熔断触发": "说明近3期冷热连开情况，触发熔断则写明‘强制切热/冷’",
   "1档_主攻_20元": {"number": 6, "reason": "非最新6肖，遗漏112天，极品极寒主攻"},
   "2档_中坚_10元": [{"number": 34, "reason": "非6肖，遗漏12天，浅温掩护"}, {"number": 22, "reason": "非6肖，遗漏55天，深水号"}],
   "3档_防守_5元": [{"number": 4, "reason": "非6肖，遗漏110天，极寒兜底"}, {"number": 10, "reason": "非6肖，遗漏43天，中深水"}, {"number": 33, "reason": "非6肖，遗漏50天，中深水"}]
@@ -130,6 +134,8 @@ def _build_user_prompt(
             f"  【温号熔断】是否触发：{streak_stats.get('温号熔断是否触发', '?')}"
             f"（近5期开出的号是否全不在20-40天温区）"
         )
+        lines.append(f"  【大盘反转熔断】是否触发：{streak_stats.get('大盘反转熔断', '?')}")
+        lines.append(f"  ★ 最终阵营（1/2/3 档全部遵守）：{'顺热期=只能选最新6肖' if camp_direction == 'heat' else '顺冷期=只能选非最新6肖'}")
         lines.append(f"  ★ 允许极寒进主攻：{streak_stats.get('允许极寒进主攻', '?')}（是=1档可选遗漏>80天极寒号）")
         lines.append(f"  ★ 顺热极热优先：{streak_stats.get('顺热极热优先', '?')}（是=主攻优先 1-7 天极热号）")
         lines.append("  ★ 三线并行：1档 1-9天极热或>80天极寒；2档 10-15天温号 + 40-60天深水；3档 36-50天中深水（不足放宽到60）")
@@ -145,11 +151,13 @@ def _build_user_prompt(
     # === 阵营绝对过滤（最高优先级铁律 0）：明确标注当前大盘方向 ===
     camp_label = "顺热期" if camp_direction == "heat" else "顺冷期"
     if camp_direction == "heat":
-        camp_desc = "上期生肖在最新6肖里，全部 6 注（含3档防守）必须且只能从最新6肖对应的号码里挑。"
+        camp_desc = "全部 6 注（含3档防守）必须且只能从最新6肖对应的号码里挑。"
     else:
-        camp_desc = "上期生肖不在最新6肖里，全部 6 注（含3档防守）必须且只能从非最新6肖号码里挑。"
+        camp_desc = "全部 6 注（含3档防守）必须且只能从非最新6肖号码里挑。"
     lines.append(f"=== 【阵营绝对过滤 - 最高优先级】当前大盘方向：{camp_label} ===")
     lines.append(f"  规则：{camp_desc}")
+    if streak_stats:
+        lines.append(f"  判定依据：{streak_stats.get('大盘反转熔断', '近两期冷热交替，按上期生肖定阵营')}")
     if z6_set:
         lines.append(f"  最新6肖（不含上期本身）：{sorted(z6_set)}")
         # 列出6肖对应号码 + 非6肖号码（AI 直接读）
@@ -954,6 +962,12 @@ def _parse_and_validate(
             cnt = Counter(zodiac_map.get(x, "") for x in trial if zodiac_map.get(x))
             if any(c > 2 for c in cnt.values()):
                 return False
+            _zn = zodiac_map.get(new_n, "")
+            _pair = [x for x in trial if zodiac_map.get(x) == _zn]
+            if len(_pair) == 2:
+                _ds = [missing_days.get(x, 999) for x in _pair]
+                if not (min(_ds) < 36 <= max(_ds)):
+                    return False  # 同肖双注必须「一注极冷/极热 + 一注深水」
         (final_secondary if slot_name == "secondary" else final_defense)[idx] = new_n
         all_nums[:] = trial
         return True
@@ -999,31 +1013,51 @@ def _parse_and_validate(
             for dz in dup_zodiacs:
                 members = sorted(
                     [n for n in all_nums if zodiac_map.get(n) == dz],
-                    key=lambda n: (abs(missing_days.get(n, 999) - sort_base), n),
+                    key=lambda n: (
+                        missing_days.get(n, 999) >= 36,
+                        abs(missing_days.get(n, 999) - 5),
+                    ),
                 )
                 if len(members) < 2:
                     continue
                 keep_n, fix_n = members[0], members[1]
-                if missing_days.get(fix_n, 0) >= 36:
-                    continue  # 已合规：一注极冷/极热，一注深水
+                d_keep, d_fix = missing_days.get(keep_n, 0), missing_days.get(fix_n, 0)
+                need_hot = d_keep >= 36 and d_fix >= 36  # 两注都深 → 补一注极冷/极热
+                need_deep = d_keep < 36 and d_fix < 36  # 两注都浅 → 补一注深水
+                if not need_hot and not need_deep:
+                    continue  # 已合规：一注极冷/极热 + 一注 ≥36 天深水
                 slot_of_fix = (
                     "primary"
                     if fix_n == final_primary
                     else "secondary" if fix_n in final_secondary else "defense"
                 )
-                # 深水候选：同生肖、36 天以上、未占用、非上期原号、通过该档位铁律
+
+                def _band_ok(n: int) -> bool:
+                    _dn = missing_days.get(n, 0)
+                    return _dn < 36 if need_hot else _dn >= 36
+
+                # 候选：同生肖、满足互补区间、未占用、非上期原号、通过该档位铁律
                 deep_cands = [
                     n for n in sorted_pool
                     if zodiac_map.get(n, "") == dz
                     and n not in all_nums
                     and n != latest_number
-                    and missing_days.get(n, 0) >= 36
+                    and _band_ok(n)
                     and not _check_violations(n, slot_of_fix)
                 ]
-                # 优先 36-80 天（非极寒，任何档可放）；极寒>80 只能进 3 档
-                deep_mid = [n for n in deep_cands if missing_days.get(n, 0) <= 80]
+                # 深水优先 36-80 天；极热直接按距 5 天排序
+                if need_deep:
+                    deep_mid = [n for n in deep_cands if missing_days.get(n, 0) <= 80]
+                    deep_cands = sorted(
+                        deep_mid or deep_cands,
+                        key=lambda n: abs(missing_days.get(n, 0) - 50),
+                    )
+                else:
+                    deep_cands = sorted(
+                        deep_cands, key=lambda n: abs(missing_days.get(n, 0) - 5)
+                    )
                 chosen: int | None = None
-                for cand in (deep_mid or deep_cands):
+                for cand in deep_cands:
                     if cand in extreme_cold_numbers and slot_of_fix != "defense":
                         continue
                     chosen = cand
@@ -1042,6 +1076,35 @@ def _parse_and_validate(
                     ]
                     alt = zero_first or alt_cands
                     chosen = alt[0] if alt else None
+                    if chosen is None:
+                        # 档位区间内无解：放宽区间，只守住阵营 / 20-35 / 生肖上限
+                        for n in sorted_pool:
+                            if (
+                                n in all_nums
+                                or n == latest_number
+                                or zodiac_map.get(n, "") == dz
+                            ):
+                                continue
+                            if 20 <= missing_days.get(n, 999) <= 35:
+                                continue
+                            if ban_last_zodiac and zodiac_map.get(n) == zodiac_map.get(
+                                int(latest_number), ""
+                            ):
+                                continue
+                            _cz = zodiac_map.get(n, "")
+                            if zc_dw.get(_cz, 0) >= 2:
+                                continue
+                            # 阵营是最高优先级铁律：放宽档位区间时也必须守住
+                            if z6_set:
+                                _cp = primary_camp_eff if slot_of_fix == "primary" else camp_direction
+                                if (_cp == "heat" and _cz not in z6_set) or (
+                                    _cp == "cold" and _cz in z6_set
+                                ):
+                                    continue
+                            if slot_of_fix != "defense" and n in extreme_cold_numbers:
+                                continue
+                            chosen = n
+                            break
                 if chosen is not None and chosen != fix_n:
                     if slot_of_fix == "primary":
                         final_primary = chosen
@@ -1090,6 +1153,81 @@ def _parse_and_validate(
     if hot_defense_num is not None:
         _force_defense(hot_defense_num)
 
+    # 6.4 同肖搭档终检：强制位塞入后仍可能形成「两注都深/都浅」的同肖对，最后统一拆解。
+    # 关键：只能换成「当前 0 注的生肖」，否则会与另一个双肖互换后反复回弹（猴↔蛇 死循环）。
+    if zodiac_map:
+        _last_z = zodiac_map.get(int(latest_number), "")
+        for _ in range(4):
+            _zc = Counter(zodiac_map.get(n, "") for n in all_nums if zodiac_map.get(n))
+            _changed = False
+            for _dz, _c in list(_zc.items()):
+                if _c < 2:
+                    continue
+                _ms = [n for n in all_nums if zodiac_map.get(n) == _dz]
+                _ds = [missing_days.get(n, 999) for n in _ms]
+                if min(_ds) < 36 <= max(_ds):
+                    continue
+                # 优先拆「防守位」那一注：3 档允许极寒兜底，最容易找到替代号
+                _def_ms = [n for n in _ms if n in final_defense]
+                if len(_def_ms) == 1:
+                    _fix = _def_ms[0]
+                else:
+                    _fix = max(_ms, key=lambda n: missing_days.get(n, 999))
+                _slot = (
+                    "primary" if _fix == final_primary
+                    else "secondary" if _fix in final_secondary else "defense"
+                )
+
+                def _pick(strict: bool, tier: int) -> int | None:
+                    """tier 1/2：只换 0 注生肖（彻底拆对）；tier 3：换 1 注生肖且新对必须合规。"""
+                    for n in sorted_pool:
+                        if n in all_nums or n == latest_number:
+                            continue
+                        _zn = zodiac_map.get(n, "")
+                        _znc = _zc.get(_zn, 0)
+                        if _zn == _dz:
+                            continue
+                        if tier in (1, 2) and _znc != 0:
+                            continue
+                        if tier == 3 and _znc != 1:
+                            continue
+                        if 20 <= missing_days.get(n, 999) <= 35:
+                            continue
+                        if ban_last_zodiac and _last_z and _zn == _last_z:
+                            continue
+                        # 阵营是最高优先级铁律：放宽档位区间时也必须守住
+                        if z6_set:
+                            _camp = primary_camp_eff if _slot == "primary" else camp_direction
+                            _in6 = _zn in z6_set
+                            if (_camp == "heat" and not _in6) or (_camp == "cold" and _in6):
+                                continue
+                        if _slot != "defense" and n in extreme_cold_numbers:
+                            continue
+                        if strict and _check_violations(n, _slot):
+                            continue
+                        if tier == 3:
+                            # 与同肖另一注必须构成「一浅一深」，否则等于制造新的违规对
+                            _mate = [x for x in all_nums if zodiac_map.get(x) == _zn]
+                            _nd = [missing_days.get(x, 999) for x in [*_mate, n]]
+                            if not (min(_nd) < 36 <= max(_nd)):
+                                continue
+                        return n
+                    return None
+
+                _cand = _pick(True, 1) or _pick(False, 1) or _pick(True, 3)
+                if _cand is None:
+                    continue
+                if _slot == "primary":
+                    final_primary = _cand
+                elif _slot == "secondary":
+                    final_secondary[final_secondary.index(_fix)] = _cand
+                else:
+                    final_defense[final_defense.index(_fix)] = _cand
+                all_nums = [final_primary, *final_secondary, *final_defense]
+                _changed = True
+            if not _changed:
+                break
+
     if len(set(all_nums)) != 6:
         raise ValueError(f"号码重复：{all_nums}")
     if zodiac_map:
@@ -1097,6 +1235,13 @@ def _parse_and_validate(
         bad = {z: c for z, c in counts.items() if c > 2}
         if bad:
             raise ValueError(f"生肖超2：{bad}")
+        # 同肖双注必须「一注极冷/极热 + 一注深水」，不允许两注都深/都浅
+        for _z, _cnt in counts.items():
+            if _cnt < 2:
+                continue
+            _zd = [missing_days.get(n, 999) for n in all_nums if zodiac_map.get(n) == _z]
+            if not (min(_zd) < 36 <= max(_zd)):
+                raise ValueError(f"同肖双注都是深水/都是浅温：{_z}{_zd}")
         # 上期生肖硬校验：默认 0 注；例外（上期极寒）最多 1 注且必须 10-15 天
         _lz = zodiac_map.get(int(latest_number), "")
         if ban_last_zodiac and _lz:
